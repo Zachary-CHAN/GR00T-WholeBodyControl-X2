@@ -119,8 +119,32 @@ else
             && echo "[pico-teleop] PC Service READY (gRPC :60061)" \
             || { echo "ERROR: PC Service did not open :60061" >&2; exit 1; }
     fi
-    IP="${LAPTOP_HOST:-$(hostname -I | awk '{print $1}')}"
-    echo "[pico-teleop] headset connects to: ${IP:-<laptop LAN IP>} (override with LAPTOP_HOST)"
+    # WHICH ADDRESS TO TYPE INTO THE HEADSET (2026-09-30). The app needs ONE address and
+    # no automatic method knows where the headset is: this laptop is routinely on several
+    # networks at once (wired + wifi + its own AP + docker bridges), and the old
+    # `hostname -I | awk '{print $1}'` picked by enumeration order. On the machine this was
+    # written it printed the WIRED 192.168.254.8 to a headset sitting on wifi, which cannot
+    # route to it -- A WRONG HINT COSTS A CONFUSING CONNECT FAILURE. So list every candidate
+    # and mark the default route; the operator matches the headset's own subnet (its wifi
+    # screen shows its IP). LAPTOP_HOST overrides. This is a HINT ONLY -- the PC Service
+    # binds *:63901, so any address below the headset can route to works, and this block
+    # changes nothing functional.
+    if [[ -n "${LAPTOP_HOST:-}" ]]; then
+        echo "[pico-teleop] headset connects to: ${LAPTOP_HOST} (from LAPTOP_HOST)"
+    else
+        # `|| true`: set -e + pipefail abort the script if `ip` fails, and a missing route
+        # table must not be fatal here (offline is still a usable teleop session).
+        DEF=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)
+        echo "[pico-teleop] headset connects to ONE of these -- pick the one on the headset's wifi subnet:"
+        ip -o -4 addr show up 2>/dev/null | awk -v def="$DEF" '
+            $3 != "inet" { next }
+            $2 ~ /^(lo|docker|br-|veth|virbr|dummy|tun|tap)/ { next }
+            { split($4, a, "/"); ip = a[1] }
+            ip ~ /^169\.254\./ { next }
+            { printf "    %-15s %-12s%s\n", ip, $2, (ip == def ? "<- default route" : "") }' || true
+        echo "[pico-teleop]   the headset's wifi screen shows its own IP; match the first three octets."
+        echo "[pico-teleop]   confirm once connected:  ss -tn | grep 63901   (expect an ESTAB from the headset)"
+    fi
 fi
 
 # ---- Optional camera feed into the headset (x2_pico_video_sender.py, verified 2026-09-07).

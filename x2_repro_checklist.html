@@ -1,0 +1,1707 @@
+<title>GR00T-X2 复现清单</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+
+<style>
+  /* ── tokens ─────────────────────────────────────────────────────────── */
+  :root {
+    color-scheme: light;
+
+    --gutter: clamp(16px, 4vw, 36px);
+
+    --bg:        #E9ECEE;
+    --surface:   #FFFFFF;
+    --surface-2: #F3F5F7;
+    --surface-3: #E2E7EA;
+
+    --ink:   #101820;
+    --ink-2: #4B5761;
+    --ink-3: #78848E;
+
+    --line:   #D2D9DF;
+    --line-2: #B9C3CB;
+
+    --accent:    #0D5C6E;
+    --accent-2:  #DCEAEE;
+    --on-accent: #FFFFFF;
+
+    --ok:    #2A7048;
+    --ok-bg: #E1EFE6;
+    --warn:    #8B5A0C;
+    --warn-bg: #F8EDD8;
+    --crit:    #9E2F26;
+    --crit-bg: #F8E3E0;
+
+    --code-bg:   #111A20;
+    --code-ink:  #D5E1E8;
+    --code-line: #26323B;
+    --code-soft: rgba(255,255,255,.09);
+    --code-hov:  rgba(255,255,255,.17);
+
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(16,24,32,.05), 0 10px 28px -20px rgba(16,24,32,.34);
+    --topbar-h: 76px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+
+      --bg:        #0D1318;
+      --surface:   #151D24;
+      --surface-2: #1B242C;
+      --surface-3: #232E37;
+
+      --ink:   #E6EDF2;
+      --ink-2: #A2AFBA;
+      --ink-3: #7A8792;
+
+      --line:   #29343D;
+      --line-2: #3A4752;
+
+      --accent:    #5FBBD0;
+      --accent-2:  #10303A;
+      --on-accent: #06222A;
+
+      --ok:    #63C08A;
+      --ok-bg: #11301F;
+      --warn:    #DCAA54;
+      --warn-bg: #322515;
+      --crit:    #E5806F;
+      --crit-bg: #351B18;
+
+      --code-bg:   #0A1015;
+      --code-ink:  #CAD8E1;
+      --code-line: #1F2A33;
+
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px -20px rgba(0,0,0,.8);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+
+    --bg:        #0D1318;
+    --surface:   #151D24;
+    --surface-2: #1B242C;
+    --surface-3: #232E37;
+
+    --ink:   #E6EDF2;
+    --ink-2: #A2AFBA;
+    --ink-3: #7A8792;
+
+    --line:   #29343D;
+    --line-2: #3A4752;
+
+    --accent:    #5FBBD0;
+    --accent-2:  #10303A;
+    --on-accent: #06222A;
+
+    --ok:    #63C08A;
+    --ok-bg: #11301F;
+    --warn:    #DCAA54;
+    --warn-bg: #322515;
+    --crit:    #E5806F;
+    --crit-bg: #351B18;
+
+    --code-bg:   #0A1015;
+    --code-ink:  #CAD8E1;
+    --code-line: #1F2A33;
+
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px -20px rgba(0,0,0,.8);
+  }
+
+  /* ── base ───────────────────────────────────────────────────────────── */
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Archivo", "Noto Sans SC", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 15px;
+    line-height: 1.72;
+    padding-inline: var(--gutter);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+
+  a { color: var(--accent); }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+  .wrap { max-width: 1140px; margin-inline: auto; padding-block: 0 80px; }
+
+  /* ── topbar ─────────────────────────────────────────────────────────── */
+  .topbar {
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    z-index: 30;
+    margin-inline: calc(-1 * var(--gutter));
+    padding-inline: var(--gutter);
+    background: var(--bg);
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .topbar-in {
+    max-width: 1140px;
+    margin-inline: auto;
+    min-height: var(--topbar-h);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px 24px;
+    flex-wrap: wrap;
+    padding-block: 12px;
+  }
+
+  .tb-id { display: flex; flex-direction: column; gap: 1px; }
+
+  .tb-id h1 {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -.015em;
+    line-height: 1.25;
+  }
+
+  .tb-id p {
+    margin: 0;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tb-acts { display: flex; align-items: center; gap: 14px; }
+
+  .prog { display: flex; align-items: center; gap: 10px; }
+
+  .prog-n {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .02em;
+  }
+
+  .prog-n b { color: var(--ink); font-weight: 600; }
+
+  .bar {
+    width: 132px;
+    height: 5px;
+    background: var(--surface-3);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width .28s cubic-bezier(.4,0,.2,1);
+  }
+
+  .btn {
+    font-family: "Archivo", "Noto Sans SC", sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink-2);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 6px 11px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+
+  .btn:hover { color: var(--ink); border-color: var(--line-2); }
+
+  .btn.danger {
+    color: var(--crit);
+    border-color: color-mix(in srgb, var(--crit) 45%, transparent);
+    background: var(--crit-bg);
+  }
+
+  /* ── intro ──────────────────────────────────────────────────────────── */
+  .intro { padding-block: 30px 26px; max-width: 68ch; }
+
+  .intro p { margin: 0; color: var(--ink-2); }
+
+  .intro p + p { margin-top: 10px; }
+
+  .intro strong { color: var(--ink); font-weight: 600; }
+
+  .lede-key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--ink-3);
+  }
+
+  .lede-key span { display: inline-flex; align-items: center; gap: 6px; }
+
+  .dot { width: 7px; height: 7px; border-radius: 999px; flex: none; }
+
+  .dot.ok   { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.crit { background: var(--crit); }
+  .dot.mute { background: var(--ink-3); }
+
+  /* ── shell ──────────────────────────────────────────────────────────── */
+  .shell {
+    display: grid;
+    grid-template-columns: 210px minmax(0, 1fr);
+    gap: 34px;
+    align-items: start;
+  }
+
+  /* ── rail ───────────────────────────────────────────────────────────── */
+  .rail {
+    position: sticky;
+    top: calc(env(safe-area-inset-top, 0px) + var(--topbar-h) + 22px);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .rail-hd {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding: 0 9px 9px;
+  }
+
+  .rail-row {
+    display: grid;
+    grid-template-columns: 22px minmax(0,1fr) auto;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 9px;
+    border-radius: 8px;
+    text-decoration: none;
+    color: var(--ink-2);
+    border-left: 2px solid transparent;
+    transition: background .14s, color .14s, border-color .14s;
+  }
+
+  .rail-row:hover { background: var(--surface-2); color: var(--ink); }
+
+  .rail-row .rn {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .rail-row .rt {
+    font-size: 13.5px;
+    line-height: 1.35;
+    overflow-wrap: break-word;
+  }
+
+  .rail-row .rc {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .rail-row.complete { border-left-color: var(--accent); }
+  .rail-row.complete .rn  { color: var(--accent); }
+  .rail-row.complete .rc  { color: var(--accent); }
+
+  /* ── stage card ─────────────────────────────────────────────────────── */
+  .stage {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 22px 24px 12px;
+    margin-bottom: 22px;
+    scroll-margin-top: calc(env(safe-area-inset-top, 0px) + var(--topbar-h) + 18px);
+  }
+
+  .stage-hd {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-bottom: 6px;
+  }
+
+  .stage-hd h2 { font-size: 19px; font-weight: 600; letter-spacing: -.012em; }
+
+  .num {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-2);
+    border-radius: 6px;
+    padding: 5px 7px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .chip {
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: .04em;
+    line-height: 1;
+    padding: 5px 9px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+
+  .chip.ok   { color: var(--ok);   background: var(--ok-bg);   border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+  .chip.warn { color: var(--warn); background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+  .chip.crit { color: var(--crit); background: var(--crit-bg); border-color: color-mix(in srgb, var(--crit) 30%, transparent); }
+  .chip.mute { color: var(--ink-3); background: var(--surface-2); border-color: var(--line); }
+
+  .stage-hd .count {
+    margin-left: auto;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stage .lede {
+    margin: 0 0 4px;
+    color: var(--ink-2);
+    font-size: 14px;
+    max-width: 66ch;
+  }
+
+  /* ── items ──────────────────────────────────────────────────────────── */
+  .items { list-style: none; margin: 0; padding: 0; }
+
+  .item {
+    display: grid;
+    grid-template-columns: 21px minmax(0, 1fr);
+    gap: 12px;
+    padding: 14px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .item:first-child { border-top: 0; }
+
+  .ck {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 21px;
+    height: 21px;
+    margin: 2px 0 0;
+    border: 1.5px solid var(--line-2);
+    border-radius: 6px;
+    background: var(--surface);
+    cursor: pointer;
+    position: relative;
+    flex: none;
+    transition: background .14s, border-color .14s;
+  }
+
+  .ck:hover { border-color: var(--accent); }
+
+  .ck:checked { background: var(--accent); border-color: var(--accent); }
+
+  .ck:checked::after {
+    content: "";
+    position: absolute;
+    left: 7px;
+    top: 3px;
+    width: 4px;
+    height: 9px;
+    border: solid var(--on-accent);
+    border-width: 0 2px 2px 0;
+    transform: rotate(43deg);
+  }
+
+  .item .body { min-width: 0; }
+
+  .ttl {
+    display: block;
+    font-weight: 500;
+    color: var(--ink);
+    cursor: pointer;
+    transition: color .14s;
+  }
+
+  .ck:checked ~ .body .ttl { color: var(--ink-3); font-weight: 400; }
+
+  .desc {
+    margin: 5px 0 0;
+    font-size: 14px;
+    color: var(--ink-2);
+    max-width: 66ch;
+  }
+
+  .desc code, .note code, .lede code, p code {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: .88em;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 4px;
+    overflow-wrap: break-word;
+  }
+
+  /* ── command block ──────────────────────────────────────────────────── */
+  .cmd { position: relative; margin-top: 10px; }
+
+  .cmd pre {
+    margin: 0;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--code-line);
+    border-radius: 9px;
+    padding: 11px 74px 11px 13px;
+    overflow-x: auto;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    white-space: pre;
+    tab-size: 2;
+  }
+
+  .copy {
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .03em;
+    color: var(--code-ink);
+    background: var(--code-soft);
+    border: 1px solid var(--code-line);
+    border-radius: 6px;
+    padding: 5px 8px;
+    cursor: pointer;
+    transition: background .14s;
+  }
+
+  .copy:hover { background: var(--code-hov); }
+
+  /* ── callouts ───────────────────────────────────────────────────────── */
+  .note {
+    margin-top: 10px;
+    border-left: 2px solid var(--line-2);
+    padding: 2px 0 2px 12px;
+    font-size: 14px;
+    color: var(--ink-2);
+    max-width: 68ch;
+  }
+
+  .note .lb {
+    display: block;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 2px;
+  }
+
+  .note.warn { border-left-color: var(--warn); }
+  .note.warn .lb { color: var(--warn); }
+
+  .note.crit { border-left-color: var(--crit); }
+  .note.crit .lb { color: var(--crit); }
+
+  .note.ok { border-left-color: var(--ok); }
+  .note.ok .lb { color: var(--ok); }
+
+  .note.accent { border-left-color: var(--accent); }
+  .note.accent .lb { color: var(--accent); }
+
+  .note ul { margin: 6px 0 0; padding-left: 17px; }
+  .note li { margin-bottom: 4px; }
+  .note li:last-child { margin-bottom: 0; }
+  .note b { color: var(--ink); font-weight: 600; }
+
+  /* 对照表：仅在 note 里出现（run 对比）。窄屏下自己横向滚，不撑破页面 */
+  .note table {
+    width: 100%;
+    margin: 8px 0;
+    border-collapse: collapse;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    display: block;
+    overflow-x: auto;
+  }
+  .note th, .note td {
+    padding: 5px 10px 5px 0;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  .note th {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    border-bottom-color: var(--line-2);
+  }
+  .note tr:last-child td { border-bottom: 0; }
+  .note td:first-child { font-weight: 600; color: var(--ink); }
+
+  /* ── reference cards (no ticks) ─────────────────────────────────────── */
+  .ref {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--crit);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 20px 24px;
+    margin-bottom: 22px;
+  }
+
+  .ref.ask { border-left-color: var(--accent); }
+
+  .ref h2 { font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+
+  .ref > .lede { margin: 7px 0 0; color: var(--ink-2); font-size: 14px; max-width: 66ch; }
+
+  .rules {
+    list-style: none;
+    margin: 14px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 9px;
+  }
+
+  .rules li {
+    display: grid;
+    grid-template-columns: 17px minmax(0,1fr);
+    gap: 10px;
+    font-size: 14px;
+    color: var(--ink-2);
+  }
+
+  .rules li::before {
+    content: "";
+    margin-top: 9px;
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--crit);
+  }
+
+  .rules li b { color: var(--ink); font-weight: 600; }
+
+  .ask-item {
+    border-top: 1px solid var(--line);
+    padding: 15px 0;
+    display: grid;
+    grid-template-columns: 22px minmax(0,1fr);
+    gap: 12px;
+  }
+
+  .ask-item:first-of-type { border-top: 0; margin-top: 12px; }
+
+  .ask-item .qn {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    padding-top: 1px;
+  }
+
+  .ask-item h3 { font-size: 15px; font-weight: 600; }
+
+  .ask-item p { margin: 5px 0 0; font-size: 14px; color: var(--ink-2); max-width: 66ch; }
+
+  .opts {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 5px;
+    font-size: 14px;
+    color: var(--ink-2);
+  }
+
+  .opts li { display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 8px; }
+
+  .opts .k {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    padding-top: 2px;
+  }
+
+  .opts .pick { color: var(--ink); }
+  .opts .pick .k { color: var(--ok); }
+
+  /* ── footer ─────────────────────────────────────────────────────────── */
+  .foot {
+    margin-top: 30px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--ink-3);
+    max-width: 72ch;
+  }
+
+  .foot p { margin: 0 0 7px; }
+  .foot p:last-child { margin-bottom: 0; }
+
+  /* ── narrow ─────────────────────────────────────────────────────────── */
+  @media (max-width: 880px) {
+    .shell { grid-template-columns: minmax(0, 1fr); gap: 22px; }
+
+    .rail {
+      position: static;
+      flex-direction: row;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+      scrollbar-width: thin;
+    }
+
+    .rail-hd { display: none; }
+
+    .rail-row {
+      grid-template-columns: auto auto;
+      border-left: 0;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      padding: 7px 11px;
+      border-radius: 999px;
+      white-space: nowrap;
+      flex: none;
+    }
+
+    .rail-row .rt {
+      font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .rail-row.complete { border-color: var(--accent); }
+  }
+
+  @media (max-width: 560px) {
+    .stage { padding: 18px 16px 10px; }
+    .ref { padding: 18px 16px; }
+    .tb-acts { width: 100%; justify-content: space-between; }
+    .bar { width: 96px; }
+    .cmd pre { padding-right: 13px; padding-top: 34px; }
+    .copy { top: 6px; right: 6px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition-duration: .001ms !important; }
+  }
+</style>
+
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="tb-id">
+      <h1>GR00T-X2 复现清单</h1>
+      <p>AgiBot X2 Ultra · Jetson aarch64 · 2026-09-29</p>
+    </div>
+    <div class="tb-acts">
+      <div class="prog">
+        <span class="prog-n"><b id="done">0</b>/<span id="total">0</span></span>
+        <div class="bar"><i id="bar"></i></div>
+      </div>
+      <button class="btn" id="reset" type="button">重置</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section class="intro">
+    <p>目标是 <strong>GEAR-SONIC 的 X2 移植版</strong>在本机跑起来。按依赖顺序分了五级，
+       每一级都能勾；勾选状态存在这个浏览器里，换浏览器或清掉站点数据就没了。</p>
+    <p>命令都是核对过仓库里的脚本写的，可以直接粘。每条命令右边的「复制」按不动时，
+       点一下会让它自动选中，再按 Ctrl+C 就行。</p>
+    <div class="lede-key">
+      <span><i class="dot ok"></i>本机已具备</span>
+      <span><i class="dot warn"></i>要先补东西</span>
+      <span><i class="dot crit"></i>本机做不了 / 有安全风险</span>
+      <span><i class="dot mute"></i>看情况</span>
+    </div>
+  </section>
+
+  <div class="shell">
+
+    <nav class="rail" aria-label="阶段导航">
+      <div class="rail-hd">阶段</div>
+      <a class="rail-row" href="#s1" data-for="s1">
+        <span class="rn">L1</span><span class="rt">环境</span><span class="rc" data-for="s1">0/0</span>
+      </a>
+      <a class="rail-row" href="#s2" data-for="s2">
+        <span class="rn">L2</span><span class="rt">仿真栈</span><span class="rc" data-for="s2">0/0</span>
+      </a>
+      <a class="rail-row" href="#s3" data-for="s3">
+        <span class="rn">L3</span><span class="rt">Pico 遥操</span><span class="rc" data-for="s3">0/0</span>
+      </a>
+      <a class="rail-row" href="#s4" data-for="s4">
+        <span class="rn">L4</span><span class="rt">真机</span><span class="rc" data-for="s4">0/0</span>
+      </a>
+      <a class="rail-row" href="#s5" data-for="s5">
+        <span class="rn">L5</span><span class="rt">训练</span><span class="rc" data-for="s5">0/0</span>
+      </a>
+    </nav>
+
+    <main>
+
+      <!-- ── 红线 ──────────────────────────────────────────────────── -->
+      <section class="ref">
+        <h2>红线</h2>
+        <p class="lede">这几条不是建议，是已经定下的约束。下面任何一步跟它们冲突，都停下来问，别自己绕。</p>
+        <ul class="rules">
+          <li><span><b>不升级系统。</b>不 <code>apt upgrade</code>、不 <code>dpkg -i</code>、不改 <code>~/.bashrc</code>。这套 Jetson 的驱动和 ROS 版本一动就回不来。</span></li>
+          <li><span><b>东西只放在 <code>~/Documents/czq/</code> 下。</b>包括解包出来的 SDK、虚拟环境、模型缓存。</span></li>
+          <li><span><b>厂商文件一字不改。</b><code>agibot_x2_urdf/X2_URDF-v1.3.0/</code> 下的 <code>x2_ultra.xml</code>、<code>scene.xml</code>、<code>x2_ultra.urdf</code>，GR00T-X2 有代码在引用它们。要改就派生一份新的。</span></li>
+          <li><span><b>GR00T-X2 的 <code>.venv</code> 和 <code>czq/xr-env</code> 是两套环境，别混用。</b><code>.venv</code> 是用 <code>xr-env</code> 的 python 建的，所以 <code>.venv/bin/python</code> 指向 <code>xr-env</code>——但 <b>site-packages 完全独立</b>。<code>gear_sonic/pyproject.toml</code> 硬钉 <code>numpy==1.26.4</code>，而 <code>xr-env</code> 是 numpy 2.x，往任一边装东西都可能把另一边的数值栈弄坏。跑 GR00T-X2 就用它自己的 <code>.venv</code>，跑 XRoboToolkit 才 <code>source setup/activate.sh</code>。</span></li>
+          <li><span><b>两边都要清掉 ROS 注入的 <code>PYTHONPATH</code>。</b><code>~/.bashrc</code> source 了 ROS Jazzy，它给每个 shell 塞进 <code>/opt/ros/jazzy/lib/python3.12/site-packages</code>；而这两套环境都是 Python 3.10，混用会出「import 成功但行为错乱」这类最难查的问题。<code>setup/activate.sh</code> 干的就是这件事（顺带设 <code>BROWSER</code>）；直接用项目 <code>.venv/bin/python</code> 时，用 <code>env -u PYTHONPATH</code> 起。</span></li>
+          <li><span><b>别在 demo 跑着的时候碰 SDK。</b>不调 <code>xrt.init()</code>，不跑自检脚本。两个 SDK session 会互相抢。</span></li>
+          <li><span><b>机器人站着的时候绝不 kill deploy 的 tmux 会话。</b>要停只能走下面 L4 里那条停止命令。</span></li>
+        </ul>
+      </section>
+
+      <!-- ── L1 ────────────────────────────────────────────────────── -->
+      <section class="stage" id="s1" data-stage="s1">
+        <header class="stage-hd">
+          <span class="num">L1</span>
+          <h2>环境与本机现状</h2>
+          <span class="chip ok">已具备</span>
+          <span class="count">0/0</span>
+        </header>
+        <p class="lede">这一级基本不用再做什么，但有三条记录是过时的，以及一处改动动了就构建不出来，先过一遍。</p>
+
+        <ul class="items">
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-1" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-1">项目自己的 <code>.venv</code> 已经建好了</label>
+              <p class="desc">在仓库根目录下。quickstart 里那一长串 <code>pip install</code> 已经跑过，不用重来。</p>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-2" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-2">docker 能用</label>
+              <p class="desc">仿真栈是把真机那份 C++ deploy 二进制跑在 <code>x2sim</code> 容器里，所以 docker 是硬前置。实测可以直接跑，不需要 sudo。</p>
+              <div class="note accent">
+                <span class="lb">过时记录</span>
+                项目自己的 <code>CLAUDE.md</code> 坑 5 还写着「docker 没权限、没解决」。那条已经不准了，别照着它去折腾用户组。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-3" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-3">git-lfs 是装了的，报「未安装」是假警报</label>
+              <p class="desc">模型和 mesh 都走 LFS，所以这一条会拦住整个流程。实际 <code>git-lfs 3.8.0</code> 在 <code>/home/nvidia/miniconda3/bin/</code> 下，只是 conda 的 base 不在 <code>PATH</code> 里。</p>
+              <div class="cmd">
+                <pre>export PATH="/home/nvidia/miniconda3/bin:$PATH"
+git lfs version</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note warn">
+                <span class="lb">查错方向</span>
+                <code>check_environment.py</code> 报 <code>Git LFS: not installed</code> 时，先按上面加 <code>PATH</code> 再复跑，不要急着去装 LFS。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-4" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-4">别回滚 <code>docker_x2/Dockerfile</code> 里那处未提交的改动</label>
+              <p class="desc">文件里有一段本地补丁：ONNX Runtime 的下载地址按 <code>uname -m</code> 选 tarball。这台是 aarch64，官方 x64 包在这里装不上，<b>回滚它镜像就构建不出来</b>。</p>
+              <div class="cmd">
+                <pre>git -C /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2 \
+  diff -- gear_sonic_deploy/docker_x2/Dockerfile</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note crit">
+                <span class="lb">动手前先看</span>
+                任何 "把工作区弄干净" 的操作（<code>git checkout .</code>、<code>git stash</code>、换分支）都会把这处补丁带走。做之前先跑上面的 diff，把它存下来。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-5" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-5">镜像和 LFS 对象都在本地了</label>
+              <p class="desc">首次构建要拉 ONNX Runtime 和一堆 apt 包。如果已经构建过就不用管，直接确认这两条命令不报错即可。</p>
+              <div class="cmd">
+                <pre>cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
+git lfs pull
+docker image ls | grep -i x2sim</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s1-6" data-default checked>
+            <div class="body">
+              <label class="ttl" for="c-s1-6">补装 <code>onnx</code>（项目安装说明里漏了这个依赖）</label>
+              <p class="desc">门禁脚本 <code>onnx_provenance.py:48</code> 硬 import 了 <code>onnx</code>，用来读模型的 <code>metadata_props</code>。但 <code>gear_sonic[sim]</code> extra 和顶层 <code>requirements-x2.txt</code> 里<b>都只声明了 <code>onnxruntime</code></b>，没有 <code>onnx</code>。缺它，栈会死在 <code>[4/4] deploy</code> 那一步，报 <code>ModuleNotFoundError: No module named 'onnx'</code>，而 deploy 根本没起来。</p>
+              <div class="cmd">
+                <pre>.venv/bin/python -m pip install "onnx" "numpy&lt;2"</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note crit">
+                <span class="lb">必须带 numpy&lt;2 这个约束</span>
+                不带的话，pip 会把 numpy 从 1.26.4 升到 <b>2.2.6</b>。而 <code>gear_sonic/pyproject.toml</code> 是硬钉 <code>1.26.4</code> 的，这个环境里 torch / onnxruntime / pinocchio / placo 全都有编译扩展，跨 ABI 大版本升级可能整片坏掉。带上约束后 pip 会自动降级 <code>ml_dtypes</code> 到 0.5.4，numpy 原地不动。
+              </div>
+              <p class="desc">装完验证 numpy 没被动：</p>
+              <div class="cmd">
+                <pre>.venv/bin/python -c "import numpy, onnx; print(numpy.__version__, onnx.__version__)"
+# 期望：1.26.4 1.23.0</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+        </ul>
+      </section>
+
+      <!-- ── L2 ────────────────────────────────────────────────────── -->
+      <section class="stage" id="s2" data-stage="s2">
+        <header class="stage-hd">
+          <span class="num">L2</span>
+          <h2>仿真栈</h2>
+          <span class="chip ok">能跑通</span>
+          <span class="count">0/0</span>
+        </header>
+        <p class="lede">这一级不碰机器人，全部在本机闭环。链子是：ONNX kplanner → 姿态 watchdog → 容器里那份真机 C++ deploy → <code>x2_mujoco_ros_bridge.py</code> 当物理引擎。</p>
+
+        <ul class="items">
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-1">
+            <div class="body">
+              <label class="ttl" for="c-s2-1">进项目、激活 <code>.venv</code></label>
+              <p class="desc">后面所有命令都在这个 shell 里跑。用项目自己的 <code>.venv</code>，<b>不要</b>用 <code>setup/activate.sh</code> 那套——两者 numpy 版本冲突，理由见上面「红线」。</p>
+              <div class="cmd">
+                <pre>cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
+source .venv/bin/activate</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-2">
+            <div class="body">
+              <label class="ttl" for="c-s2-2">重建动作库</label>
+              <p class="desc">launcher、评测脚本、<code>deploy_x2.sh --motion</code> 都读这几个 pkl。仓库里不带这些文件，得生成一次。</p>
+              <div class="cmd">
+                <pre>bash tools/build_demo_bank_from_upstream.sh</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <p class="desc">生成 <code>gear_sonic/data/motions/</code> 下的 <code>x2_demo_bank.pkl</code>、<code>x2_planner_primitives.pkl</code>、<code>x2_pad_banks.pkl</code>，以及 <code>gear_sonic_deploy/data/motions_x2m2/demo_bank/*.x2m2</code>。</p>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-3">
+            <div class="body">
+              <label class="ttl" for="c-s2-3">先看运动学是否合理，不带策略</label>
+              <p class="desc">在 MuJoCo 里单放一段动作库的片段。这一步不加载任何 ONNX，出问题一定是模型或动作数据本身，排查面小很多。</p>
+              <div class="cmd">
+                <pre>python gear_sonic/scripts/play_x2_motion_mujoco.py \
+  --motion gear_sonic/data/motions/x2_demo_bank.pkl</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-4">
+            <div class="body">
+              <label class="ttl" for="c-s2-4">跑一致性门</label>
+              <p class="desc">launcher 每次启动都会跑它，但单独跑一次能更早看到报错，不用等容器起来。</p>
+              <div class="cmd">
+                <pre>.venv/bin/python gear_sonic/scripts/check_plant_consistency.py</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-5">
+            <div class="body">
+              <label class="ttl" for="c-s2-5">先 <code>--dry-run</code> 看解析出来的路径</label>
+              <p class="desc">只打印最终选中的模型、调参 yaml、动作库路径，然后退出。真跑之前花十秒确认这几个路径是不是你想要的，比起了容器再回滚便宜得多。</p>
+              <div class="cmd">
+                <pre>./gear_sonic/scripts/sim_onnx_planner.sh --whole-body-teleop --dry-run</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-6">
+            <div class="body">
+              <label class="ttl" for="c-s2-6">起仿真栈</label>
+              <p class="desc">不带任何环境变量就是这个模式的默认：仓库里自带的那套 dual-head SONIC 模型。第一次会先构建镜像，慢。</p>
+              <div class="cmd">
+                <pre>./gear_sonic/scripts/sim_onnx_planner.sh --whole-body-teleop</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note warn">
+                <span class="lb">身份门会拦你</span>
+                一旦你用 <code>MODEL=</code> 或 <code>PLANNER_MODEL=</code> 指定了别的模型，launcher 会拿它和真机上实际部署的那份做 md5 比对，对不上就 <b>exit 6</b>。要跑候选模型必须显式加 <code>ALLOW_MISMATCH=1</code>。
+                <br>这个门是有来历的：它抓到过一次真机跑 <code>ft_2082_g1.onnx</code> 而所有 sim launcher 都在用 <code>walkft_3065_g1.onnx</code>，也就是说仿真一直在验证另一个策略。别把它当成碍事的检查。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-7">
+            <div class="body">
+              <label class="ttl" for="c-s2-7">确认启动判决是 CONTROL + ARMED</label>
+              <p class="desc">launcher 会自己等最多 60 秒。你要看到的是这一行：</p>
+              <div class="cmd">
+                <pre>VERDICT: deploy in CONTROL + kplanner ARMED — stack is UP, pad live.</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note crit">
+                <span class="lb">半死的状态</span>
+                如果它打的是 <code>DEPLOY UP but KPLANNER NEVER ARMED</code>，说明 deploy 活着但 kplanner 收不到 deploy 的 debug 回声，<b>手柄是全死的</b>，而且日志里一个错误都没有。2026-08-29 端口从 5657 挪到 5659 时就是这么咬人的。看到这句先查端口接线，别去查手柄。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-8">
+            <div class="body">
+              <label class="ttl" for="c-s2-8">确认 RTF 没被腰斩</label>
+              <p class="desc">启动时会打印 deploy 日志的路径（<code>pid … (log: …/logs/deploy.log)</code>），默认在 <code>~/.cache/sonic/simstack_pc/logs/deploy.log</code>。grep 里面的 <code>RTF</code>。</p>
+              <div class="cmd">
+                <pre>grep -m3 RTF "${SIMSTACK_DIR:-$HOME/.cache/sonic/simstack_pc}/logs/deploy.log"</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note ok">
+                <span class="lb">本机实测：0.96~0.97 稳定——够用，不是坑 8</span>
+                Jetson 上 steady state 实测 <code>RTF 0.97 / 0.96 / 0.96 / 0.97</code>。<b>这是 4% 的稳定缺口，和 0.51 不是同一回事：</b><br>
+                <b>0.51 是结构性的</b>——渲染被塞进物理循环，实时因子腰斩，按墙钟推进的参考轨迹相当于以两倍速灌进物理，失稳被盖住。<br>
+                <b>0.96 只是 CPU 紧张</b>——实测占用最高的是物理桥（<code>x2_mujoco_ros_bridge</code> 约 0.67 核）和镜像窗口（约 0.58 核），加起来不到 2 核，离饱和还远，且这个量级藏不住失稳。<br>
+                想抠回 1.00 的杠杆是关掉宿主侧镜像窗口，但那是唯一的观察窗，为 4% 不值得。
+              </div>
+              <div class="note accent">
+                <span class="lb">别只信日志——独立测一遍</span>
+                bridge 在 <code>:5570</code> 上发布 <b>地面真值的 pelvis <code>qpos</code></b>（JSON：<code>{"sim_time":…, "pelvis_qpos_wxyz":[x,y,z,qw,qx,qy,qz]}</code>，注意 z 在第三个位置）。用 <code>CONFLATE</code> 只取最新帧，比较 <code>sim_time</code> 与墙钟就能独立算出 RTF：
+                <div class="cmd">
+                  <pre>.venv/bin/python - &lt;&lt;'EOF'
+import zmq, json, time
+ctx = zmq.Context(); s = ctx.socket(zmq.SUB)
+s.setsockopt(zmq.CONFLATE, 1)          # 只留最新帧，否则会读到积压队列
+s.connect("tcp://127.0.0.1:5570"); s.setsockopt(zmq.SUBSCRIBE, b"robot_pose")
+def latest():
+    while True:
+        raw = s.recv()
+        if s.getsockopt(zmq.EVENTS) &amp; zmq.POLLIN == 0:
+            return json.loads(raw.split(b" ", 1)[1])
+a = latest(); w0 = time.time(); time.sleep(8); b = latest()
+print(f"RTF = {(b['sim_time']-a['sim_time'])/(time.time()-w0):.3f}")
+EOF</pre>
+                  <button class="copy" type="button">复制</button>
+                </div>
+                实测 <b>0.964</b>，与 bridge 自报一致。同一个流也能看机器人到底在不在动（pelvis 的 x/y/z 轨迹）。
+              </div>
+              <div class="note crit">
+                <span class="lb">会骗你的数字</span>
+                <code>RTF 0.51</code> 意味着物理跑在半速上：参考轨迹以两倍速灌进物理，把本该暴露的不稳定全藏起来。这个值是 <code>SIM_VIEWER_MODE=container</code> 造成的——它把渲染塞进物理循环里。<b>别设这个变量。</b>
+                现在默认用的是 host 侧只读的 <code>sim_mirror_viewer.py</code>，关掉那个窗口不会影响仿真。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s2-9">
+            <div class="body">
+              <label class="ttl" for="c-s2-9">收尾必须停栈</label>
+              <p class="desc">就算你已经 Ctrl-C 过了，也要跑这条。它会停掉 kplanner、watchdog、bridge、token service、pad bridge、<code>x2sim</code> 容器，并清扫 deploy 节点。</p>
+              <div class="cmd">
+                <pre>./gear_sonic/scripts/simstack_local.sh --stop</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note warn">
+                <span class="lb">为什么是「必须」</span>
+                deploy 节点比启动它的 host 包装脚本活得久。<b>两个 deploy 绝不能驱动同一个 sim</b>——叠上去不会报错，只会让后面所有的 A/B 对比静默失效。重新启动时 launcher 会先自动 stop 一次，但收尾这一次得你自己来。
+              </div>
+            </div>
+          </li>
+
+        </ul>
+
+        <div class="note accent" style="margin: 4px 0 14px;">
+          <span class="lb">这一级另外两个坑</span>
+          <ul>
+            <li><b>两套 launcher 家族别混着用。</b><code>--whole-body-teleop</code> 走 <code>simstack_local.sh</code>，端口整体 +100（5656 / 5658 / 5659 / 5663 / 5668）；默认的 pad / VR 模式走 <code>run_x2_quest3_planner_stack.sh</code>，用的是<b>和真机一样的端口号</b>。历史上「手柄在仿真里能用啊」的错觉就是从这个分裂来的。</li>
+            <li><b>没有手柄也能跑。</b>默认的 pad 模式要求 <code>pad_locomotion_bridge.py --probe</code> 能列出设备，没手柄就起不来。这时候不用去找手柄，用脚本化的输入走同一条线：
+              <div class="cmd">
+                <pre>python gear_sonic/scripts/simstack_pad_drive.py walk 6 0.6
+python gear_sonic/scripts/simstack_pad_drive.py crouchwalk 8 0.6
+bash gear_sonic/scripts/simstack_turn.sh right 3</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </li>
+            <li><b>端口表以 <code>x2_pc2/PORT_REGISTRY.md</code> 为准。</b>要新增 socket，先在那张表里加一行再写代码。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ── L3 ────────────────────────────────────────────────────── -->
+      <section class="stage" id="s3" data-stage="s3">
+        <header class="stage-hd">
+          <span class="num">L3</span>
+          <h2>Pico 全身遥操</h2>
+          <span class="chip ok">下游已实测打通</span>
+          <span class="count">0/0</span>
+        </header>
+        <p class="lede">要三个 Motion Tracker 和一副头显。<b>除头显之外的下游整条链路已在 2026-09-29 用一段现成 tape 无头显验证通过</b>（见第 6 条）——所以这一级剩下的都是「插上头显就有」的事，不再是未知数。</p>
+
+        <ul class="items">
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-1">
+            <div class="body">
+              <label class="ttl" for="c-s3-1">建 <code>.venv_teleop</code></label>
+              <p class="desc">实时遥操要用 Pico SDK，所以是<b>单独一个</b>虚拟环境，不复用 <code>.venv</code>。本机已于 2026-09-29 建好。</p>
+              <div class="note crit">
+                <span class="lb">不要直接跑 <code>install_pico.sh</code>——它有两处会咬人</span>
+                <ul>
+                  <li><b>多拉几 GB：</b><code>torch&gt;=2.4.0</code> 是 <code>gear_sonic</code> 的<b>基础依赖</b>（不在 extra 里），而脚本全程没有预装 CPU 版。实测解析出 <code>torch==2.14.0</code> CUDA 版 + 15 个 <code>nvidia-*</code> 包 + triton，<b>共 53 个包</b>。先装 CPU 版只有 151.9 MiB。</li>
+                  <li><b>夹着一次 <code>dpkg -i</code>：</b>第 8 步装 PC Service，系统级改动。它整个块可以用 <code>SKIP_PC_SERVICE=1</code> 跳过。</li>
+                </ul>
+                项目自己的 <code>docs/x2/README.md</code> 与 <code>CLAUDE.md</code> 第三节都写了「torch 必须先装 CPU 版」，<b>是这个脚本漏了这步</b>。
+              </div>
+              <div class="cmd">
+                <pre>cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.10
+uv venv .venv_teleop --python "$(uv python find --no-project 3.10)" --prompt gear_sonic_teleop
+VPY=$PWD/.venv_teleop/bin/python
+# ★ 脚本漏掉的关键一步：
+uv pip install --python "$VPY" torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python "$VPY" -e "gear_sonic[teleop]"
+uv pip install --python "$VPY" cmake pybind11 setuptools
+export CMAKE_PREFIX_PATH="$("$VPY" -m pybind11 --cmakedir)"
+uv pip install --python "$VPY" --no-build-isolation \
+  -e external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note ok">
+                <span class="lb">本机实测结果（可直接对照）</span>
+                39 个包，<b>零 <code>nvidia-*</code>、零 triton</b>，<code>torch 2.14.0+cpu</code>，<code>xrobotoolkit-sdk 1.0.2</code> 由预编译 so 编出（7 秒）。<br>
+                两个可跳过项：aarch64 的 <code>libPXREARobotSDK.so</code> 仓库里<b>已自带</b>（19.6 MB），省掉源码编译；<code>SKIP_SIM_AND_UNITREE=1</code> 可再省掉 CycloneDDS 源码编译——<b>laptop 半边只发 intent，不需要 mujoco 和 unitree DDS</b>。<br>
+                <b>验证隔离性：</b><code>pyvenv.cfg</code> 里 <code>include-system-site-packages = false</code>，且 <code>.venv_teleop/bin/python3</code> 直指 <code>xr-env</code>（不经 <code>.venv</code>）——所以它和 <code>.venv</code> 是<b>同一种耦合</b>：删掉 <code>xr-env</code> 会连带弄坏这两个 venv。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-2">
+            <div class="body">
+              <label class="ttl" for="c-s3-2">处理 PC Service 的路径错配</label>
+              <p class="desc">这是个<b>查不出来的静默陷阱</b>，已经在本机实测确认。三件事同时成立：</p>
+              <ul class="opts">
+                <li><span class="k">1</span><span><code>run_pico_teleop.sh</code> 第 23 行期望 <code>/opt/apps/roboticsservice</code>；这个目录在本机<b>不存在</b>。</span></li>
+                <li><span class="k">2</span><span>第 103 行的检查是 <code>pgrep -x RoboticsService</code>，<b>只按进程名匹配</b>。</span></li>
+                <li><span class="k">3</span><span>而 <code>czq/roboticsservice/</code> 起的那个 <code>./RoboticsServiceProcess</code> 正在跑，于是这个检查被"满足"了，缺失的目录永远不会被报出来。</span></li>
+              </ul>
+              <p class="desc" style="margin-top:8px;">三条路里，实测答案是 <b>C</b>——而且 A 和 B 都跑不通：</p>
+              <ul class="opts">
+                <li><span class="k">A</span><div>照 <code>install_pico.sh</code> 走，<code>dpkg -i</code> 装到 <code>/opt/apps/roboticsservice</code>。<b>和红线冲突</b>，且实测装上也跑不起来（原因见下）。</div></li>
+                <li><span class="k">B</span><div>把 deb 解到 <code>czq/</code> 下，用环境变量指过去，系统一点不动。<b>解包本身没问题，但解出来的二进制在本机也跑不起来。</b>
+                  <div class="cmd">
+                    <pre>dpkg-deb -x /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2/gear_sonic_deploy/thirdparty/roboticsservice_1.0.0.0_arm64.deb \
+  /home/nvidia/Documents/czq/pico_service</pre>
+                    <button class="copy" type="button">复制</button>
+                  </div>
+                </div></li>
+                <li class="pick"><span class="k">C</span><div><b>实际生效的方案：</b>用 <code>czq/roboticsservice/</code> 那份正在跑的守护进程。它已经在 <code>:60061</code> 上监听，<code>run_pico_teleop.sh</code> 会直接走「already running」分支，<b>什么都不用配</b>。</div></li>
+              </ul>
+              <div class="note ok">
+                <span class="lb">2026-09-29 实测：为什么 A 和 B 都跑不起来</span>
+                解包出来的二进制 <code>ldd</code> 缺 <code>libicuuc.so.70</code> / <code>libicui18n.so.70</code>：<b>这个 deb 是 Ubuntu 22.04 的构建（ICU 70），而本机是 ICU 74</b>。解包树的 <code>lib/</code> 只有 15 个文件、不含 ICU。而 <code>czq/roboticsservice/</code> 那份的 <code>lib/</code> <b>自带 12 个 ICU</b>，所以它能跑。<br>
+                <b>也就是说：B 方案的价值不在于「换一条路装上了」，而在于它挡住了一次 <code>dpkg -i</code>——那个 deb 装进系统同样是跑不起来的二进制。</b>
+              </div>
+              <div class="note crit">
+                <span class="lb">陷阱本身仍然要记住</span>
+                <code>:60061</code> 只能被一个进程占，而 <code>pgrep -x</code> <b>只按进程名匹配、不校验路径</b>。所以「谁在跑」这件事被静默地决定了，脚本永远不会抱怨。<br>
+                写部署文件时如果加了「确保 PC Service 在跑」这类逻辑，只 <code>pgrep</code> 进程名是不够的——<b>必须校验你期望的那个路径下进程真的可执行</b>，否则这个陷阱会跟着你进真机。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-3">
+            <div class="body">
+              <label class="ttl" for="c-s3-3">准备好三个 Pico Motion Tracker</label>
+              <p class="desc">腰一个、两踝各一个。少一个就是残缺的全身解。</p>
+              <div class="note crit">
+                <span class="lb">配对顺序有讲究</span>
+                头显里打开 Motion Tracker app 后，<b>先把 max tracker usage 改成 3</b>，再去配对腰和两个踝。这个值默认是 2，先配对就会卡在「只配上两个」，而且看不出是被设置挡住的。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-4">
+            <div class="body">
+              <label class="ttl" for="c-s3-4">头显里选 Full body 模式并标定</label>
+              <p class="desc">设完 tracker 数量、配对完，选 <b>Full body</b> 模式，然后点 <b>Calibrate</b>。</p>
+              <div class="note crit">
+                <span class="lb">每次重启都要重来</span>
+                <b>头显一重启，标定就没了。</b>判断方法看按钮上的字：显示 <code>Calibrate</code> 说明标定已丢，显示 <code>Recalibrate</code> 才是还有。每次重启头显之后都要重新标定，不然 <code>body</code> 会一直是 <code>False</code>。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-5">
+            <div class="body">
+              <label class="ttl" for="c-s3-5">单独验证 SDK 能拿到身体数据</label>
+              <p class="desc">看三件事：身体数据可用、时间戳在走、tracker 数量是 3。</p>
+              <div class="cmd">
+                <pre>.venv_teleop/bin/python -c "import xrobotoolkit_sdk as xrt, time; xrt.init(); time.sleep(2); print('body:', xrt.is_body_data_available(), 'stamp:', xrt.get_time_stamp_ns(), 'trackers:', xrt.num_motion_data_available())"</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note ok">
+                <span class="lb">本机实测（2026-09-29，无头显）——「连不上」和「没数据」要分清</span>
+                链路半边已确认通过，日志里能看到 SDK 真的连上了守护进程：
+                <div class="cmd"><pre>initialize sdk, connect 127.0.0.1:60061
+client start
+server stream server connect
+server connect watch server feedback thread start</pre><button class="copy" type="button">复制</button></div>
+                <b>没有头显时 <code>stamp: 0</code>、<code>body: False</code> 是正常的</b>，不是故障——身体数据来自头显。所以无头显时这条的判据只有「能连上 <code>:60061</code>」；后两项要戴着头显才有意义。
+              </div>
+              <div class="note warn">
+                <span class="lb">实测到的一个真实异常：退出时会核心转储</span>
+                上面这条命令跑完，进程以 <code>terminate called without an active exception</code> 中止。pybind SDK 在解释器拆卸时<b>没有 join 自己的反馈线程</b>，析构时触发 <code>std::terminate</code>。<br>
+                <b>为什么要在意：</b>C++ 的 <code>terminate</code> 会跳过 Python 的 <code>atexit</code>。如果 tape 录制是挂在 <code>atexit</code> 上落盘的，<b>每次 live session 都可能留下一个没写完的 tape</b>。跑完真机或长回放后，去 tape 目录确认文件能正常 <code>np.load</code>。
+              </div>
+              <div class="note crit">
+                <span class="lb">时序</span>
+                <b>不要和 sender 同时跑。</b>两个 xrt 会话会互相干扰。（仿真栈自己那个 C++ deploy <b>不占 xrt 会话</b>，所以栈跑着的时候跑这条没问题——前提是 <code>run_pico_teleop.sh</code> / <code>live_pico_smpl_teleop.py</code> 没有在跑。）
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-6">
+            <div class="body">
+              <label class="ttl" for="c-s3-6">先用 tape 无头显验掉下游整条链路</label>
+              <p class="desc">戴头显之前，先把「除头显之外的一切」验掉。仓库自带一段 Pico 录制，直接灌进正在跑的仿真栈，<b>不需要头显、不需要 tracker</b>。这是 F05 定义的 headset-free 门禁。</p>
+              <div class="cmd">
+                <pre>cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
+./gear_sonic/scripts/run_pico_teleop.sh \
+  --tape-replay gear_sonic/data/motions/x2_pico_chores/tapes/session_20260917_014453Z_x2_seg02.npz \
+  --auto-engage</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note ok">
+                <span class="lb">通过的判据（2026-09-29 本机实测全中）</span>
+                <b>sender 侧</b>依序出现：<code>intent PUB -&gt; tcp://127.0.0.1:5573 topic 'pico_intent'</code> → <code>stream live.</code> → <code>ENGAGED (auto).</code> → 稳态 <code>[intent] 50.0 Hz ENGAGED [tape]</code>。<br>
+                <b>deploy 侧</b>出现：<code>WHOLE-BODY ENGAGED — smpl head (crossfade 0.40s)</code>。<br>
+                <b>仿真侧</b>：<code>grav_z ≈ -1.00</code>（直立没倒）、<code>wrist_bypass_max_dev_rad</code> 持续增长（参考在动、机器人在跟）。<br>
+                自带的这段是 <b>234.5 秒 / 19358 帧 / 82.5 fps</b>，<code>body_ok</code> 全 True。<br>
+                <b>以上判据在第 227 秒之前全部成立——然后机器人摔了。门禁不是全绿收场，见下条。</b>
+              </div>
+              <div class="note crit">
+                <span class="lb">★ 实测结局：跑到第 227 秒摔了</span>
+                <b>227 秒</b>时 <code>tilt watchdog tripped: gravity_body[z]=-0.263152</code> → <code>PURE-DAMPING</code> → <code>SAFE_HOLD</code>；紧接着 down-detect 判 <code>robot is DOWN/FALLING</code> → 自动纯阻尼。地面真值（<code>:5570</code>）骨盆 <code>(8.07, 0.92, 0.07)</code>，倾角 <b>71.9°</b>，确认是倒了不是误判。<br>
+                <b>摔得又快又"安静"</b>：<code>grav_z</code> 走 <code>-0.97</code>(14°) → <code>-0.77</code>(40°) → <code>-0.263</code>(75°)，全程 <b>1.76 秒</b>。日志里<b>没有任何先兆事件</b>——intent 没断、watchdog 没报警、pose 源没切换；摔倒后 sender 仍在正常发 50 Hz，所以也不是链路问题。<br>
+                <b>安全链本身四级全部按设计触发</b>，这部分是好的：tilt → 纯阻尼 → SAFE_HOLD → down-detect → 自动纯阻尼。
+              </div>
+              <div class="note crit">
+                <span class="lb">★ 复现性 + 最小复现：局部内容触发，不依赖历史</span>
+                同盘 tape 重跑（2026-09-30），栈重建、模型指纹每次都相同（<code>model_step_045000.pt</code> / <code>native-3enc:52d8ca59</code>），<b>变量只有"哪一次运行"</b>：
+
+                <table>
+                  <tr><th>run</th><th>打进去的 tape</th><th>起跑后摔倒</th><th>摔倒前 grav_z</th></tr>
+                  <tr><td>1</td><td>seg02 全长</td><td><b>227.0 s</b></td><td>-0.97 → -0.77 → -0.263</td></tr>
+                  <tr><td>2</td><td>seg02 全长</td><td><b>227.9 s</b></td><td>-0.98 → -0.76 → -0.279</td></tr>
+                  <tr><td>3</td><td>seg02 <b>从 t=215 s 切</b>（19.5 s）</td><td><b>12.9 s</b></td><td>塌缩形状相同</td></tr>
+                  <tr><td>4</td><td>seg02 <b>从 t=220 s 切</b>（14.5 s）</td><td><b>7.7 s</b></td><td>塌缩形状相同</td></tr>
+                </table>
+
+                <b>切段照样摔，而且摔点折算回原始 tape 是同一时刻 → 触发来自局部内容，与 215 秒之前的历史状态无关。</b>run1/run2 差 0.9 秒（0.4%），是确定性复现不是偶发。<br>
+                <b>由此确定排除的：</b>接缝（都在第一圈回卷<b>之前</b>摔）、deploy 自身时钟（run1 摔在 <code>policy_t=634 s</code>、run2 在 <code>policy_t=242 s</code>，差得远）、intent 断流（每次 sender 到摔倒时都还在正常发 50 Hz）、CPU 争用。
+              </div>
+              <div class="note crit">
+                <span class="lb">★ 找到根因了：录到的「人根朝向」持续倾倒</span>
+                <b>回放里 <code>body[:,0,3:7]</code>（SMPL 根关节朝向）一旦出现持续 ≳1.5 秒的 &gt;30° 偏离直立，机器人必摔，摔在事件开始后 <b>4.22 ± 0.11 秒</b>。</b>四跑（含两次切段、含一盘从没跑过的 tape）逐一对上：
+
+                <table>
+                  <tr><th>跑次</th><th>tape</th><th>切点</th><th>预测</th><th>实测</th><th>残差</th></tr>
+                  <tr><td>2</td><td>seg02</td><td>不切</td><td>+227.818 s</td><td>+227.900 s</td><td>−0.082</td></tr>
+                  <tr><td>3</td><td>seg02</td><td>t=215</td><td>+12.808 s</td><td>+12.938 s</td><td>−0.130</td></tr>
+                  <tr><td>4</td><td>seg02</td><td>t=220</td><td>+7.808 s</td><td>+7.687 s</td><td>+0.121</td></tr>
+                  <tr><td>5</td><td><b>seg01</b></td><td>不切</td><td>+19.425 s</td><td>+19.334 s</td><td>+0.091</td></tr>
+                </table>
+
+                <b>区分因子是「持续时长」不是「幅度」。</b>≲0.4 秒的 &gt;30° 瞬时毛刺<b>从不</b>致摔——seg02 在 t=35/50/55/78/134 秒都有 32~36° 毛刺，全部安全度过；≳1.5 秒的持续倾倒必摔。<br>
+                seg02 只有一个这样的持续事件：<b>t=223.600 秒</b>（197 帧 / 2.32 秒 / 峰值 52.9°），同时也是全 tape 最大倾角（中位只有 4.9°、95 分位 17.4°）。seg01 有<b>三个</b>：t=15.206 秒（187 帧 / 63.5°）、18.77 秒、28.24 秒（188 帧 / 86.0°）——<b>机器人摔在第一个</b>，它撑不过第一个就到不了后面。<br>
+                <b>机制链：</b><code>live_pico_smpl_teleop.py:469</code> 的 <code>build_smpl_obs</code> 把根朝向以 <code>rel = cur.inv() * o</code>（人根朝向 ÷ 机器人基座朝向）写进 obs → 策略命令机器人跟着倾 → 越过 tilt watchdog（<code>--tilt-cos -0.3</code> ≈107°）→ PURE-DAMPING → SAFE_HOLD。1.76 秒的 grav_z 塌缩与此吻合。<br>
+                <b>报给上游的结论：这是 tape 的录制缺陷，不是模型/栈的问题。</b>要干净输入就重录，或回放前先离线跑一次根朝向倾角检查剔除。
+              </div>
+              <div class="note warn">
+                <span class="lb">它不会让机器人走起来——这是对的，别当成没跟上</span>
+                <code>pico_intent_sender.py:603</code> 是 <code>full_tape = "full_session" in _tape_files</code>。自带这段 tape 的字段只有 <code>stamp_ns / body / body_ok / headset / lctrl / rctrl / axes / buttons / analog</code>，<b>没有 <code>full_session</code></b>，于是 <code>dual_mode=False</code>——<b>tape 不驱动 locomotion</b>，走位仍归 kplanner/pad。<br>
+                实测表现：机器人在原地做上半身动作 + 重心转移（pelvis 高度稳定 0.66~0.67 m），31 个仿真秒里只漂了约 1 米。
+              </div>
+              <div class="note warn">
+                <span class="lb">这两盘自带 tape 本身就录得不干净</span>
+                离线解剖两盘仓库自带 tape（都是 <code>2026-09-17</code> 录的），特征一致，是<b>录制管线</b>的问题不是偶发：
+                <br>· <b>物理不可能的根位移</b>：seg02 有 <b>128 帧</b>（0.66%）骨盆水平速度 &gt; 4 m/s，最大 <b>13.1 m/s</b>（seg01 有 40 帧，最大 6.4 m/s）。真人做不到。而 <code>body_ok</code> <b>全程 True</b>——<b>tape 自己不标记这些帧无效</b>。摔倒所在的 t=210~234 s 窗口里占了 10 帧。
+                <br>· <b>65% 的相邻帧完全重复</b>：录制器按 100 Hz 轮询，而 SDK 体感流只更新约 <b>31 Hz</b>，同一姿势被记了很多遍。所以标称 82.5 fps 的 tape，<b>有效姿势率只有 ~31 Hz</b>。
+                <br>· 录的时候人<b>基本站着没动</b>：骨盆水平速度中位数 <b>0.00 m/s</b>、竖直 std 仅 0.10 m。<b>别用"累计位移 96 米"判断这盘 tape 是走路的</b>——那个数是上面那些尖峰贡献的，我先前据此说"人在走"是错的。
+                <br>· 朝向通道（<code>body[...,3:7]</code> 四元数）<b>能正常解出，约定是 (x,y,z,w)</b>：<code>sRot.from_quat(body[:,0,[6,3,4,5]], scalar_first=True)</code> 后取 <code>apply([0,1,0])[:,1]</code>，开局 10 秒 mean <b>+0.996</b>（人直立），全 tape 中位 4.9°。我先前说"两种约定都解不出自洽结果"是我用错了约定，<b>收回</b>。<b>而且根朝向恰恰就是摔倒的触发通道，见上两条。</b>
+              </div>
+              <div class="note accent">
+                <span class="lb">怎么停 / 什么时候必须停</span>
+                停：pad 上按 <b>LB+RB</b> 或 <b>RB+B</b>，或直接 Ctrl-C sender。<br>
+                <b>起 live 遥操之前必须先停掉它</b>——<code>run_pico_teleop.sh</code> 有「一个目标只允许一个 sender」的互斥保护，两个 sender 会把 <code>engaged</code> 标志打成几 Hz 的抖动，1 秒 warm-up 永远完不成（脚本里引的是 2026-09-05 真机那次的教训）。
+                <br><b>另一件事：</b>tape 会循环，接缝处一帧内把姿态弹回第 0 帧——<b>在接缝处摔倒属于回放artifact，不是模型的问题。</b>想避免就用 <code>--tape-once</code>。
+                <br><b>但这次的摔倒不是接缝，别甩锅给它。</b>回放是<b>按设备时间戳间隔</b>走的，不是帧数 ÷50 Hz——见 <code>utils/teleop/pico_tape.py:119</code> 的 <code>_offsets</code> 和 <code>_idx()</code> 的 <code>el % self._span</code>。所以一圈 = <b>234.5 秒</b>（stamp 跨度），而不是 19358÷50 = 387 秒。<b>摔在圈内 223.6 秒处，比第一次回卷还早 11 秒</b>；我先前说"摔在第一次回卷之后"是错的（用错了圈长），收回。<br>
+                <b>真正的原因是 tape 内容本身</b>——见上面「找到根因了」那条：录到的人根朝向持续倾倒，机器人跟着倾过去。切段重放照样摔，所以跟回卷、跟历史状态都无关。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-7">
+            <div class="body">
+              <label class="ttl" for="c-s3-7">起遥操，对着仿真里的 X2 走一遍</label>
+              <p class="desc">仿真栈起着的时候，另开一个终端跑（注意这个终端要 <code>source setup/activate.sh</code>，在 <code>czq/</code> 下操作）。</p>
+              <div class="cmd">
+                <pre>cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
+./gear_sonic/scripts/run_pico_teleop.sh</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <div class="note ok">
+                <span class="lb">不需要再设 <code>PICO_PC_SERVICE_DIR</code> 了</span>
+                守护进程已经在 <code>:60061</code> 上跑着，脚本会走「already running」分支，那个变量根本不会被读。<br>
+                真要设的话，值应该是 <code>czq/roboticsservice</code>（自带 ICU、能跑），<b>不是</b> <code>pico_service/opt/apps/roboticsservice</code>（缺 ICU 70，起不来）——见第 2 条。
+              </div>
+              <div class="note accent">
+                <span class="lb">报错对照</span>
+                <ul>
+                  <li><code>--input-source pico needs .venv_teleop</code> → 第 1 条没做</li>
+                  <li>tracker 都连着但 <code>body: False</code> 一直是 → 标定丢了，回第 4 条</li>
+                  <li>三个只配上两个 → <code>max tracker usage</code> 还是 2，回第 3 条</li>
+                  <li><code>ENGAGE REFUSED</code> → 身体解算冻住或挂了：重新标定，并保持 app 在前台</li>
+                  <li><code>REFUSING: another sender … already targets</code> → 第 6 条的 tape 没停</li>
+                </ul>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s3-8">
+            <div class="body">
+              <label class="ttl" for="c-s3-8">根朝向安全边界：命令侧倾角软限幅（<code>--root-tilt-limit-deg</code>）</label>
+              <p class="desc">上一节的根因（<b>录到的人根朝向持续 ≳1.5 s 偏离直立 &gt;30°，机器人必摔，摔在 onset 后 4.22 ± 0.11 s</b>）是可以从命令侧拦住的——不是在策略后面加事后急停，而是在<b>把根朝向写进 obs 之前</b>把它钳住。默认开启，<code>0</code> 关闭。</p>
+              <div class="note ok">
+                <span class="lb">它做什么：swing-twist 软限幅，不是欧拉分量钳制</span>
+                保留绕 up 轴的 heading（twist），只把总倾角（swing）钳到阈值。放在
+                <code>gear_sonic/utils/teleop/root_tilt_guard.py</code>，由
+                <code>LiveSmplSource.window()</code> / <code>SmplFileSource.window()</code> 收口，<b>tape 与 live 两条路都过</b>。<br>
+                <b>为什么不用欧拉</b>：ZYX 欧拉下 <code>tilt = arccos(cos θ_pitch · cos φ_roll)</code>，
+                pitch/roll 各自钳到 ±30° 的最坏总倾角是 <b>41.4°</b>，口径和实测的「总倾角 30°」对不上。<br>
+                <b>未超限时逐位透传</b>（返回原对象，不是副本）——正常遥操零扰动，这条有测试守着。<br>
+                <b>倾角在设备帧与 wire 帧之间严格不变</b>（可证：<code>R_wire e_z ≡ R_dev e_y</code>，
+                两向量被同一正交阵作用），所以实测阈值可直接用，无需换算。真实 tape 上数值验证
+                <code>max|θ_dev − θ_wire| = 1.87e-05°</code>（纯 float32 舍入）。
+              </div>
+              <div class="note crit">
+                <span class="lb">★★ 但 memoryless 的守卫自己会致摔——严格 A/B 已确证</span>
+                建成后第一次 sim 验证就发现<b>守卫让情况变坏了</b>。三次跑同一盘 seg02、同一个 <code>policy_t</code> 触发：
+
+                <table>
+                  <tr><th>跑次</th><th>守卫</th><th>offset</th><th>摔在 tape_t</th></tr>
+                  <tr><td>baseline</td><td>OFF</td><td>7.62</td><td>219.96</td></tr>
+                  <tr><td>run4</td><td>OFF</td><td>7.92</td><td>220.45</td></tr>
+                  <tr><td>run3</td><td><b>ON（memoryless, cap 25）</b></td><td>8.08</td><td><b>78.52</b></td></tr>
+                  <tr><td>run5</td><td><b>ON（ramp 0.6 s, cap 25）</b></td><td>7.97</td><td><b>没摔</b>（整盘 234.5 s 播完）</td></tr>
+                </table>
+
+                <b>守卫把摔倒提前了 141 秒。</b>机理：<code>tape_t 78.00~78.30</code> 是一段
+                <b>0.30 s 的平滑小鼓包</b>（脊柱链峰 31.49°、根倾角峰 34.25°），原始信号无害
+                ——这类 ≲0.4 s 毛刺 seg02 全程有 5 处，从不致摔。但 memoryless 守卫在这 26 帧上
+                <b>全部超限、全部施加钳制</b>，绕 <b>ROLL</b> 轴（<code>[-0.80,-0.60,0.00]</code>）
+                转了 6.49°。机器人 0.27 s 后就摔了。<br>
+                <b>所以任何单一阈值都救不了</b>：要放过这个毛刺需要 cap &gt; 34.25°，
+                要兜住真事件需要 cap &lt; 30°——<b>区间是空的</b>。唯一能区分二者的是
+                <b>持续时长</b>（0.30 s vs 2.3 s），不是幅度。
+              </div>
+              <div class="note accent">
+                <span class="lb">修法：软启动 ramp（<code>--root-tilt-ramp-s</code>，默认 0.6 s）</span>
+                钳制强度从超限第 1 帧起随时间线性增长，<code>T=0.6 s</code> 到全强度。
+                短毛刺只被部分钳制，真事件在 0.6 s 内拿到全部保护——<b>远在 4.22 s 窗口之内</b>。<br>
+                <b>衰减是非对称的</b>（<code>_RAMP_DECAY = 2.0</code>）：超限帧是「操作者在倾」的证据，
+                应该守住；单个未超限帧<b>不是</b>「倾完了」的证据——10 帧滑窗在 20 ms 步进下，
+                真事件的大半时间都有几帧还在阈值下。2.0 意味着满充 0.5 s 只要 0.25 s 净空就忘掉，
+                比毛刺回落用的 ~0.1 s 长，所以毛刺跨调用攒不起来。<br>
+                <code>0</code> = 退回 memoryless。env 旋钮 <code>PICO_ROOT_TILT_RAMP_S</code>。
+                启动时会打印实际生效值，日志里能看到 <code>[tiltcap] operator root tilt cap: 25 deg, ramped to full strength over 0.6 s</code>。
+              </div>
+              <div class="note warn">
+                <span class="lb">ramp 的代价（离线量化，如实报）</span>
+                在 ramp 上升期输出会短暂超过 30°：全程累计 <b>1.557 s</b>（memoryless 是 0.000 s），
+                分 6 段，最长一段 <b>0.356 s</b>（<code>t=50.13~51.02</code>），输出峰值 35.59°，
+                共 125 帧 / 0.65% 的 tape，全部发生在 strength 0.100~0.767。<br>
+                <b>每一段都短于 0.4 s——即实测中从未摔过这台机器人的时长带——但最坏那段只剩 0.044 s 余量。</b>
+                这是这个方案的真实成本，别当成零。<br>
+                <b>致死毛刺被压住了</b>：<code>78.00~78.30</code> 段的强度峰值只有 0.500~0.567，
+                永不达全强度，施加旋转从 6.49° 降到 ≤3.69°。
+              </div>
+              <div class="note ok">
+                <span class="lb">★ sim 实测判决：存活（2026-09-30）</span>
+                <code>cap 25 / ramp 0.6 s / TRIG=6.00 / offset 7.97</code>，ran 整盘 seg02 到
+                <code>[tape] exit (replay complete)</code>：<b><code>grep -cE '^\[FATAL\] \[17'</code> = 0</b>，
+                全程 <code>alpha=1.00</code>、<code>grav_z</code> 健康。<br>
+                <b>ramp 一处修掉了两个摔点</b>：memoryless 摔的 <code>tape_t 78.52</code>，
+                以及无守卫基线摔的 <code>tape_t 219.96 / 220.45</code>。后者原本不在预期内——
+                先前判断「那里根通道只有 20°，守卫够不着」，实测表明<b>躯干链钳制在那个窗口确实起了作用</b>。
+                生产日志的收尾行与离线数字吻合：<code>root capped on 3150/120000 frames (2.62%)</code>
+                （离线 2.55%）、<code>300 at the geometric floor</code>（可达锥残差 0.25%）。<br>
+                <b>顺带纠正一个自己造出来的假警报</b>：在全索引上比 <code>root(输出) &gt; root(输入)</code>
+                会报 1420 帧，看着像守卫放大倾角。实际是离线缓存前向填充（50 Hz 调用落不到的 tape 帧
+                用上一帧顶上）造成的<b>比对错位</b>。只在真被调用命中的帧上比，这个数是 <b>0</b>——
+                「输出倾角恒不超过原始输入」严格成立。<b>单次调用隔离测试另确认：保序，未超限帧逐位透传。</b>
+              </div>
+              <div class="note warn">
+                <span class="lb">还没做（别当成已验证）</span>
+                · seg01 不切、seg02 切 @215 / 切 @220 在 ramp 下重跑<br>
+                · 不误伤回归：<code>:5570</code> 地面真值比「有守卫/无守卫」的 <code>pelvis_qpos_wxyz</code>，未钳时段要求 &lt; 1 cm
+              </div>
+            </div>
+          </li>
+
+        </ul>
+      </section>
+
+      <!-- ── L4 ────────────────────────────────────────────────────── -->
+      <section class="stage" id="s4" data-stage="s4">
+        <header class="stage-hd">
+          <span class="num">L4</span>
+          <h2>真机</h2>
+          <span class="chip mute">本机没有机器人</span>
+          <span class="count">0/0</span>
+        </header>
+        <p class="lede">这一级现在做不了，但安全条目要先记住——它们不是流程里的可选步骤，是「不知道就会弄坏机器」的那种。真正的部署流程在 <code>docs/x2/F10_real_robot_colcon.md</code>。</p>
+
+        <ul class="items">
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-1">
+            <div class="body">
+              <label class="ttl" for="c-s4-1">记住停止命令，并知道它做什么</label>
+              <p class="desc">从笔记本上执行。它做的是 RAMP_OUT，然后交还给 MC——<b>是平稳卸力，不是断电</b>。</p>
+              <div class="cmd">
+                <pre>./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host &lt;PC2_IP&gt;</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-2">
+            <div class="body">
+              <label class="ttl" for="c-s4-2">绝不在机器人站着的时候 kill deploy 的 tmux 会话</label>
+              <p class="desc">这是最容易顺手做错的一步：出了怪事，第一反应是 Ctrl-C 或者 kill 掉那个会话。在站着的机器人上做这个，等于把控制权从它脚下抽走。</p>
+              <div class="note crit">
+                <span class="lb">另一条</span>
+                <b>MC 重启会直接掉到 ZERO TORQUE。</b>不是慢慢卸力，是瞬间没有保持力矩。所以也别拿「重启一下试试」当排查手段。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-3">
+            <div class="body">
+              <label class="ttl" for="c-s4-3">急停手势：先做一遍，并且知道怎么解除</label>
+              <p class="desc">按 <b>A+X</b>，然后反复扣两个扳机。扣 3 次以上 = SOFT stop；继续扣大约 1 秒 = PURE DAMPING。</p>
+              <div class="note crit">
+                <span class="lb">解除要完整重来</span>
+                解除不是松开就行：先松开 A+X，<b>等够 5 秒</b>，再把整套手势重做一遍。中途急着操作会解不掉。
+              </div>
+              <div class="note warn">
+                <span class="lb">急停 ≠ 保持</span>
+                急停之后机器人不会「停在原地撑着」。要它保持姿态，靠的是 deploy 在跑；一旦进了停止链，力矩就撤了。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-4">
+            <div class="body">
+              <label class="ttl" for="c-s4-4">确认端口和域跟仿真的对应关系</label>
+              <p class="desc">真机用 5556 / 5557 / 5558 / 5563 / 5568；仿真那套是同一批 +100，也就是 5656 / 5658 / 5659 / 5663 / 5668。两边都跑 <code>ROS_DOMAIN_ID=73</code>、<code>ROS_LOCALHOST_ONLY=1</code>。</p>
+              <div class="note accent">
+                <span class="lb">为什么不直接把真机端口写进仿真</span>
+                仿真是故意隔开的：如果仿真和真机用同一批端口又同时在这台机器上跑（比如做 A/B 对比时），流量会串。看到端口号不对先别改，去 <code>PORT_REGISTRY.md</code> 查这张表是不是本来就该这样。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-5">
+            <div class="body">
+              <label class="ttl" for="c-s4-5">读一遍模型身份门到底比对了什么</label>
+              <p class="desc">launcher 在起之前，会把你将要跑的每一个模型和真机上<b>实际部署的那一份</b>做 md5 比对，并打印真机文件的最后修改时间，让「陈旧产物」看得见。然后自动挑本地 md5 相同的那个 ONNX。这样「你在测的东西」和「机器人在跑的东西」是构造上同一份，而不是靠人记。</p>
+              <div class="note ok">
+                <span class="lb">为什么这条值得花时间</span>
+                这个门抓到过一次真机在跑 <code>ft_2082_g1.onnx</code>，而所有 sim launcher 用的都是 <code>walkft_3065_g1.onnx</code>——也就是说仿真验证的根本不是机器人上那个策略。而那个模型在本机所有数值检查和肉眼检查里都正常。
+              </div>
+            </div>
+          </li>
+
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s4-6">
+            <div class="body">
+              <label class="ttl" for="c-s4-6">过一遍 PC2 的 bring-up 与 preflight</label>
+              <p class="desc">真机部署是 rsync 文件 + pip + colcon 编译，然后由 ritual 点火拉起一组守护进程。完整的顺序、每个守护进程的角色、点火手势（<code>L1+L2+R1+R2</code> 按住约 3 秒 → 松手 → 按 <b>Y</b>）都在 F10 里。</p>
+              <div class="cmd">
+                <pre>sed -n '1,200p' docs/x2/F10_real_robot_colcon.md</pre>
+                <button class="copy" type="button">复制</button>
+              </div>
+              <p class="desc">机器人端日志里的成功标志是 <code>GATE PASSED</code> → <code>x2_deploy STARTED</code>，然后 deploy 面板打出 <code>Loaded ONNX: …</code> 和 <code>[plant] RUNTIME PLANT LOADED: …</code>。</p>
+            </div>
+          </li>
+
+        </ul>
+      </section>
+
+      <!-- ── L5 ────────────────────────────────────────────────────── -->
+      <section class="stage" id="s5" data-stage="s5">
+        <header class="stage-hd">
+          <span class="num">L5</span>
+          <h2>训练与微调</h2>
+          <span class="chip crit">本机做不了</span>
+          <span class="count">0/0</span>
+        </header>
+        <p class="lede">训练要 GPU 集群，不在本机。这一级只是把这件事记下来，免得后面在本地白折腾一轮。</p>
+
+        <ul class="items">
+          <li class="item">
+            <input class="ck" type="checkbox" id="c-s5-1">
+            <div class="body">
+              <label class="ttl" for="c-s5-1">确认本机只做推理和验证，训练走 Nebius</label>
+              <p class="desc">要微调或导出自己的模型时看这两份：<code>docs/x2/F12_training_nebius.md</code>（集群上的流程）和 <code>MODELS.md</code>（每个模型变量的文件契约和导出方式）。仓库自带的模型够跑通 L2 和 L3，不需要先训练。</p>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <!-- ── 待决定 ────────────────────────────────────────────────── -->
+      <section class="ref ask">
+        <h2>要你拍板的三件事</h2>
+        <p class="lede">这三个卡在流程中间，定不下来就没法往下走。在终端里说一声就行。</p>
+
+        <div class="ask-item">
+          <span class="qn">01</span>
+          <div>
+            <h3>PC Service 走哪条路？</h3>
+            <p>三条路的安全性差别很大：A 是系统级安装（碰红线），B 是本地解包加环境变量（推荐），C 是复用已经在跑的那个（最快但版本可能不匹配）。</p>
+          </div>
+        </div>
+
+        <div class="ask-item">
+          <span class="qn">02</span>
+          <div>
+            <h3><code>.venv_teleop</code> 现在装，还是先只验回放？</h3>
+            <p><code>install_pico.sh</code> 里的 <code>dpkg -i</code> 和红线冲突，得先决定怎么绕。如果只是想先确认链路通，可以先跑 tape replay——它不需要这个环境，用 <code>.venv</code> 就能验证仿真侧。</p>
+          </div>
+        </div>
+
+        <div class="ask-item">
+          <span class="qn">03</span>
+          <div>
+            <h3>这次复现的目标定在哪一级？</h3>
+            <p>到 L3（在仿真里用 Pico 把 X2 全身带起来）就收，还是要奔 L4 真机？这决定要不要现在就把 PC Service 和 tracker 这些前置条件一次做干净。</p>
+          </div>
+        </div>
+      </section>
+
+      <div class="foot">
+        <p>依据：仓库里的 <code>README_X2.md</code>、<code>docs/x2/</code> 下的 runbook、<code>gear_sonic/scripts/</code> 里的 launcher 源码，以及本机的实测状态（docker 可跑、git-lfs 路径、<code>/opt/apps/roboticsservice</code> 缺失、正在跑的 <code>./RoboticsServiceProcess</code>）。</p>
+        <p>页面源码在本仓库根目录的 <code>x2_repro_checklist.html</code>，不需要了直接删。</p>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<script>
+(function () {
+  var KEY = 'gx2-repro-checklist-v1';
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('.ck'));
+
+  var store = null;
+  try {
+    store = window.localStorage;
+    store.getItem(KEY);
+  } catch (e) {
+    store = null;
+  }
+
+  function load() {
+    if (!store) return {};
+    try {
+      var raw = store.getItem(KEY);
+      var parsed = raw ? JSON.parse(raw) : {};
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function save(state) {
+    if (!store) return;
+    try { store.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  var state = load();
+
+  boxes.forEach(function (b) {
+    if (Object.prototype.hasOwnProperty.call(state, b.id)) {
+      b.checked = !!state[b.id];
+    }
+    b.addEventListener('change', function () {
+      state[b.id] = b.checked;
+      save(state);
+      render();
+    });
+  });
+
+  var doneEl  = document.getElementById('done');
+  var totalEl = document.getElementById('total');
+  var barEl   = document.getElementById('bar');
+
+  function render() {
+    var doneAll = 0, totalAll = 0;
+
+    Array.prototype.forEach.call(document.querySelectorAll('.stage[data-stage]'), function (sec) {
+      var key = sec.getAttribute('data-stage');
+      var list = sec.querySelectorAll('.ck');
+      var d = 0;
+      Array.prototype.forEach.call(list, function (b) { if (b.checked) d++; });
+
+      doneAll += d;
+      totalAll += list.length;
+
+      var count = sec.querySelector('.count');
+      if (count) count.textContent = d + '/' + list.length;
+
+      var rc = document.querySelector('.rc[data-for="' + key + '"]');
+      if (rc) rc.textContent = d + '/' + list.length;
+
+      var row = document.querySelector('.rail-row[data-for="' + key + '"]');
+      if (row) row.classList.toggle('complete', list.length > 0 && d === list.length);
+    });
+
+    doneEl.textContent = doneAll;
+    totalEl.textContent = totalAll;
+    barEl.style.width = (totalAll ? (doneAll / totalAll * 100) : 0) + '%';
+  }
+
+  // copy buttons
+  Array.prototype.forEach.call(document.querySelectorAll('.copy'), function (btn) {
+    btn.addEventListener('click', function () {
+      var pre = btn.parentNode.querySelector('pre');
+      if (!pre) return;
+      var text = pre.textContent;
+
+      function flash(msg) {
+        var old = btn.textContent;
+        btn.textContent = msg;
+        window.setTimeout(function () { btn.textContent = old; }, 1500);
+      }
+
+      function selectIt() {
+        try {
+          var r = document.createRange();
+          r.selectNodeContents(pre);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(r);
+          flash('已选中 · Ctrl+C');
+        } catch (e) {
+          flash('复制失败');
+        }
+      }
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          function () { flash('已复制'); },
+          function () { selectIt(); }
+        );
+      } else {
+        selectIt();
+      }
+    });
+  });
+
+  // two-step reset (no confirm() dialogs inside artifacts)
+  var reset = document.getElementById('reset');
+  var armed = false;
+  var timer = null;
+
+  function disarm() {
+    armed = false;
+    reset.textContent = '重置';
+    reset.classList.remove('danger');
+    if (timer) { window.clearTimeout(timer); timer = null; }
+  }
+
+  reset.addEventListener('click', function () {
+    if (!armed) {
+      armed = true;
+      reset.textContent = '再点一次确认';
+      reset.classList.add('danger');
+      timer = window.setTimeout(disarm, 3500);
+      return;
+    }
+    disarm();
+    state = {};
+    save(state);
+    boxes.forEach(function (b) {
+      b.checked = b.hasAttribute('data-default');
+    });
+    render();
+  });
+
+  render();
+})();
+</script>

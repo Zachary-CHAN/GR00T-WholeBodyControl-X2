@@ -30,7 +30,9 @@ Reference pages: [`ARCHITECTURE.md`](ARCHITECTURE.md) (stack diagrams),
 [`TRAINING_NOTES.md`](TRAINING_NOTES.md) (run history, reward deviations, traps),
 [`BUILD_CHAIN.md`](BUILD_CHAIN.md) (what rebuilds when),
 [`gamepad_cheatsheet.md`](gamepad_cheatsheet.md), [`../../MODELS.md`](../../MODELS.md),
-[`../../x2_pc2/PORT_REGISTRY.md`](../../x2_pc2/PORT_REGISTRY.md) (every ZMQ port).
+[`../../x2_pc2/PORT_REGISTRY.md`](../../x2_pc2/PORT_REGISTRY.md) (every ZMQ port),
+[`PICO_LIVE_TELEOP_PITFALLS.md`](PICO_LIVE_TELEOP_PITFALLS.md) (live-teleop failure
+signatures, disproved hypotheses, the probe).
 
 ## 10-minute quickstart (sim, no robot)
 

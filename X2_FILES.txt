@@ -6,6 +6,7 @@
 #
 # Anything tracked that is absent from this list is upstream and must be treated as such on a rebase.
 
+A	CLAUDE.md	Claude Code project context for this port: navigation, the local deploy state, and the pitfalls the runbooks leave out.
 A	MODELS.md	MODELS.md — the shipped default set, and bring-your-own models for the X2 stack — One native 3-encoder SONIC set ships in this repository under
 A	README_X2.md	AgiBot X2 Ultra support — This branch adds the AgiBot X2 Ultra (31 DOF, OmniHand) as a second
 A	docs/x2/ARCHITECTURE.md	X2 stack architecture — Diagrams of the runtime stacks, the teleop sources, the model build chain and
@@ -22,6 +23,7 @@ A	docs/x2/F09_mujoco_sim.md	F09 — MuJoCo sim stack — Two launchers, one stac
 A	docs/x2/F10_real_robot_colcon.md	F10 — Real robot: PC2 bring-up, colcon build, push, ritual — The robot side runs on PC2 (Jetson Orin NX, aarch64) under one prefix
 A	docs/x2/F11_docker.md	F11 — Docker test image — `gear_sonic_deploy/docker_x2/` is a ROS 2 Humble + ONNX Runtime + MuJoCo
 A	docs/x2/F12_training_nebius.md	F12 — Training and finetuning on Nebius — Training uses the upstream SONIC trainer (`gear_sonic/train_agent_trl.py`,
+A	docs/x2/PICO_LIVE_TELEOP_PITFALLS.md	Pico live teleop pitfalls (2026-09-30) — The three gates that keep the robot still, the failure signatures, and the hypotheses that were disproved.
 A	docs/x2/README.md	AgiBot X2 Ultra on GEAR-SONIC — runbook index — This directory documents the X2 feature set carried on this branch: gamepad
 A	docs/x2/TRAINING_NOTES.md	Public run history: lineages and GPU-hours of the shipped sets, the reward terms that differ from the SONIC paper and the A/B that would settle them, the traps that cost GPU-hours.
 A	docs/x2/gamepad_cheatsheet.md	X2 gamepad cheat sheet (demo pad, untethered) — Bindings come from two places and the sheet reflects their combination
@@ -275,6 +277,7 @@ A	gear_sonic/scripts/pc2_pad_daemon.py	PC2-resident gamepad daemon: pad events b
 A	gear_sonic/scripts/pc2_pico_token_service.py	PC2-side SMPL token service — the robot-local half of whole-body teleop.
 A	gear_sonic/scripts/pico_button_probe.py	Standalone Pico face-button / trigger probe.
 A	gear_sonic/scripts/pico_intent_sender.py	LAPTOP intent sender — whole-body teleop, Quest-split architecture.
+A	gear_sonic/scripts/pico_tape_root_tilt_cap.py	Offline causal intervention: cap the operator ROOT tilt in a recorded Pico tape.
 A	gear_sonic/scripts/pico_tape_to_smpl_obs.py	Pico tape -> clean SMPL stream for the SONIC smpl encoder (840-D path).
 A	gear_sonic/scripts/pico_token_sender.py	LAPTOP half of robot whole-body teleop: Pico -> tokens -> PC2 pose topic.
 A	gear_sonic/scripts/pkl_to_x2m2.py	Window a motion-lib clip and write it as X2M2 for the dance/clip player.
@@ -312,6 +315,7 @@ A	gear_sonic/scripts/x2_pkl_command_source.py	PKL-driven ``planner_cmd`` publish
 A	gear_sonic/scripts/x2_pose_merger.py	x2_pose_merger.py -- laptop-side pose merger for the X2 planner stacks.
 A	gear_sonic/scripts/x2_pose_mux.py	x2_pose_mux.py -- laptop-side N-to-1 pose multiplexer.
 A	gear_sonic/tests/data/wrist_maxrange_20260905_002744Z.npz	Test fixture capture (operator headset/controller frames) via git-lfs.
+A	gear_sonic/tests/test_root_tilt_clamp.py	Lean-guard tests: root clamp invariants (hard cap, bit-exact pass-through, azimuth/heading preserved), torso min-max convergence and continuity, at-floor counting, + the live window() insertion point.
 A	gear_sonic/tests/test_wrist_map_regression.py	Wrist mapping regression: operator max-range clip -> X2 wrist chain angles.
 A	gear_sonic/trl/callbacks/finetune_rate_schedule_callback.py	Trainer callback that schedules the finetune sampling rate over iterations (used by the pico finetune configs).
 A	gear_sonic/trl/modules/frozen_core_g1_actor.py	FrozenCore T2 actor module: frozen GEAR-SONIC G1 core + Phi codec, batched.
@@ -346,6 +350,7 @@ A	gear_sonic/utils/teleop/online_sonic_tokenizer.py	Online wrapper around :class
 A	gear_sonic/utils/teleop/operator_calibration.py	Per-operator wrist position + orientation calibration for VR teleop.
 A	gear_sonic/utils/teleop/pico_3pt.py	Pico/XRoboToolkit 24-joint body pose -> 3-point VR pose reduction.
 A	gear_sonic/utils/teleop/pico_tape.py	Pico/XRoboToolkit stream tape: record live xrt samples, replay headset-free.
+A	gear_sonic/utils/teleop/root_tilt_guard.py	Operator lean cap: the measured 30 deg / 1.5 s fall boundary as a command-side clamp on BOTH channels that carry the lean -- the root swing (guard_window_quats) and the torso chain in the 72-value joint block (cap_torso_lean). Shared by the live guard and the offline tape tool.
 A	gear_sonic/utils/teleop/smpl_obs.py	Torch/mujoco-free SMPL-observation assembly for the whole-body pipeline.
 A	gear_sonic/utils/teleop/solver/arm/__init__.py	X2 arm inverse kinematics for VR teleop.
 A	gear_sonic/utils/teleop/solver/arm/x2_arm_fk.py	Forward kinematics for the AgiBot X2 arm chains.
@@ -552,6 +557,7 @@ A	x2_pc2/start_x2_motor_monitor.sh	autogenerated by x2_pc2_daemons.sh for tmux s
 A	x2_pc2/start_x2_pose_watchdog_local.sh	Per-run log stamp.
 A	x2_pc2/x2-camera-bridge.service	Boot service on PC2 (Jetson).
 A	x2_pc2/x2-pad-autopair.service	Paths are the default PC2_PREFIX; x2_pc2/install_pad_autopair_service.sh rewrites them when the install prefix differs.
+A	x2_repro_checklist.html	GR00T-X2 reproduction checklist (rendered HTML): red lines, local deploy state, and the sim / Pico teleop / real-robot acceptance items.
 
 M	.gitattributes	Machine learning models and data files
 M	.gitignore	Byte-compiled / optimized / DLL files

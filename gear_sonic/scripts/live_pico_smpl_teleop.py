@@ -73,6 +73,10 @@ from gear_sonic.scripts.pico_manager_thread_server import (  # noqa: E402
     compute_from_body_poses,
 )
 from gear_sonic.scripts.pico_tape_to_smpl_obs import SMPL_PARENTS  # noqa: E402
+from gear_sonic.utils.teleop.root_tilt_guard import (  # noqa: E402
+    ROOT_TILT_CAP_DEG, ROOT_TILT_RAMP_S, guard_window_pose, set_root_tilt_cap,
+    set_root_tilt_ramp,
+)
 
 SMPL_WINDOW = 10
 SMPL_DT = 0.02
@@ -314,7 +318,17 @@ class LiveSmplSource:
         idx = idx.clip(0, len(ring) - 1)
         joints = np.stack([ring[i][1] for i in idx])
         quats = np.stack([ring[i][2] for i in idx])
-        return joints, quats
+        # Operator lean guard (2026-09-30): root channel, then torso channel.
+        # The 72-value joint block carries as much of the operator's fold as
+        # the 6-D root block does, so guarding only the root leaves seg01
+        # falling at 25 deg and again at 10 deg.  Tape replay comes through
+        # this same call, so --tape-replay exercises the guard as a live
+        # operator would.
+        #
+        # `now` drives the ramp: one advance per call, which is the rate this
+        # window slides at.  The 10 frames overlap the previous call's by 9,
+        # so anything counted per frame would be counted ten times.
+        return guard_window_pose(joints, quats, now)
 
 
 class SmplFileSource:
@@ -404,7 +418,10 @@ class SmplFileSource:
             self._end_announced = True
         idx = np.clip(np.arange(i - SMPL_WINDOW + 1, i + 1),
                       0, len(self._joints) - 1)
-        return self._joints[idx], self._quats[idx]
+        # Same guard as the live path: this source also drives the policy, so
+        # an unbounded lean falls here too.  Pass --root-tilt-limit-deg 0 when
+        # analysing raw operator data.
+        return guard_window_pose(self._joints[idx], self._quats[idx], now)
 
 
 _CUE_DIR = None
@@ -631,6 +648,32 @@ def main() -> int:
                          "policy wrist output is prior noise — twisted "
                          "hands. --no-wrist-hold restores raw policy "
                          "wrists for testing)")
+    ap.add_argument("--root-tilt-limit-deg", type=float,
+                    default=ROOT_TILT_CAP_DEG,
+                    help="cap the operator's lean at this many degrees from "
+                         "upright, on BOTH channels that carry it: the root "
+                         "orientation (swing clamp, heading preserved) and the "
+                         "torso chain inside the joint block (rigid rotation "
+                         "about the pelvis, stance untouched). The Pico tapes "
+                         "fell at every sustained >30 deg lean: the policy "
+                         "tracks it and trips the deploy tilt watchdog 4.22 s "
+                         "later. Root-only is not enough -- with the root "
+                         "pinned upright seg01 still leans 28.9 deg through "
+                         "the torso. 25 leaves margin under that line. "
+                         "0 = off. Default: $PICO_ROOT_TILT_CAP_DEG, else "
+                         f"{ROOT_TILT_CAP_DEG:g}.")
+    ap.add_argument("--root-tilt-ramp-s", type=float,
+                    default=ROOT_TILT_RAMP_S,
+                    help="seconds of continuous over-cap lean before the cap "
+                         "reaches full strength; clamp strength grows with "
+                         "time over the cap. A memoryless cap bounded every "
+                         "FRAME but not the ROBOT: the 0.30 s / 31.5 deg blip "
+                         "at seg02 tape_t 78 made the guard rotate the upper "
+                         "body 6.49 deg about ROLL and the robot fell 0.27 s "
+                         "later, while the 2.3 s / 52.9 deg event is the real "
+                         "target. Duration is what separates them. 0 = "
+                         "memoryless clamp. Default: $PICO_ROOT_TILT_RAMP_S, "
+                         f"else {ROOT_TILT_RAMP_S:g}.")
     ap.add_argument("--auto-engage", action="store_true",
                     help="skip the SPACE gate (implied by --headless)")
     ap.add_argument("--no-record", action="store_true",
@@ -642,6 +685,14 @@ def main() -> int:
                          "(default: $PICO_TAPES_DIR/sessions, PICO_TAPES_DIR=<repo>/logs/pico_tapes; "
                          "same root pico_intent_sender.py uses)")
     args = ap.parse_args()
+
+    _tilt = set_root_tilt_cap(args.root_tilt_limit_deg)
+    _ramp = set_root_tilt_ramp(args.root_tilt_ramp_s)
+    print("[tiltcap] operator root tilt cap: "
+          + ("OFF" if _tilt <= 0 else f"{_tilt:.0f} deg")
+          + ("" if _tilt <= 0 else
+             (" (memoryless)" if _ramp <= 0 else
+              f", ramped to full strength over {_ramp:.1f} s")), flush=True)
 
     if not (args.checkpoint or args.onnx):
         ap.error("need --checkpoint and/or --onnx")

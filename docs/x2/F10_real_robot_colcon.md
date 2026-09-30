@@ -251,7 +251,8 @@ policy back. The deploy now has a `RECOVER` state:
 5. **Abort.** Any tilt past `--tilt-cos` during the stand-up, or stale state
    for 0.5 s, drops straight back to SAFE_HOLD pure damping; the gate can
    re-arm. `--no-safe-hold-recover` disables the path. `x2_debug` carries an
-   `in_recover` flag; `tick.csv` reasons are `recover_stiffen` / `recover_standup`.
+   `in_recover` flag; the ritual's `${PC2_PREFIX}/log/deploy_ritual_*/tick.csv`
+   reasons are `recover_stiffen` / `recover_standup`.
 
 **Helper procedure on the robot (first trials on the gantry).** Lift the robot
 upright and hold it still with the feet on the ground and the knees bent.

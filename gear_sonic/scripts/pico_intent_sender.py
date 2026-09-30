@@ -57,6 +57,9 @@ sys.path.insert(0, str(SCRIPTS.parents[1]))
 
 from scipy.spatial.transform import Rotation as Rot  # noqa: E402
 from live_pico_smpl_teleop import LiveSmplSource, _audio_cue  # noqa: E402
+from gear_sonic.utils.teleop.root_tilt_guard import (  # noqa: E402
+    ROOT_TILT_CAP_DEG, ROOT_TILT_RAMP_S, set_root_tilt_cap, set_root_tilt_ramp,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message  # noqa: E402
 from gear_sonic.utils.teleop.vr.button_state_machine import ButtonStateMachine  # noqa: E402
 from gear_sonic.utils.teleop.vr.intent_decoder import (  # noqa: E402
@@ -556,6 +559,32 @@ def main() -> int:
                          "head-look route, commit 123e1b2). Knobs: "
                          "HEAD_YAW_SIGN (+1), HEAD_YAW_GAIN (1.0), "
                          "HEAD_YAW_MAX_RAD (0.35), HEAD_YAW_DEADBAND_DEG (2).")
+    ap.add_argument("--root-tilt-limit-deg", type=float,
+                    default=ROOT_TILT_CAP_DEG,
+                    help="cap the operator's lean at this many degrees from "
+                         "upright, on BOTH channels that carry it: the root "
+                         "orientation (swing clamp, heading preserved) and the "
+                         "torso chain inside the joint block (rigid rotation "
+                         "about the pelvis, stance untouched). The Pico tapes "
+                         "fell at every sustained >30 deg lean: the policy "
+                         "tracks it and trips the deploy tilt watchdog 4.22 s "
+                         "later. Root-only is not enough -- with the root "
+                         "pinned upright seg01 still leans 28.9 deg through "
+                         "the torso. 25 leaves margin under that line. "
+                         "0 = off. Default: $PICO_ROOT_TILT_CAP_DEG, else "
+                         f"{ROOT_TILT_CAP_DEG:g}.")
+    ap.add_argument("--root-tilt-ramp-s", type=float,
+                    default=ROOT_TILT_RAMP_S,
+                    help="seconds of continuous over-cap lean before the cap "
+                         "reaches full strength; clamp strength grows with "
+                         "time over the cap. A memoryless cap bounded every "
+                         "FRAME but not the ROBOT: the 0.30 s / 31.5 deg blip "
+                         "at seg02 tape_t 78 made the guard rotate the upper "
+                         "body 6.49 deg about ROLL and the robot fell 0.27 s "
+                         "later, while the 2.3 s / 52.9 deg event is the real "
+                         "target. Duration is what separates them. 0 = "
+                         "memoryless clamp. Default: $PICO_ROOT_TILT_RAMP_S, "
+                         f"else {ROOT_TILT_RAMP_S:g}.")
     ap.add_argument("--rate-report-s", type=float, default=10.0)
     ap.add_argument("--no-record", action="store_true",
                     help="disable the intent tape. DEFAULT IS RECORD for live "
@@ -573,6 +602,14 @@ def main() -> int:
                          "these raw clips are what pico_tape_to_x2_gmr.py "
                          "consumes. --no-record disables both.")
     args = ap.parse_args()
+
+    _tilt = set_root_tilt_cap(args.root_tilt_limit_deg)
+    _ramp = set_root_tilt_ramp(args.root_tilt_ramp_s)
+    print("[tiltcap] operator root tilt cap: "
+          + ("OFF" if _tilt <= 0 else f"{_tilt:.0f} deg")
+          + ("" if _tilt <= 0 else
+             (" (memoryless)" if _ramp <= 0 else
+              f", ramped to full strength over {_ramp:.1f} s")), flush=True)
 
     ctx = zmq.Context.instance()
     # BOUNDED QUEUES (2026-09-06 robot session on a jittery AP: "at least 5 second lag from when I

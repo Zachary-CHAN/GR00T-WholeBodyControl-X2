@@ -75,12 +75,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # layout in both worlds. Keeps `-DONNXRUNTIME_ROOT=/opt/onnxruntime` (the
 # default `deploy_x2.sh` passes) hitting the right files.
 ARG ONNXRUNTIME_VERSION=1.16.3
-RUN cd /tmp && \
+# aarch64 (Jetson) hosts must use the linux-aarch64 prebuilt; x86_64 keeps
+# the original linux-x64 tarball (same version + install path either way).
+RUN _ort_arch="$(uname -m | sed 's/^arm.*$/x64/;s/^aarch64$/aarch64/;s/^x86_64$/x64/')" && cd /tmp && \
     wget -q --tries=3 \
-        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${_ort_arch}-${ONNXRUNTIME_VERSION}.tgz" \
         -O onnxruntime.tgz && \
     tar xzf onnxruntime.tgz && \
-    mv "onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}" /opt/onnxruntime && \
+    mv "onnxruntime-linux-${_ort_arch}-${ONNXRUNTIME_VERSION}" /opt/onnxruntime && \
     rm onnxruntime.tgz && \
     echo /opt/onnxruntime/lib > /etc/ld.so.conf.d/onnxruntime.conf && \
     ldconfig
