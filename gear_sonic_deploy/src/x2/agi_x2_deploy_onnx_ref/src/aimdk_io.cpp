@@ -4,6 +4,8 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 namespace agi_x2 {
 
@@ -14,6 +16,48 @@ inline double SteadyNowSec()
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+// aimdk_msgs JointState gained per-motor coil_temp/motor_temp in a newer
+// release; robots still shipping aimdk <= 0.9 (e.g. the 0.9.0.4 install on
+// our first PC2) have name/position/velocity/effort/error_code only. Detect
+// the members at compile time so the same source builds against either
+// message generation: without the fields the temps read as 0 C, which just
+// means the ThermalMonitor (notification-only, no derating) never trips.
+template <typename T, typename = void>
+struct HasCoilTemp : std::false_type {};
+template <typename T>
+struct HasCoilTemp<T, std::void_t<decltype(std::declval<const T&>().coil_temp)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasMotorTemp : std::false_type {};
+template <typename T>
+struct HasMotorTemp<T, std::void_t<decltype(std::declval<const T&>().motor_temp)>>
+    : std::true_type {};
+
+// Accessors must be function templates: a discarded if-constexpr branch is
+// only skipped when instantiated from a template (in a plain function both
+// branches are fully checked), so the member access lives here where the
+// false instantiation never compiles it.
+template <typename T>
+double CoilTempOf(const T& joint)
+{
+  if constexpr (HasCoilTemp<T>::value) {
+    return static_cast<double>(joint.coil_temp);
+  } else {
+    return 0.0;
+  }
+}
+
+template <typename T>
+double MotorTempOf(const T& joint)
+{
+  if constexpr (HasMotorTemp<T>::value) {
+    return static_cast<double>(joint.motor_temp);
+  } else {
+    return 0.0;
+  }
 }
 
 }  // namespace
@@ -165,10 +209,8 @@ void AimdkIo::IngestJointGroup(const aimdk_msgs::msg::JointStateArray& msg,
   for (std::size_t i = 0; i < group_len; ++i) {
     latest_state_.joint_pos_mj[start_mj_idx + i] = msg.joints[i].position;
     latest_state_.joint_vel_mj[start_mj_idx + i] = msg.joints[i].velocity;
-    latest_state_.coil_temp_c[start_mj_idx + i] =
-        static_cast<double>(msg.joints[i].coil_temp);
-    latest_state_.motor_temp_c[start_mj_idx + i] =
-        static_cast<double>(msg.joints[i].motor_temp);
+    latest_state_.coil_temp_c[start_mj_idx + i] = CoilTempOf(msg.joints[i]);
+    latest_state_.motor_temp_c[start_mj_idx + i] = MotorTempOf(msg.joints[i]);
   }
   out_stamp_field = SteadyNowSec();
   out_seen_field  = true;
