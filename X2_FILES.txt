@@ -593,3 +593,4 @@ M	motionbricks/motionbricks/motion_backbone/demo/clips.py	get the actual data in
 M	motionbricks/motionbricks/motion_backbone/models/pose_model.py	the other key args here: most of them for compatibility only and won't be used at all
 M	motionbricks/motionbricks/motionlib/core/skeletons/__init__.py	flake8: noqa
 M	pyproject.toml	Root pyproject.toml — tooling configuration only.
+A	docs/x2/MODES_AND_MC_NOTES.md	Code-level analysis notes (2026-10-09): MC version coupling (waistmc tuning), hybrid locomotion+Pico-arms support, WHOLE_BODY vs LOCOMOTION data/control flow table, 31-DOF + floating-base evidence.

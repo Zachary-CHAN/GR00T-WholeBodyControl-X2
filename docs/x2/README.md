@@ -32,7 +32,9 @@ Reference pages: [`ARCHITECTURE.md`](ARCHITECTURE.md) (stack diagrams),
 [`gamepad_cheatsheet.md`](gamepad_cheatsheet.md), [`../../MODELS.md`](../../MODELS.md),
 [`../../x2_pc2/PORT_REGISTRY.md`](../../x2_pc2/PORT_REGISTRY.md) (every ZMQ port),
 [`PICO_LIVE_TELEOP_PITFALLS.md`](PICO_LIVE_TELEOP_PITFALLS.md) (live-teleop failure
-signatures, disproved hypotheses, the probe).
+signatures, disproved hypotheses, the probe),
+[`MODES_AND_MC_NOTES.md`](MODES_AND_MC_NOTES.md) (MC version coupling, hybrid
+locomotion + Pico-arms support, WHOLE_BODY vs LOCOMOTION data/control flow).
 
 ## 10-minute quickstart (sim, no robot)
 
