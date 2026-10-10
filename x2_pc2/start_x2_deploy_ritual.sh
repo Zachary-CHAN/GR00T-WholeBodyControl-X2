@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PC2-resident deploy launcher for GAMEPAD RITUAL ignition. Checked into the
-# repo at x2_pc2/ and staged to /home/run/gear-sonic/ by pc2_bringup.sh.
+# repo at x2_pc2/ and staged to /home/agi/gear-sonic/ by pc2_bringup.sh.
 #
 # WHY THIS FILE EXISTS (2026-07-29 blocked-ignition incident):
 # the ritual scripts used to launch the deploy via log/start_x2_deploy.sh,
@@ -64,7 +64,7 @@
 # Ignition is the pad chord, so there is no shell to export from -- change the
 # number on the --intra-op-threads line below to A/B it, and compare tick.csv
 # period tails on the SAME model.
-PREFIX="${PC2_PREFIX:-/home/run/gear-sonic}"
+PREFIX="${PC2_PREFIX:-/home/agi/gear-sonic}"
 # Source the robot profile FIRST: it carries X2_RITUAL_TUNING (the tuning
 # switch) so the pad-CHORD ignition selects the preset -- the operator
 # holds the robot at SONIC start and can never be at a keyboard
@@ -321,7 +321,7 @@ cd "${PREFIX}/gear_sonic_deploy" && \
         --onbot-ws "${PREFIX}/ws" \
         --onbot-venv "${PREFIX}/venv" \
         --onbot-onnxruntime "${PREFIX}/onnxruntime" \
-        --onbot-aimdk-prefix /agibot/software/housekeeper/bin/aimdk_msgs \
+        --onbot-aimdk-prefix /home/agi/aimdk/install/aimdk_msgs \
         ${WATCHDOG_ARGS} ${WB_ARGS} \
         --tuning-config "${TUNING}" \
         --max-target-dev-head "${HEAD_DEV}" \
