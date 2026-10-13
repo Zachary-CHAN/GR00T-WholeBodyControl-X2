@@ -166,9 +166,24 @@ class ClutchArm:
         position_scale: float = 1.0,
         rotation_weight: float = 0.5,
         target_slew_m_s: float = 0.6,
+        freeze_pos_err_m: float = 0.12,
+        jump_guard_rad: float = 0.22,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
+        # FREEZE GUARD thresholds (see step()): a solve with position error
+        # beyond freeze_pos_err_m, or one reachable from the current q only
+        # by a per-tick joint jump beyond jump_guard_rad, is treated as
+        # "not solvable this tick" and the previous command is resent.
+        # Calibrated separation: a legit fold-through-shoulder overhead pass
+        # peaks at 0.167 rad/tick, while an elbow-branch reconfiguration
+        # hammers the solver step cap (0.30-0.60 rad/tick) continuously --
+        # guard 0.22 with a 3-tick persistence requirement sits between.
+        self.freeze_pos_err_m = float(freeze_pos_err_m)
+        self.jump_guard_rad = float(jump_guard_rad)
+        self.hold_ticks = 3
+        self._hold_votes = 0
+        self.holding = False
         # rotation_weight 0 = position-only IK (the live jitter fix: unfiltered
         # controller orientation noise through 7-DoF shakes the whole arm;
         # the wrist joints saturate near their +-0.558 rad pitch range anyway)
@@ -275,11 +290,33 @@ class ClutchArm:
             if n > self.target_slew:
                 tgt_pos = self._tgt_slewed + step_v * (self.target_slew / n)
             self._tgt_slewed = tgt_pos.copy()
-        self.q, self.last_ik = self.solver.solve(
+        q_new, ik = self.solver.solve(
             self.q, tgt_pos, tgt_rot.as_quat(scalar_first=True), max_iters=IK_ITERS_PER_TICK
         )
         off = 0 if self.side == "left" else 7
-        self.q = np.clip(self.q, ubt.ARM_LO[off : off + 7], ubt.ARM_HI[off : off + 7])
+        q_new = np.clip(q_new, ubt.ARM_LO[off : off + 7], ubt.ARM_HI[off : off + 7])
+        # FREEZE GUARD (live round 6: crossing the arms shook the robot -- a
+        # midline-crossing target has no continuous joint path from the
+        # current elbow branch, and the DLS answers with max-rate joint
+        # swings; a diverged solve is worse still). A solution is ACCEPTED
+        # only if it is finite, its position error is sane, and it is
+        # reachable from the current q without a jump; otherwise the
+        # previous command is resent unchanged (the robot holds). Diverged /
+        # non-finite solves latch instantly; a jump must persist hold_ticks
+        # consecutive ticks (transient spikes during a legitimate
+        # fold-through-shoulder pass must not freeze the arm mid-motion).
+        # Resume is automatic: the first subsequent acceptable solve wins.
+        nonfinite = not np.isfinite(q_new).all()
+        if nonfinite or ik.pos_err_m > self.freeze_pos_err_m:
+            self._hold_votes = self.hold_ticks  # instant, latched
+        elif np.abs(q_new - self.q).max() > self.jump_guard_rad:
+            self._hold_votes += 1
+        else:
+            self._hold_votes = 0
+        self.holding = self._hold_votes >= self.hold_ticks
+        if not self.holding:
+            self.q = q_new
+        self.last_ik = ik
         return self.q.copy(), self.last_ik
 
 
@@ -783,6 +820,57 @@ def check_extended_stability() -> None:
     assert dq.max() < 0.005, f"commanded q still moving: {dq.max():.4f} rad/tick"
 
 
+def check_ik_freeze_guard() -> None:
+    """Live round 6: crossing the arms shook the robot -- a solve needing a
+    sustained joint JUMP (elbow branch reconfiguration), a diverged solve,
+    or a NaN must be REJECTED: the previous command is resent (robot
+    holds). The three failure paths are injected straight into the solver
+    so the guard logic itself is what's under test; recovery is verified
+    by restoring the real solver."""
+    arm = ClutchArm("right", 1.0, 0.0, target_slew_m_s=0.0)  # slew off: full jumps
+    pose = np.zeros(7)
+    pose[3] = 1.0
+    pose[:3] = arm.solver.fk(arm.q)[0]
+    assert arm.engage(pose)
+    orig = arm.solver.solve
+
+    # 1) sustained max-rate joint swings (an elbow flip answers every tick
+    #    with solver-cap steps): latches only after the persistence window
+
+    def flip_solve(q_seed, *_a, **_k):
+        return np.asarray(q_seed, np.float64) + 0.5, IKResult(0.01, 0.0, 2, 0)
+
+    arm.solver.solve = flip_solve
+    for _ in range(arm.hold_ticks - 1):
+        arm.step(True, pose)
+    assert not arm.holding, "persistence window: must not latch on the first spike"
+    q_mid = arm.step(True, pose)[0]
+    assert arm.holding, "sustained solver-cap steps must latch"
+    q_a = arm.step(True, pose)[0]
+    np.testing.assert_array_equal(q_a, q_mid, err_msg="latched: resend the last command")
+
+    # 2) diverged position error: INSTANT latch
+    def lost_solve(q_seed, *_a, **_k):
+        return np.asarray(q_seed, np.float64), IKResult(0.9, 0.0, 2, 0)
+
+    arm.solver.solve = lost_solve
+    q_b = arm.step(True, pose)[0]
+    assert arm.holding and np.array_equal(q_b, q_a), "diverged solve must hold instantly"
+
+    # 3) NaN: INSTANT latch, never command garbage
+    arm.solver.solve = lambda _s, *_a, **_k: (np.full(7, np.nan), IKResult(9.9, 9.9, 0, 0))
+    q_c = arm.step(True, pose)[0]
+    assert arm.holding and np.array_equal(q_c, q_a), "NaN solve must hold instantly"
+
+    # 4) solver recovers -> resumes on the next acceptable solve
+    arm.solver.solve = orig
+    arm.disengage()
+    assert arm.engage(pose)
+    q, _ = arm.step(True, pose)
+    assert not arm.holding, "resume after the solver recovers"
+    np.testing.assert_allclose(q, q_a, atol=1e-9)
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -794,6 +882,7 @@ CHECKS = [
     ("torso_frame", check_torso_frame),
     ("overhead_clamp", check_overhead_clamp),
     ("extended_stability", check_extended_stability),
+    ("ik_freeze_guard", check_ik_freeze_guard),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 
@@ -988,6 +1077,7 @@ def main() -> int:
             if now - last_stat > 2.0:
                 last_stat = now
                 hz = n_ticks / (now - t0)
+                hold = "".join(s[0].upper() for s in ("left", "right") if arms[s].holding)
                 print(
                     f"[sim] {'L' if held['left'] else '-'}"
                     f"{'R' if held['right'] else '-'} "
@@ -995,6 +1085,7 @@ def main() -> int:
                     f"R {arms['right'].last_ik.pos_err_m*1000:5.1f}mm "
                     f"waist {math.degrees(waist.cmd):+5.1f}deg "
                     f"loop {hz:4.1f}Hz "
+                    f"hold={hold or '-'} "
                     f"err={nerr} stale={int(not fresh)}"
                 )
                 n_ticks = 0
