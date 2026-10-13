@@ -464,15 +464,15 @@ _YUP_TO_ZUP = Rot.from_matrix(np.array([[1.0, 0.0, 0.0],
 #   q2 = Rx(90deg) ⊗ q1              (smpl_root_ytoz_up: y-up -> z-up)
 #   q3 = q2 ⊗ base⁻¹                 (remove_smpl_base_rot; base = 120deg
 #                                     about [1,1,1], the SMPL rest pose)
-# The chain then runs SMPL FK with root orient q2 and transl = the RAW
-# pelvis position, IN THE RAW Y-UP SLAM WORLD (world offset kept), and
-#   smpl_joints_local = q3⁻¹ · joints      (exact: 0.000 mm on tapes)
-# So the canonical frame is root-orientation-removed but NOT pelvis-zeroed
-# (smpl_joints_local[0] = q3⁻¹·transl ≠ 0). Canonicalising a controller
-# point is therefore simply q3⁻¹ · c[:3] -- raw y-up SLAM position, NO
-# pelvis subtraction, NO extra y->z rotation (q3 already carries it; the
-# first draft applied both and the double Rx90 was the live "hand in
-# front, robot hand behind" inversion).
+# The chain's ONLY use here is _canonical_root_inv (the pytest exactness
+# lock: canonicalising the chain's own FK output must reproduce
+# smpl_joints_local bit-for-bit). It is NOT usable for the controllers:
+# live-probe round 3 (2026-10-13) showed the FK reconstruction and the RAW
+# SDK joint positions have NO rigid correspondence (per-joint scale 0.8-1.14,
+# jw[0] != raw pelvis, residuals ~0.5 m) -- no canonicalization chain can
+# carry a controller pose into the wire smpl_joints frame. It doesn't need
+# to: the clutch teleop wants the OPERATOR TORSO frame, which is measurable
+# directly from the raw joints (see _torso_M below).
 _RY180 = Rot.from_euler("y", 180.0, degrees=True)
 _SMPL_BASE_INV = Rot.from_quat(np.array([0.5, 0.5, 0.5, 0.5])).inv()  # wxyz in
 _ZERO_POSE7 = np.zeros(7, np.float32)
@@ -486,28 +486,41 @@ def _canonical_root_inv(body: np.ndarray) -> Rot:
     return ((_YUP_TO_ZUP * (q_raw * _RY180)) * _SMPL_BASE_INV).inv()
 
 
-# FRAME-ROTATION SMOOTHING (live jitter round 2, 2026-10-13: jitter persisted
-# with the sim-side pose LPF + position-only IK). The canonical frame rotates
-# with the RAW per-tick pelvis quat, so its orientation noise swings the whole
-# canonicalized controller pose about the pelvis (~0.6 m radius) -- filter the
-# quat at the SOURCE, where the noise is a single rotation, not a Cartesian
-# cloud. tau 0.15 s in the tangent space; state drops with the body stream.
-_ROOT_LPF = {"rot": None, "tau_s": 0.15}
+# OPERATOR TORSO FRAME from the RAW SDK joints (live round 3, 2026-10-13;
+# replaces the canonical-chain attempts that caused "still jitter + cannot
+# lift overhead" -- canonicalized targets landed >1 m outside the robot
+# workspace and the DLS thrashed against joint limits):
+#   up  = neck(12) - pelvis(0);  lat = L sh(16) - R sh(17), orthogonalised
+#   fwd = lat x up;  M = rows [fwd, lat, up]
+#   p_torso = M (c - pelvis);  q_torso = R(M) * q_c
+# fwd=+x / left=+y / up=+z, pelvis origin -- the robot convention, so the
+# sim consumes anchor deltas 1:1 with no further frame math. Live-verified
+# on the probe: |ctrl_torso - raw_wrist_torso| = 9.1 +- 0.2 cm, exactly the
+# physical hand-held offset, stable frame to frame. M is blended (tau) and
+# re-orthonormalised (SVD) each tick; degenerate joints keep the last M.
+_TORSO_LPF = {"M": None, "tau_s": 0.2}
 
 
-def _smoothed_root_inv(body: np.ndarray, dt: float) -> Rot:
-    """_canonical_root_inv with the pelvis quat low-pass filtered (the
-    wire path; the pure version stays available for exactness tests)."""
-    q_raw = Rot.from_quat(
-        np.array([body[0, 6], body[0, 3], body[0, 4], body[0, 5]]), scalar_first=True
-    )
-    if _ROOT_LPF["rot"] is None or _ROOT_LPF["tau_s"] <= 0.0:
-        _ROOT_LPF["rot"] = q_raw
-    else:
-        a = dt / (_ROOT_LPF["tau_s"] + dt)
-        r = _ROOT_LPF["rot"]
-        _ROOT_LPF["rot"] = Rot.from_rotvec(a * (r.inv() * q_raw).as_rotvec()) * r
-    return ((_YUP_TO_ZUP * (_ROOT_LPF["rot"] * _RY180)) * _SMPL_BASE_INV).inv()
+def _torso_M(body: np.ndarray, prev_M, tau_s: float, dt: float):
+    """Rows [fwd, lat, up] of the raw-joint torso frame, low-pass filtered.
+    Degenerate joints keep prev_M (may be None: caller must treat as dead)."""
+    pelv = body[0, :3]
+    up = body[12, :3] - pelv
+    lat = body[16, :3] - body[17, :3]
+    n_up, n_lat = np.linalg.norm(up), np.linalg.norm(lat)
+    if n_up < 0.05 or n_lat < 0.05:
+        return prev_M
+    up = up / n_up
+    lat = lat - (lat @ up) * up
+    lat /= np.linalg.norm(lat)
+    fwd = np.cross(lat, up)
+    tgt = np.stack([fwd, lat, up])
+    if prev_M is None or tau_s <= 0.0:
+        return tgt
+    a = dt / (tau_s + dt)
+    blend = prev_M + a * (tgt - prev_M)
+    u, _s, vt = np.linalg.svd(blend)  # re-orthonormalise
+    return u @ vt
 
 
 def _ctrl_wire_fields(xrt, lt, rt):
@@ -516,12 +529,11 @@ def _ctrl_wire_fields(xrt, lt, rt):
     Returns a dict for pack_pose_message: lctrl_pose/rctrl_pose f32[7]
     (xyz + quat wxyz) and trigger/grip f32[2] ([l, r]).
 
-    Poses are in the SMPL canonical frame -- the same frame as the wire
-    smpl_joints (pelvis-anchored, root-orientation-removed), so consumers
-    may mix them (e.g. build the operator torso frame from smpl_joints and
-    rotate controller deltas with it). Anchoring only removes the pelvis
-    ORIENTATION at the given tick; deltas between ticks remain the raw
-    controller motion.
+    Poses are in the OPERATOR TORSO frame (fwd=+x, left=+y, up=+z, pelvis
+    origin; see _torso_M) -- the anatomical frame the robot's arm targets
+    live in, so any headset-tracking frame error cancels by construction.
+    Deltas between ticks are the controller's motion relative to the
+    operator's torso (torso rotation while holding does not move the arm).
 
     Safe defaults everywhere: no xrt (intent-tape replay) or any SDK
     read failure -> all zeros (freeze + hands closed).
@@ -537,16 +549,21 @@ def _ctrl_wire_fields(xrt, lt, rt):
     try:
         body = np.asarray(xrt.get_body_joints_pose(), np.float64).reshape(24, 7)
         if np.linalg.norm(body[0, 3:7]) < 0.5:  # dead body stream: drop filter
-            _ROOT_LPF["rot"] = None
+            _TORSO_LPF["M"] = None
             return fields
-        root_inv = _smoothed_root_inv(body, CONTROL_DT)
+        M = _torso_M(body, _TORSO_LPF["M"], _TORSO_LPF["tau_s"], CONTROL_DT)
+        _TORSO_LPF["M"] = M
+        if M is None:  # degenerate joints from frame one: no frame, no poses
+            return fields
+        pelv = body[0, :3]
+        rM = Rot.from_matrix(M)
         fields["grip"] = np.array(
             [float(xrt.get_left_grip()), float(xrt.get_right_grip())], np.float32)
         for name, getter in (("lctrl_pose", xrt.get_left_controller_pose),
                              ("rctrl_pose", xrt.get_right_controller_pose)):
             c = np.asarray(getter(), np.float64).reshape(7)
-            pos = root_inv.apply(c[:3])          # raw y-up -> canonical
-            q = root_inv * (_YUP_TO_ZUP * Rot.from_quat(c[3:]))       # xyzw in
+            pos = M @ (c[:3] - pelv)
+            q = rM * Rot.from_quat(c[3:])                               # xyzw in
             fields[name] = np.concatenate(
                 [pos, q.as_quat(scalar_first=True)]).astype(np.float32)  # wxyz out
     except Exception:

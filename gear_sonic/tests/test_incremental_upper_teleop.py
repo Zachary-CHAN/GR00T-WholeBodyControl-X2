@@ -45,6 +45,10 @@ def test_input_lpf():
     iutm.check_input_lpf()
 
 
+def test_torso_frame():
+    iutm.check_torso_frame()
+
+
 def test_overhead_clamp():
     iutm.check_overhead_clamp()
 
@@ -70,6 +74,42 @@ def test_ctrl_canonicalization_matches_wire_chain():
     jl = r["smpl_joints_local"][0].numpy().astype(np.float64)  # wire frame
     err = np.abs(_canonical_root_inv(body).apply(jw) - jl).max()
     assert err < 1e-5, f"canonical frame mismatch: {err * 1000:.3f} mm"
+
+
+def test_ctrl_torso_frame_from_raw_joints():
+    """The sender frames controller poses with M built from the RAW SDK
+    joints (up=neck-pelvis, lat=shoulder line, fwd=lat x up). A synthetic
+    person in an arbitrary SLAM pose: a controller offset that is +fwd in
+    the person's anatomical axes must come out +x regardless of the world
+    pose (live round 3: this is what finally killed the jitter + the
+    unreachable-target thrash -- the canonical chain cannot do this)."""
+    import numpy as np
+    from pico_intent_sender import _torso_M
+    from scipy.spatial.transform import Rotation as sRot
+
+    body = np.zeros((24, 7))
+    body[0, :3] = [1.2, -0.4, 0.7]  # pelvis anywhere in the SLAM world
+    body[12, :3] = body[0, :3] + [0.1, 0.05, 0.6]  # neck up-ish
+    body[16, :3] = body[0, :3] + [-0.1, 0.2, 0.45]  # L shoulder
+    body[17, :3] = body[0, :3] + [-0.1, -0.2, 0.45]  # R shoulder
+    M = _torso_M(body, None, 0.2, 0.02)
+    # the person's anatomical axes expressed in world coords (rows of M are
+    # fwd/lat/up in world; columns map world -> torso)
+    fwd_w, up_w = M[0], M[2]
+    ctrl = body[0, :3] + 0.3 * fwd_w + 0.15 * up_w  # 0.3 m forward, 0.15 m up
+    np.testing.assert_allclose(M @ (ctrl - body[0, :3]), [0.3, 0.0, 0.15], atol=1e-9)
+    assert abs(np.linalg.det(M) - 1.0) < 1e-9, "M must be a proper rotation"
+    # rotation path: the sender transforms a controller ORIENTATION as a
+    # pose (q_torso = R(M) * q_c, not a conjugation) -- a controller whose
+    # world orientation equals the torso frame itself ((R_M)^-1) must
+    # arrive as the identity
+    rM = sRot.from_matrix(M)
+    q_ctrl = rM.inv()
+    q_torso = rM * q_ctrl
+    assert q_torso.magnitude() < 1e-9, "quat pose path broke the torso frame"
+    # degenerate joints: keep the previous frame (None stays None -> dead)
+    assert _torso_M(np.zeros((24, 7)), None, 0.2, 0.02) is None
+    assert _torso_M(np.zeros((24, 7)), M, 0.2, 0.02) is M
 
 
 def test_model_and_head_hold():

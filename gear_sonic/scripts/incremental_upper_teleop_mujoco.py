@@ -16,9 +16,10 @@ one DLS tick per 50 Hz frame (x2_arm_ik.ArmIKSolver, ported anchor
 logic from vr_arm_teleop.py v1). Trigger released -> the arm freezes.
 
 Input: the laptop sender's pico_intent wire (SUB-bind), which now also
-packs lctrl_pose/rctrl_pose f32[7] (pelvis-anchored Z-up, xyz + quat
-wxyz), trigger f32[2], grip f32[2]. The SMPL stream only feeds the
-waist (shoulder line vs hip line). Model: X2 + OmniHand
+packs lctrl_pose/rctrl_pose f32[7] ALREADY in the operator torso frame
+(fwd=+x, left=+y, up=+z, pelvis origin -- the sender builds it from the
+raw SDK joints), trigger f32[2], grip f32[2]. The SMPL stream only feeds
+the waist (shoulder line vs hip line). Model: X2 + OmniHand
 (compose_x2_with_omnihand), floating base pinned (gantry), 20x1 ms
 substeps under the 50 Hz commands.
 
@@ -293,6 +294,59 @@ class PoseLpf:
             self.pos = self.pos + a * (p - self.pos)
             self.rot = sRot.from_rotvec(a * (self.rot.inv() * r).as_rotvec()) * self.rot
         return np.concatenate([self.pos, self.rot.as_quat(scalar_first=True)])
+
+
+# ---------------------------------------------------------------------------
+# Torso frame: canonical(wire) -> the operator's anatomical axes.
+# ---------------------------------------------------------------------------
+class TorsoFrame:
+    """Canonical(wire) -> the operator's anatomical axes (fwd=+x, left=+y,
+    up=+z -- the robot convention), built from the wire smpl_joints.
+
+    Primary use: the WAIST path -- the twist formula assumes up=+z /
+    lateral=+y, which the raw canonical frame is not (it keeps the SMPL
+    120-deg base rotation). The controller poses no longer pass through
+    here: the sender frames them in an equivalent raw-joint torso frame at
+    the source (live round 3, 2026-10-13 -- the canonical chain cannot
+    carry controller data, the raw/FK skeletons are not rigidly related).
+    Smoothed (tau) and re-orthonormalised every tick.
+    """
+
+    def __init__(self, tau_s: float = 0.2) -> None:
+        self.tau = float(tau_s)
+        self.M = np.eye(3)
+
+    def step(self, j24: np.ndarray, dt: float) -> np.ndarray:
+        j24 = np.asarray(j24, np.float64).reshape(24, 3)
+        up = j24[12] - j24[0]  # neck - pelvis
+        lat = j24[16] - j24[17]  # R->L shoulder line
+        n_up, n_lat = np.linalg.norm(up), np.linalg.norm(lat)
+        if n_up < 0.05 or n_lat < 0.05:
+            return self.M  # degenerate: keep the last frame
+        up = up / n_up
+        lat = lat - (lat @ up) * up  # orthogonalise, keep R->L sense
+        lat /= np.linalg.norm(lat)
+        fwd = np.cross(lat, up)  # right-handed: x = y x z
+        tgt = np.stack([fwd, lat, up])  # rows: canonical vec -> torso coords
+        if self.tau > 0.0:
+            a = dt / (self.tau + dt)
+            self.M = self.M + a * (tgt - self.M)
+            u, _s, vt = np.linalg.svd(self.M)  # re-orthonormalise
+            self.M = u @ vt
+        else:
+            self.M = tgt
+        return self.M
+
+    def transform(self, pose7: np.ndarray) -> np.ndarray:
+        """Map one canonical 7-DoF pose into torso coordinates."""
+        c = np.asarray(pose7, np.float64).reshape(7)
+        if np.linalg.norm(c) < 1e-6:
+            return c
+        out = np.empty(7)
+        out[:3] = self.M @ c[:3]
+        rot = sRot.from_matrix(self.M) * sRot.from_quat(c[3:], scalar_first=True)
+        out[3:] = rot.as_quat(scalar_first=True)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +700,34 @@ def check_overhead_clamp() -> None:
     ), f"wrist not overhead: only {p[2] - arm.shoulder[2]:.2f} m above shoulder"
 
 
+def check_torso_frame() -> None:
+    """A synthetic person whose canonical joints are the anatomical pose
+    rotated by a constant R0: the torso map must undo R0 (a forward reach
+    in canonical coords lands on torso +x whatever R0 is)."""
+    j24 = np.zeros((24, 3))
+    j24[0] = [0.0, 0.0, 0.0]  # pelvis
+    j24[12] = [0.0, 0.0, 0.6]  # neck straight up
+    j24[16], j24[17] = [0.0, 0.2, 0.5], [0.0, -0.2, 0.5]  # R->L shoulder line
+    r0 = sRot.from_euler("xyz", [35.0, -70.0, 15.0], degrees=True)
+    rot = r0.as_matrix()
+    j24r = j24 @ rot.T  # the whole body in a rotated canonical frame
+    tf = TorsoFrame(tau_s=0.0)
+    m = tf.step(j24r, DT)
+    # forward reach: anatomical +x expressed in the rotated canonical frame
+    fwd_canonical = rot @ np.array([1.0, 0.0, 0.0])
+    fwd_torso = tf.transform(np.concatenate([fwd_canonical, [1.0, 0, 0, 0]]))[:3]
+    np.testing.assert_allclose(
+        fwd_torso,
+        [1.0, 0.0, 0.0],
+        atol=1e-6,
+        err_msg="torso map failed to undo the canonical rotation",
+    )
+    assert abs(np.linalg.det(m) - 1.0) < 1e-9, "M must stay a proper rotation"
+    # degenerate joints: keep the last frame instead of NaN-ing
+    tf.step(np.zeros((24, 3)), DT)
+    np.testing.assert_array_equal(tf.M, m)
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -654,6 +736,7 @@ CHECKS = [
     ("waist_chain_gating", check_waist_chain_gating),
     ("grip_mapping", check_grip_mapping),
     ("input_lpf", check_input_lpf),
+    ("torso_frame", check_torso_frame),
     ("overhead_clamp", check_overhead_clamp),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
@@ -744,6 +827,7 @@ def main() -> int:
         "right": ClutchArm("right", args.position_scale, args.rotation_weight, args.target_slew),
     }
     lpfs = {"left": PoseLpf(args.input_tau), "right": PoseLpf(args.input_tau)}
+    torso = TorsoFrame()
     waist = WaistYawChain(sign=args.waist_sign, clamp_rad=args.waist_clamp)
     rx = IncrementalIntentReceiver(args.intent_port)
     rx.start()
@@ -783,8 +867,11 @@ def main() -> int:
                 lpfs["left"].reset()
                 lpfs["right"].reset()
             if fresh:
-                # filter BEFORE the anchor math so engage/step/deltas all see
-                # the same smoothed pose (zero placeholders pass through)
+                # controller poses arrive PRE-FRAMED in the operator torso
+                # axes (sender-side raw-joint torso map) -- only the pose LPF
+                # runs here, so engage/step/deltas all see the same smoothed
+                # anatomical pose (zero placeholders pass through)
+                torso.step(j24, DT)
                 lcp = lpfs["left"].step(lcp, DT)
                 rcp = lpfs["right"].step(rcp, DT)
             held = {
@@ -798,7 +885,9 @@ def main() -> int:
                 elif not held[side] and arm.engaged:
                     arm.disengage()
             if j24 is not None:
-                waist.step(j24, DT)
+                # waist in the SAME torso frame: the twist formula assumes
+                # up=+z / lateral=+y, which the raw canonical frame is not
+                waist.step(j24 @ torso.M.T, DT)
 
             for side, arm in arms.items():
                 q, _ = arm.step(held[side], ctrl[side], waist.cmd, args.waist_compensate)
