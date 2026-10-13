@@ -203,23 +203,28 @@ class ClutchArm:
         # distorts the step direction -> bang-bang). A null-space bent-elbow
         # bias was tried here too but its projection through the DAMPED
         # pseudo-inverse leaks into the task error (17 mm) -- not worth it.
-        # ROTATION-RESIDUAL SOFT ENVELOPE (live round 8: "增量式位姿控制还是有
+        # ROTATION-RESIDUAL SATURATION (live round 8: "增量式位姿控制还是有
         # 抖动"): in POSE mode the operator wrist sweeps far outside the robot
         # wrist joints' range, so a persistent large angular residual is
         # structurally unreachable -- and DLS answers a large residual with a
         # large per-tick step (~linear: 34 deg -> 0.14 rad/tick, 90 deg ->
-        # 0.26), a visible shake that also drags the shoulder/elbow around and
-        # wrecks position tracking. The envelope fades the orientation pull
-        # over [rot_err_clip_rad, 2.5x] and yields it entirely above, but ONLY
-        # while the wrist jams a limit AND the target holds still AND the
-        # residual isn't closing -- a driven or receding target keeps full
-        # pull (see ArmIKSolver.solve). Measurable residuals stay untouched.
+        # 0.26), which at the wrist limit grinds and stick-slips against the
+        # jump guard. The residual is clamped to rot_err_clip_rad (direction
+        # preserved) so the pull saturates at rotation_weight * clip -- the
+        # arm keeps closing, just at a bounded human-plausible rate. Below
+        # the cap the solver is bit-for-bit the legacy one.
         #
-        # NOTE the real round-8 jitter root cause was upstream of this: a
-        # left-multiply bug in PoseLpf.step made the LPFed target orbit at a
-        # constant ~8 deg/tick for large orientation steps, so "target
-        # stationary" never held and this gate never armed. The envelope is
-        # hardening on top of the fixed filter, not the fix itself.
+        # NOTE the round-8 live retest made this the third shape of the
+        # same idea: round-8.0 shipped a fade band + jam/still/closing
+        # freeze gate (stateful); it jittered live immediately -- the fade
+        # band bang-banged between ~0 and full pull for any residual
+        # hovering at its edge (measured 2x dq oscillation), and the gate
+        # was inert during all far-out live motion (n >= band top or
+        # target moving), so the real grinding (dq up to the 0.6 step cap)
+        # survived it. A stateless saturation has neither failure mode.
+        # (The round-8.0 PoseLpf left-multiply fix -- see PoseLpf.step --
+        # remains in force; that killed the orbiting target, this bounds
+        # the far-out pull.)
         self.solver = ArmIKSolver(
             side,
             damping=0.08,
@@ -1151,24 +1156,20 @@ def check_pose_lpf_convergence() -> None:
     assert d[-1] < 1e-3, f"LPF did not converge: {np.degrees(d[-1]):.2f} deg left after 6 s"
 
 
-def check_pose_envelope() -> None:
-    """Live round 8 hardening: with PoseLpf fixed, a PARKED out-of-range
-    wrist target still creeped silently (DLS kept re-aiming at an
-    unreachable residual: measured ~0.3-2 mrad/tick of wrist drift,
-    forever -- "the robot's wrist slowly turns by itself"). The soft
-    envelope fades the orientation pull above ``rot_err_clip_rad`` and
-    yields it entirely (2.5x) -- but only while the wrist jams a limit
-    AND the target holds still AND the residual is not closing.
-
-    Shipped behavior under test:
-    1. below the threshold the solver is EXACTLY the legacy one (a
-       trackable pose must keep its accuracy, bit for bit);
-    2. a driven target (operator still turning) keeps full tracking --
-       the arm must not freeze mid-rotation;
-    3. parked far out of range -> the commanded q FREEZES (dq -> 0),
-       killing the creep;
-    4. turning the target back re-arms tracking (no deadlock; residual
-       returns to ~0 at home).
+def check_pose_err_cap() -> None:
+    """Live round 8.1: the rotation-residual SATURATION
+    (``rot_err_clip_rad``). Shipped behavior under test:
+    1. below the cap the solver is EXACTLY the legacy one (a trackable
+       pose must keep its accuracy, bit for bit);
+    2. a driven far-out target keeps following, but every per-tick step
+       stays BOUNDED (the round-8 fade/gate shipped here instead
+       oscillated ~2x and let the raw solve grind at the 0.6 rad/tick
+       step cap -- live retest jittered immediately);
+    3. parked far out of range -> the residual holds and the commanded
+       q stays smooth (small, non-alternating steps): no grinding, no
+       yank; the arm keeps a gentle bounded pull instead of creep;
+    4. turning the target back tracks home with no deadlock (the pull
+       is never zero, so the arm always follows back).
     """
     ax = np.array([0.3, -0.2, 0.93])
     ax /= np.linalg.norm(ax)
@@ -1190,7 +1191,7 @@ def check_pose_envelope() -> None:
 
     e_env, e_off = feasible_err(0.08), feasible_err(0.0)
     assert e_env < np.radians(1.0), f"trackable 3-deg twist not met: {np.degrees(e_env):.2f} deg"
-    assert abs(e_env - e_off) < 1e-12, "envelope must be an exact no-op below the threshold"
+    assert abs(e_env - e_off) < 1e-12, "saturation must be an exact no-op below the cap"
 
     arm = ClutchArm("right", 1.0, 0.5, rot_err_clip_rad=0.08)
     lpf = PoseLpf(0.12)
@@ -1222,11 +1223,24 @@ def check_pose_envelope() -> None:
     for _ in range(100):  # settle at home
         _, ik = arm.step(True, lpf.step(pose0, DT))
         err_end = ik.rot_err_rad
-    assert dq_drive.max() > 0.01, "driven target: arm must keep following"
-    assert dq_park[-100:].max() < 1e-5, (
-        f"parked out of range: creep not frozen ({dq_park[-100:].max():.2e} rad/tick)"
+    assert dq_drive.max() > 0.005, "driven target: arm must keep following"
+    # Saturation bounds the whole closed loop: cap 0.08 x weight 0.5 =
+    # 0.04 rad of task error (through J^+ a few hundredths of a rad/tick).
+    # Calibrated: new solver measures <=0.009 across drive/park/return;
+    # the round-8 fade+gate shipped 0.027 (drive) / 0.067 (park onset) /
+    # 0.094 (slamming on the way back) -- all three trip this bound.
+    assert dq_drive.max() < 0.02, f"saturation breached: {dq_drive.max():.3f} rad/tick"
+    assert dq_park.max() < 0.02, (
+        f"parked far out of range must stay gentle, got {dq_park.max():.4f} rad/tick"
     )
-    assert dq_back.max() > 0.01, "turning back must re-arm tracking (deadlock?)"
+    assert np.abs(np.diff(dq_park[-100:])).max() < 0.001, (
+        "parked far out of range must not alternate (grinding/yank), "
+        f"tick-to-tick delta {np.abs(np.diff(dq_park[-100:])).max():.4f}"
+    )
+    assert dq_back.max() > 0.005, "turning back must re-arm tracking (deadlock?)"
+    assert dq_back.max() < 0.02, (
+        f"turning back must stay smooth, got {dq_back.max():.4f} rad/tick"
+    )
     assert err_end < np.radians(2.0), (
         f"tracking not restored at home: {np.degrees(err_end):.2f} deg residual"
     )
@@ -1246,7 +1260,7 @@ CHECKS = [
     ("ik_freeze_guard", check_ik_freeze_guard),
     ("torso_keepout", check_torso_keepout),
     ("pose_lpf_convergence", check_pose_lpf_convergence),
-    ("pose_envelope", check_pose_envelope),
+    ("pose_err_cap", check_pose_err_cap),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 
@@ -1287,9 +1301,10 @@ def main() -> int:
         "--rot-err-clip",
         type=float,
         default=0.08,
-        help="soft-envelope start for the pose-mode angular residual (rad); "
-        "pull fades to zero at 2.5x, only while the wrist jams a limit and "
-        "the target holds still; 0 = off (legacy)",
+        help="saturation cap on the pose-mode angular residual fed to the IK "
+        "(rad): the pull is bounded at rotation_weight x cap, so far-out "
+        "residuals close at a smooth bounded rate instead of grinding; "
+        "below the cap the solver is byte-identical to legacy; 0 = off",
     )
     ap.add_argument(
         "--input-tau",
