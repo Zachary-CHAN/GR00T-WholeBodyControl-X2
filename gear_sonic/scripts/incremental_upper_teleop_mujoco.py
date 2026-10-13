@@ -1383,6 +1383,10 @@ def main() -> int:
     grip_f = {"l": 0.0, "r": 0.0}
     GRIP_TAU = 0.15
     t0 = time.monotonic()
+    # Rate window for the status Hz -- SEPARATE from t0. It is reset every
+    # status print; sharing t0 silently kept resetting the --duration timer
+    # so the loop never stopped.
+    t_stat = t0
     last_stat = 0.0
     n_ticks = 0
     next_tick = time.monotonic()
@@ -1465,7 +1469,7 @@ def main() -> int:
             now = time.monotonic()
             if now - last_stat > 2.0:
                 last_stat = now
-                hz = n_ticks / (now - t0)
+                hz = n_ticks / (now - t_stat)
                 hold = "".join(s[0].upper() for s in ("left", "right") if arms[s].holding)
                 print(
                     f"[sim] {'L' if held['left'] else '-'}"
@@ -1478,7 +1482,7 @@ def main() -> int:
                     f"err={nerr} stale={int(not fresh)}"
                 )
                 n_ticks = 0
-                t0 = now
+                t_stat = now
     except KeyboardInterrupt:
         print("[sim] Ctrl-C")
     # NOTE: no explicit viewer.close() -- it segfaults at teardown on this
