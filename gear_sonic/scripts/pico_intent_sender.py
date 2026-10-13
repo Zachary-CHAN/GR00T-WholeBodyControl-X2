@@ -457,7 +457,33 @@ def _poll_controllers(xrt):
 _YUP_TO_ZUP = Rot.from_matrix(np.array([[1.0, 0.0, 0.0],
                                         [0.0, 0.0, -1.0],
                                         [0.0, 1.0, 0.0]]))
+# Exact numpy replica of the body stream's canonicalisation (see
+# compute_from_body_poses + process_smpl_joints). Root quat chain (all
+# torch fns are standard Hamilton wxyz -- calibrated 2026-10-13):
+#   q1 = q_raw ⊗ Ry(180deg)          (Pico SDK SMPL-convention patch)
+#   q2 = Rx(90deg) ⊗ q1              (smpl_root_ytoz_up: y-up -> z-up)
+#   q3 = q2 ⊗ base⁻¹                 (remove_smpl_base_rot; base = 120deg
+#                                     about [1,1,1], the SMPL rest pose)
+# The chain then runs SMPL FK with root orient q2 and transl = the RAW
+# pelvis position, IN THE RAW Y-UP SLAM WORLD (world offset kept), and
+#   smpl_joints_local = q3⁻¹ · joints      (exact: 0.000 mm on tapes)
+# So the canonical frame is root-orientation-removed but NOT pelvis-zeroed
+# (smpl_joints_local[0] = q3⁻¹·transl ≠ 0). Canonicalising a controller
+# point is therefore simply q3⁻¹ · c[:3] -- raw y-up SLAM position, NO
+# pelvis subtraction, NO extra y->z rotation (q3 already carries it; the
+# first draft applied both and the double Rx90 was the live "hand in
+# front, robot hand behind" inversion).
+_RY180 = Rot.from_euler("y", 180.0, degrees=True)
+_SMPL_BASE_INV = Rot.from_quat(np.array([0.5, 0.5, 0.5, 0.5])).inv()  # wxyz in
 _ZERO_POSE7 = np.zeros(7, np.float32)
+
+
+def _canonical_root_inv(body: np.ndarray) -> Rot:
+    """q3⁻¹ for one body frame (24x7 SDK pose, quats xyzw at [3:7])."""
+    q_raw = Rot.from_quat(
+        np.array([body[0, 6], body[0, 3], body[0, 4], body[0, 5]]), scalar_first=True
+    )
+    return ((_YUP_TO_ZUP * (q_raw * _RY180)) * _SMPL_BASE_INV).inv()
 
 
 def _ctrl_wire_fields(xrt, lt, rt):
@@ -466,14 +492,12 @@ def _ctrl_wire_fields(xrt, lt, rt):
     Returns a dict for pack_pose_message: lctrl_pose/rctrl_pose f32[7]
     (xyz + quat wxyz) and trigger/grip f32[2] ([l, r]).
 
-    FRAME WARNING: the poses are in a *pelvis-translation-anchored Z-up*
-    frame -- position is R_yz @ (ctrl - pelvis_raw) with pelvis from the
-    SDK's raw body[0, :3] (same SLAM frame, same tick as the controller
-    read; NOT the wire smpl_joints j0, which lives in the root-rotated
-    canonical frame and differs by the constant pelvis orientation).
-    Consumers must only ever use *deltas* between frames (the clutch
-    anchor does exactly that); mixing these positions with smpl_joints
-    positions absolutely is wrong.
+    Poses are in the SMPL canonical frame -- the same frame as the wire
+    smpl_joints (pelvis-anchored, root-orientation-removed), so consumers
+    may mix them (e.g. build the operator torso frame from smpl_joints and
+    rotate controller deltas with it). Anchoring only removes the pelvis
+    ORIENTATION at the given tick; deltas between ticks remain the raw
+    controller motion.
 
     Safe defaults everywhere: no xrt (intent-tape replay) or any SDK
     read failure -> all zeros (freeze + hands closed).
@@ -488,14 +512,14 @@ def _ctrl_wire_fields(xrt, lt, rt):
         return fields
     try:
         body = np.asarray(xrt.get_body_joints_pose(), np.float64).reshape(24, 7)
-        pelvis = body[0, :3]
+        root_inv = _canonical_root_inv(body)
         fields["grip"] = np.array(
             [float(xrt.get_left_grip()), float(xrt.get_right_grip())], np.float32)
         for name, getter in (("lctrl_pose", xrt.get_left_controller_pose),
                              ("rctrl_pose", xrt.get_right_controller_pose)):
             c = np.asarray(getter(), np.float64).reshape(7)
-            pos = _YUP_TO_ZUP.apply(c[:3] - pelvis)
-            q = _YUP_TO_ZUP * Rot.from_quat(c[3:])       # xyzw in, frame-rotated
+            pos = root_inv.apply(c[:3])          # raw y-up -> canonical
+            q = root_inv * (_YUP_TO_ZUP * Rot.from_quat(c[3:]))       # xyzw in
             fields[name] = np.concatenate(
                 [pos, q.as_quat(scalar_first=True)]).astype(np.float32)  # wxyz out
     except Exception:
