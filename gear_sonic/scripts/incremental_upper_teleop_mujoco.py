@@ -168,9 +168,19 @@ class ClutchArm:
         target_slew_m_s: float = 0.6,
         freeze_pos_err_m: float = 0.12,
         jump_guard_rad: float = 0.22,
+        torso_keepout: tuple | None = None,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
+        # TORSO KEEP-OUT (live round 7: crossing toward the other arm drove
+        # the wrist INTO the trunk/hip shells -- PD against contact forces =
+        # shaking; the freeze guard only locked an already-colliding
+        # command). A target inside the trunk volume is projected onto its
+        # surface, so the wrist slides ALONG the body instead of into it.
+        # Tuple: (cx, cy, a_ax, b_ax, z_lo, z_hi) -- an elliptical cylinder
+        # (a_ax lateral y, b_ax fore-aft x) in THIS arm's solver-chain
+        # frame, from torso_keepout_from_model(). None = no keep-out.
+        self.torso_keepout = torso_keepout
         # FREEZE GUARD thresholds (see step()): a solve with position error
         # beyond freeze_pos_err_m, or one reachable from the current q only
         # by a per-tick joint jump beyond jump_guard_rad, is treated as
@@ -252,6 +262,40 @@ class ClutchArm:
         self.anchor = None
         self._tgt_slewed = None
 
+    def _project_out_of_trunk(self, tgt_pos: np.ndarray) -> np.ndarray:
+        """Push a target inside the trunk keep-out volume out to its surface.
+
+        The volume is an ELLIPTICAL cylinder: (cx, cy, a_ax, b_front,
+        b_back, zlo, zhi) with a_ax the lateral (y) half-axis and the
+        fore-aft (x) half-axis ASYMMETRIC (the backpack reaches much
+        farther behind than the chest does in front), in this arm's
+        solver-chain frame. An ellipse, not a circle, because the live
+        round-7 repro showed the wrist sweeping through the HIP region
+        (wrist-vs-hip_roll contacts, 769 of them) while a circular
+        silhouette either misses the hips or (with a matching radius)
+        swallows the whole front workspace. The radial scale keeps the
+        target's direction: target' = c + (target - c) / sqrt(E) with E
+        the ellipse value, which lands exactly on the surface.
+        """
+        cx, cy, a_ax, b_front, b_back, zlo, zhi = self.torso_keepout
+        if not (zlo < tgt_pos[2] < zhi):
+            return tgt_pos
+        dx = tgt_pos[0] - cx
+        dy = tgt_pos[1] - cy
+        b_ax = b_front if dx >= 0.0 else b_back
+        e = (dx / b_ax) ** 2 + (dy / a_ax) ** 2
+        if e >= 1.0:  # already outside
+            return tgt_pos
+        tgt_pos = tgt_pos.copy()
+        if e < 1e-9:  # dead centre: push out to this arm's own side
+            tgt_pos[0] = cx
+            tgt_pos[1] = cy + (a_ax if self.side == "left" else -a_ax)
+            return tgt_pos
+        s = 1.0 / math.sqrt(e)
+        tgt_pos[0] = cx + dx * s
+        tgt_pos[1] = cy + dy * s
+        return tgt_pos
+
     @property
     def engaged(self) -> bool:
         return self.anchor is not None
@@ -276,11 +320,21 @@ class ClutchArm:
             rz_inv = sRot.from_euler("z", -waist_yaw)
             tgt_pos = rz_inv.apply(tgt_pos)
             tgt_rot = rz_inv * tgt_rot
-        # workspace clamp: saturate radius, keep direction
+        # workspace clamp + torso keep-out (live round 7): the two
+        # constraints interfere -- projecting out of the body can push the
+        # target past max_reach, and clamping back can push it into the
+        # body. Apply them as a sandwich (project -> clamp -> project):
+        # the final project has the last word (never hand the solver a
+        # target inside the body), and whatever residual the two leave is
+        # bounded per tick by the target slew just below.
+        if self.torso_keepout is not None:
+            tgt_pos = self._project_out_of_trunk(tgt_pos)
         rad = tgt_pos - self.shoulder
         r = float(np.linalg.norm(rad))
         if r > self.max_reach:
             tgt_pos = self.shoulder + rad * (self.max_reach / r)
+        if self.torso_keepout is not None:
+            tgt_pos = self._project_out_of_trunk(tgt_pos)
         # target slew: bound per-tick target motion (noise floor only)
         if self._tgt_slewed is None:
             self._tgt_slewed = tgt_pos.copy()
@@ -458,6 +512,80 @@ class WaistYawChain:
 # ---------------------------------------------------------------------------
 # Model / joint plumbing (same pattern as upper_body_teleop_mujoco.py)
 # ---------------------------------------------------------------------------
+# trunk + hip bodies whose geometry defines the torso keep-out volume.
+# The hips are IN (live round 7b): the offline repro's contacts were all
+# wrist-vs-hip_roll (769 of 1439) -- a low sweep across the pelvis hits the
+# hip shells before any torso mesh.
+_TRUNK_BODIES = (
+    "pelvis",
+    "waist_yaw_link",
+    "waist_pitch_link",
+    "torso_link",
+    "left_hip_yaw_link",
+    "left_hip_roll_link",
+    "left_hip_pitch_link",
+    "right_hip_yaw_link",
+    "right_hip_roll_link",
+    "right_hip_pitch_link",
+)
+
+
+def torso_keepout_from_model(
+    m, d, side: str, margin_m: float = 0.05
+) -> tuple[float, float, float, float, float, float, float]:
+    """(cx, cy, a_ax, b_front, b_back, z_lo, z_hi) of the trunk keep-out
+    ELLIPTICAL cylinder for `side`, in that arm's solver-chain frame. Call
+    at start-up with the model at the neutral pose (build_model + mj_forward).
+
+    The silhouette comes from MESH VERTICES, not geom_rbound: the torso
+    mesh's bounding sphere reads 0.33 m wide when the real trunk is 0.15 m
+    laterally. Per-axis extents, and the fore-aft (x) half-axes are
+    ASYMMETRIC: the backpack reaches 0.196 m behind the axis while the
+    chest is only 0.100 m in front (the hips 0.147). A symmetric axis
+    would apply the backpack's 0.20 m to the FRONT as well and project
+    every normal "hand across the body 15-20 cm ahead" trajectory -- the
+    live round-7 A/B showed exactly that regression (more shaking than no
+    keep-out at all). a_ax is the lateral (y) half-axis. Chain-frame
+    alignment: subtract the (constant, translation-only) offset between
+    the mj wrist body and the solver-chain wrist at the same neutral pose.
+    """
+    pts = []
+    for gid in range(m.ngeom):
+        bname = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[gid])
+        if bname not in _TRUNK_BODIES:
+            continue
+        bid = m.geom_bodyid[gid]
+        if m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH:
+            did = m.geom_dataid[gid]
+            vs = m.mesh_vert[m.mesh_vertadr[did] : m.mesh_vertadr[did] + m.mesh_vertnum[did]]
+            rmat = np.empty(9)
+            mujoco.mju_quat2Mat(rmat, m.geom_quat[gid])
+            vs = np.asarray(vs) @ rmat.reshape(3, 3).T + m.geom_pos[gid]
+            pts.append(d.xpos[bid] + vs @ d.xmat[bid].reshape(3, 3).T)
+        else:
+            pts.append(d.geom_xpos[gid][None, :])
+    pts = np.concatenate(pts)
+    cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    a_ax = float(np.abs(pts[:, 1] - cy).max())
+    b_front = float((pts[:, 0] - cx).max())
+    b_back = float((cx - pts[:, 0]).max())
+    z_lo, z_hi = float(pts[:, 2].min()), float(pts[:, 2].max())
+    # world -> this arm's chain frame
+    arm = ClutchArm(side)
+    chain_w = arm.solver.fk(arm.q)[0]
+    jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"{side}_wrist_pitch_joint")
+    off = d.xpos[m.jnt_bodyid[jid]] - chain_w
+    return (
+        cx - float(off[0]),
+        cy - float(off[1]),
+        a_ax + margin_m,
+        b_front + margin_m,
+        b_back + margin_m,
+        z_lo - float(off[2]) - margin_m,
+        z_hi - float(off[2]) + margin_m,
+    )
+
+
 def build_model(disable_hand_collisions: bool = True):
     _spec, m, layout = build_x2_with_omnihand_spec(disable_hand_collisions=disable_hand_collisions)
     d = mujoco.MjData(m)
@@ -871,6 +999,74 @@ def check_ik_freeze_guard() -> None:
     np.testing.assert_allclose(q, q_a, atol=1e-9)
 
 
+def check_torso_keepout() -> None:
+    """Live round 7: sweeping the right hand across the body toward the
+    left arm drove the wrist into the HIP shells (offline repro: 769
+    wrist-vs-hip_roll contacts -- PD fighting contact forces = shaking).
+    Two things are under test with the elliptical keep-out built from the
+    real model silhouette:
+
+    1. while the crossing is still kinematically feasible, the wrist
+       slides ALONG the body surface (never inside the ellipse) and the
+       freeze guard does NOT trip;
+    2. once the target goes past what the arm can do (the sweep hits the
+       shoulder_roll joint limit; diag: the wrist reaches (0.27,-0.11)
+       and can go no farther), the guard latches and resends the same
+       command -- the robot HOLDS STILL instead of fighting -- and when
+       the operator pulls the hand back, tracking resumes.
+
+    (The round-7 first cut failed the first half: a circular silhouette
+    plus sequential clamp-then-project drove the target past max_reach
+    and latched the guard from tick 149, cascading the IK error to 376 mm.)
+    """
+    m, d, _layout = build_model()
+    keepout = torso_keepout_from_model(m, d, "right")
+    cx, cy, a_ax, b_front, b_back, _zlo, _zhi = keepout
+    arm = ClutchArm("right", 1.0, 0.0, torso_keepout=keepout)
+    other = ClutchArm("left")
+    pos0, _ = arm.solver.fk(arm.q)
+    pos_l, _ = other.solver.fk(other.q)
+    pose = np.zeros(7)
+    pose[3] = 1.0
+    pose[:3] = pos0
+    assert arm.engage(pose)
+    latched_early, latched, froze, min_e = False, False, True, 1e9
+    q_hold_ref, p_at_limit, tail_err = None, None, 9.9
+    for k in range(700):  # push 0 -> 0.8 (past the limit), then pull back
+        s = 0.8 * k / 399.0 if k < 400 else 0.8 - 0.45 * (k - 400) / 299.0
+        op = pose.copy()
+        op[:3] = pos0 + s * (pos_l - pos0)
+        op[2] += 0.15 * s  # a human crossing lifts the hand a little
+        q, ik = arm.step(True, op)
+        p, _ = arm.solver.fk(q)
+        if _zlo < p[2] < _zhi:
+            b_ax = b_front if p[0] - cx >= 0.0 else b_back
+            e = ((p[0] - cx) / b_ax) ** 2 + ((p[1] - cy) / a_ax) ** 2
+            min_e = min(min_e, e)
+        if arm.holding:
+            latched_early = latched_early or s < 0.40
+            if s > 0.55:
+                latched = True
+                if p_at_limit is None:
+                    p_at_limit = p.copy()
+                if q_hold_ref is None:
+                    q_hold_ref = q.copy()
+                else:
+                    froze = froze and bool(np.array_equal(q, q_hold_ref))
+        if k >= 690:
+            tail_err = min(tail_err, ik.pos_err_m)
+    fk_end = arm.solver.fk(arm.q)[0]
+    assert min_e > 0.98, f"wrist entered the keep-out (E={min_e:.3f})"
+    assert not latched_early, "feasible part of the crossing must not freeze"
+    assert latched and q_hold_ref is not None, "past the limit the guard must hold"
+    assert froze, "while held, the same joint command must be resent"
+    assert not arm.holding, "pulling the hand back must resume tracking"
+    assert (
+        p_at_limit is not None and np.linalg.norm(fk_end - p_at_limit) > 0.05
+    ), "pulled back, the wrist must leave the limit pose"
+    assert tail_err < 0.05, f"tracking should resume cleanly (err {tail_err * 1000:.0f} mm)"
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -883,6 +1079,7 @@ CHECKS = [
     ("overhead_clamp", check_overhead_clamp),
     ("extended_stability", check_extended_stability),
     ("ik_freeze_guard", check_ik_freeze_guard),
+    ("torso_keepout", check_torso_keepout),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 
@@ -972,6 +1169,10 @@ def main() -> int:
         "left": ClutchArm("left", args.position_scale, args.rotation_weight, args.target_slew),
         "right": ClutchArm("right", args.position_scale, args.rotation_weight, args.target_slew),
     }
+    # trunk keep-out from the REAL model silhouette (d is still at the
+    # neutral pose build_model + mj_forward left it in)
+    for side, arm in arms.items():
+        arm.torso_keepout = torso_keepout_from_model(m, d, side)
     lpfs = {"left": PoseLpf(args.input_tau), "right": PoseLpf(args.input_tau)}
     torso = TorsoFrame()
     waist = WaistYawChain(sign=args.waist_sign, clamp_rad=args.waist_clamp)
