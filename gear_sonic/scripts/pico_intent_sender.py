@@ -452,6 +452,57 @@ def _poll_controllers(xrt):
         return None
 
 
+# y-up (headset SLAM) -> z-up rotation, the same fixup process_smpl_joints
+# applies to the body stream. Rx(+90deg): x->x, y(up)->z, z->-y.
+_YUP_TO_ZUP = Rot.from_matrix(np.array([[1.0, 0.0, 0.0],
+                                        [0.0, 0.0, -1.0],
+                                        [0.0, 1.0, 0.0]]))
+_ZERO_POSE7 = np.zeros(7, np.float32)
+
+
+def _ctrl_wire_fields(xrt, lt, rt):
+    """Controller-side wire fields for the incremental (clutch-IK) teleop.
+
+    Returns a dict for pack_pose_message: lctrl_pose/rctrl_pose f32[7]
+    (xyz + quat wxyz) and trigger/grip f32[2] ([l, r]).
+
+    FRAME WARNING: the poses are in a *pelvis-translation-anchored Z-up*
+    frame -- position is R_yz @ (ctrl - pelvis_raw) with pelvis from the
+    SDK's raw body[0, :3] (same SLAM frame, same tick as the controller
+    read; NOT the wire smpl_joints j0, which lives in the root-rotated
+    canonical frame and differs by the constant pelvis orientation).
+    Consumers must only ever use *deltas* between frames (the clutch
+    anchor does exactly that); mixing these positions with smpl_joints
+    positions absolutely is wrong.
+
+    Safe defaults everywhere: no xrt (intent-tape replay) or any SDK
+    read failure -> all zeros (freeze + hands closed).
+    """
+    fields = {
+        "trigger": np.array([lt, rt], np.float32),
+        "grip": np.zeros(2, np.float32),
+        "lctrl_pose": _ZERO_POSE7.copy(),
+        "rctrl_pose": _ZERO_POSE7.copy(),
+    }
+    if xrt is None:
+        return fields
+    try:
+        body = np.asarray(xrt.get_body_joints_pose(), np.float64).reshape(24, 7)
+        pelvis = body[0, :3]
+        fields["grip"] = np.array(
+            [float(xrt.get_left_grip()), float(xrt.get_right_grip())], np.float32)
+        for name, getter in (("lctrl_pose", xrt.get_left_controller_pose),
+                             ("rctrl_pose", xrt.get_right_controller_pose)):
+            c = np.asarray(getter(), np.float64).reshape(7)
+            pos = _YUP_TO_ZUP.apply(c[:3] - pelvis)
+            q = _YUP_TO_ZUP * Rot.from_quat(c[3:])       # xyzw in, frame-rotated
+            fields[name] = np.concatenate(
+                [pos, q.as_quat(scalar_first=True)]).astype(np.float32)  # wxyz out
+    except Exception:
+        pass  # keep the zero placeholders: freeze + hands closed
+    return fields
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pc2-host", required=True,
@@ -929,6 +980,10 @@ def main() -> int:
                 time.sleep(min(next_t - now, 0.005))
                 continue
             next_t += CONTROL_DT
+            # triggers must survive the non-dual path (intent-tape replay):
+            # the incremental teleop reads them from the wire regardless of
+            # mode, so initialise outside the dual_mode block.
+            lt = rt = 0.0
             if not dual_mode:
                 # stick-less tape replay (single engage-window clip): the
                 # tape's grips still drive the hands (triggers are zero)
@@ -1403,6 +1458,9 @@ def main() -> int:
                 "wrist_pr": wr,
                 "wrist_yaw": wy,
                 "frame_index": np.array([frame_idx], np.int64),
+                # controller layer for the incremental (clutch-IK) teleop;
+                # version stays 4 -- the packed protocol is additive
+                **_ctrl_wire_fields(getattr(src, "xrt", None), lt, rt),
             }, topic="pico_intent", version=4)
             sock.send(msg)
             if rec is not None:

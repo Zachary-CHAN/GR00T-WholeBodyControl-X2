@@ -306,6 +306,8 @@ A	gear_sonic/scripts/simstack_replay_tape.py	Replay a kplanner intent tape into 
 A	gear_sonic/scripts/simstack_turn.sh	Pad emulator for the local sim stack (gear_sonic/scripts/simstack_local.sh).
 A	gear_sonic/scripts/sonic_motion_token_labeler.py	SONIC motion-token labeler for X2 LeRobot datasets (M6 / Stage C1).
 A	gear_sonic/scripts/vr_operator_calibrate.py	VR operator calibration script.
+A	gear_sonic/scripts/incremental_upper_teleop_mujoco.py	MuJoCo harness v2: clutch-IK incremental arm teleop (trigger-held 6-DoF wrist tracking via DLS IK, grip->OmniHand, SMPL shoulder-line->waist yaw, head hold) on the composed X2+OmniHand model.
+A	gear_sonic/scripts/upper_body_teleop_mujoco.py	MuJoCo harness v1 (Plan D): replays the PC2 analytic-retarget upper-body teleop pipeline against the X2 MJCF (synthetic poses or the real sender wire).
 A	gear_sonic/scripts/window_motion_pkl.py	Window long motion-lib clips into overlapping sub-clips for kplanner training.
 A	gear_sonic/scripts/x2_gmr_to_motion_lib.py	Stage 2 of tape -> X2: GMR raw retarget npz -> motion-lib pkl (+ render).
 A	gear_sonic/scripts/x2_kplanner.py	Neural kinematic planner daemon for AgiBot X2 Ultra.
@@ -315,6 +317,7 @@ A	gear_sonic/scripts/x2_pkl_command_source.py	PKL-driven ``planner_cmd`` publish
 A	gear_sonic/scripts/x2_pose_merger.py	x2_pose_merger.py -- laptop-side pose merger for the X2 planner stacks.
 A	gear_sonic/scripts/x2_pose_mux.py	x2_pose_mux.py -- laptop-side N-to-1 pose multiplexer.
 A	gear_sonic/tests/data/wrist_maxrange_20260905_002744Z.npz	Test fixture capture (operator headset/controller frames) via git-lfs.
+A	gear_sonic/tests/test_incremental_upper_teleop.py	Layer tests for the clutch-IK incremental upper teleop: wire round-trip (new controller fields), ground-truth IK convergence, anchor freeze/re-anchor, waist yaw rest/twist + gating, grip->hand mapping, composed-model joint map + head hold.
 A	gear_sonic/tests/test_root_tilt_clamp.py	Lean-guard tests: root clamp invariants (hard cap, bit-exact pass-through, azimuth/heading preserved), torso min-max convergence and continuity, at-floor counting, + the live window() insertion point.
 A	gear_sonic/tests/test_wrist_map_regression.py	Wrist mapping regression: operator max-range clip -> X2 wrist chain angles.
 A	gear_sonic/trl/callbacks/finetune_rate_schedule_callback.py	Trainer callback that schedules the finetune sampling rate over iterations (used by the pico finetune configs).
