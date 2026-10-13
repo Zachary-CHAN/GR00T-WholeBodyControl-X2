@@ -195,6 +195,14 @@ class ArmIKSolver:
             update step. Acts as a final safety belt; a runaway DLS
             iteration (e.g. near a singularity with a huge target
             error) cannot move any joint more than this in one solve.
+        uniform_step_clip: scale the WHOLE dq vector uniformly down to
+            the max step instead of clipping per-joint. Near a
+            singularity (elbow straight) the raw dq is huge; per-joint
+            clipping distorts its direction (different joints saturate
+            at different times), which feeds a bang-bang oscillation --
+            the live "arm shakes once extended" symptom. Uniform
+            scaling keeps the descent direction and only caps the
+            magnitude. Opt-in; default keeps the legacy clip.
     """
 
     def __init__(
@@ -206,6 +214,7 @@ class ArmIKSolver:
         max_per_tick_step_rad: float = 0.30,
         null_space_gain: float = 0.0,
         q_preferred: np.ndarray | None = None,
+        uniform_step_clip: bool = False,
     ):
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
@@ -214,6 +223,7 @@ class ArmIKSolver:
         self.position_weight = float(position_weight)
         self.rotation_weight = float(rotation_weight)
         self.max_per_tick_step_rad = float(max_per_tick_step_rad)
+        self.uniform_step_clip = bool(uniform_step_clip)
         self._chain = left_arm_chain() if side == "left" else right_arm_chain()
 
         if side == "left":
@@ -332,8 +342,13 @@ class ArmIKSolver:
                 dq_null_proj = dq_null - J.T @ null_inv
                 dq = dq + dq_null_proj
 
-            np.clip(dq, -self.max_per_tick_step_rad,
-                    self.max_per_tick_step_rad, out=dq)
+            if self.uniform_step_clip:
+                mx = float(np.max(np.abs(dq)))
+                if mx > self.max_per_tick_step_rad:
+                    dq *= self.max_per_tick_step_rad / mx
+            else:
+                np.clip(dq, -self.max_per_tick_step_rad,
+                        self.max_per_tick_step_rad, out=dq)
 
             q_new = q + dq
 

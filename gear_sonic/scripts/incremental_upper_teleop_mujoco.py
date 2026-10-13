@@ -172,7 +172,17 @@ class ClutchArm:
         # rotation_weight 0 = position-only IK (the live jitter fix: unfiltered
         # controller orientation noise through 7-DoF shakes the whole arm;
         # the wrist joints saturate near their +-0.558 rad pitch range anyway)
-        self.solver = ArmIKSolver(side, damping=0.08, rotation_weight=rotation_weight)
+        # solver hardening (live round 5: "手臂伸直后不稳定"): uniform dq
+        # scaling near the elbow-straight singularity (per-joint clipping
+        # distorts the step direction -> bang-bang). A null-space bent-elbow
+        # bias was tried here too but its projection through the DAMPED
+        # pseudo-inverse leaks into the task error (17 mm) -- not worth it.
+        self.solver = ArmIKSolver(
+            side,
+            damping=0.08,
+            rotation_weight=rotation_weight,
+            uniform_step_clip=True,
+        )
         self.q = ARM_NEUTRAL[side].copy()
         self.anchor = None  # (op_pos, op_rot_inv, rob_pos, rob_rot)
         self.last_ik = IKResult(0.0, 0.0, 0, 0)
@@ -182,10 +192,13 @@ class ClutchArm:
         # stalls partway up). Clamp the target onto the reachable sphere
         # around the shoulder: direction preserved, magnitude saturated --
         # the wrist still ends up overhead, just not at an impossible radius.
-        # Clamp to the INTERIOR (0.90, live round 4: clamping at 0.97 put the
-        # target exactly ON the reachable boundary, where a stretched arm's
-        # Jacobian degenerates -> the DLS stalls and the elbow flips branches
-        # -> the overhead raise moved in stutters).
+        # Radius choice (rounds 4-5 lesson): the NEUTRAL wrist already sits
+        # at ~90% of the sampled max reach, so a fixed small fraction of max
+        # (0.85) clamps EVERY pose -- tracking pulled 20 mm radially from the
+        # first tick. Use 0.93 of the sampled max, floored at 1.03x the
+        # neutral radius so neutral/engage NEVER clamp, while far reaches
+        # stay off the elbow-straight boundary (singularity -> bang-bang,
+        # now also damped by the solver's uniform step clip).
         _, origins, _ = chain_fk_full(self.solver._chain, self.q)
         self.shoulder = np.asarray(origins[0], np.float64).copy()
         rng = np.random.RandomState(0)
@@ -194,7 +207,8 @@ class ClutchArm:
             q = rng.uniform(self.solver._lo, self.solver._hi)
             p, _R = self.solver.fk(q)
             reach = max(reach, float(np.linalg.norm(p - self.shoulder)))
-        self.max_reach = 0.90 * reach
+        r_neutral = float(np.linalg.norm(self.solver.fk(self.q)[0] - self.shoulder))
+        self.max_reach = max(0.93 * reach, 1.03 * r_neutral)
         # TARGET SLEW (jitter fix, stage 2): whatever survives the input LPF
         # still drives the DLS at up to 0.3 rad/tick per joint. Rate-limiting
         # the target itself bounds the commanded-q steps to human-plausible
@@ -739,6 +753,36 @@ def check_torso_frame() -> None:
     np.testing.assert_array_equal(tf.M, m)
 
 
+def check_extended_stability() -> None:
+    """Live round 5: "手臂伸直后不稳定" -- target held just outside the
+    reachable sphere (operator reaching past the clamp). The commanded q
+    must SETTLE on the clamped sphere instead of oscillating: uniform dq
+    scaling + null-space bent-elbow bias; the legacy per-joint clip
+    bang-bangs here."""
+    arm = ClutchArm("left", 1.0, 0.0)
+    pos0, _ = arm.solver.fk(arm.q)
+    anchor = np.zeros(7)
+    anchor[3] = 1.0
+    anchor[:3] = pos0
+    assert arm.engage(anchor)
+    # far past the clamp: up and forward, ~1.5x reach from the shoulder
+    out = anchor.copy()
+    out[:3] = arm.shoulder + 1.5 * arm.max_reach * np.array([0.55, 0.0, 0.83]) / np.linalg.norm(
+        [0.55, 0.0, 0.83]
+    )
+    for _ in range(400):  # 8 s: past slew, LPF and settling
+        q, _ = arm.step(True, out)
+    p, _ = arm.solver.fk(q)
+    assert np.linalg.norm(p - arm.shoulder) <= arm.max_reach * 1.001, "clamp violated"
+    # steady state: no residual oscillation in the commanded q
+    qs = []
+    for _ in range(50):
+        q, _ = arm.step(True, out)
+        qs.append(q.copy())
+    dq = np.abs(np.diff(np.asarray(qs), axis=0))
+    assert dq.max() < 0.005, f"commanded q still moving: {dq.max():.4f} rad/tick"
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -749,6 +793,7 @@ CHECKS = [
     ("input_lpf", check_input_lpf),
     ("torso_frame", check_torso_frame),
     ("overhead_clamp", check_overhead_clamp),
+    ("extended_stability", check_extended_stability),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 

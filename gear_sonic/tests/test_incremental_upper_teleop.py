@@ -53,6 +53,10 @@ def test_overhead_clamp():
     iutm.check_overhead_clamp()
 
 
+def test_extended_stability():
+    iutm.check_extended_stability()
+
+
 def test_ctrl_canonicalization_matches_wire_chain():
     """The sender's controller canonicalisation must be the EXACT rotation
     the wire smpl_joints chain applies: canonicalising the chain's own FK
