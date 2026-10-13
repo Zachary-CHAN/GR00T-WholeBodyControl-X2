@@ -62,6 +62,7 @@ from scipy.spatial.transform import Rotation as sRot  # noqa: E402
 import zmq  # noqa: E402  # module-level: a local import got NameError'd
 
 from gear_sonic.utils.teleop.solver.arm import ArmIKSolver, IKResult  # noqa: E402
+from gear_sonic.utils.teleop.solver.arm.x2_arm_fk import chain_fk_full  # noqa: E402
 from gear_sonic.utils.teleop.vr_arm_teleop import (  # noqa: E402
     DEFAULT_LEFT_ARM_NEUTRAL_RAD,
     DEFAULT_RIGHT_ARM_NEUTRAL_RAD,
@@ -159,7 +160,11 @@ class ClutchArm:
     """
 
     def __init__(
-        self, side: str, position_scale: float = 1.0, rotation_weight: float = 0.5
+        self,
+        side: str,
+        position_scale: float = 1.0,
+        rotation_weight: float = 0.5,
+        target_slew_m_s: float = 0.6,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
@@ -170,6 +175,27 @@ class ClutchArm:
         self.q = ARM_NEUTRAL[side].copy()
         self.anchor = None  # (op_pos, op_rot_inv, rob_pos, rob_rot)
         self.last_ik = IKResult(0.0, 0.0, 0, 0)
+        # WORKSPACE CLAMP (live 2026-10-13: "手臂无法举过头顶" -- the operator's
+        # arm span from the anchor (~1.2 m) exceeds the robot's ~0.55 m reach,
+        # so an overhead target lands far outside the workspace and the DLS
+        # stalls partway up). Clamp the target onto the reachable sphere
+        # around the shoulder: direction preserved, magnitude saturated --
+        # the wrist still ends up overhead, just not at an impossible radius.
+        _, origins, _ = chain_fk_full(self.solver._chain, self.q)
+        self.shoulder = np.asarray(origins[0], np.float64).copy()
+        rng = np.random.RandomState(0)
+        reach = 0.0
+        for _ in range(400):  # joint-space sweep of |wrist - shoulder|
+            q = rng.uniform(self.solver._lo, self.solver._hi)
+            p, _R = self.solver.fk(q)
+            reach = max(reach, float(np.linalg.norm(p - self.shoulder)))
+        self.max_reach = 0.97 * reach
+        # TARGET SLEW (jitter fix, stage 2): whatever survives the input LPF
+        # still drives the DLS at up to 0.3 rad/tick per joint. Rate-limiting
+        # the target itself bounds the commanded-q steps to human-plausible
+        # motion; engaged motion is << 0.6 m/s so this only eats the noise.
+        self.target_slew = float("inf") if target_slew_m_s <= 0 else float(target_slew_m_s) * DT
+        self._tgt_slewed = None
 
     def engage(self, ctrl_pose7: np.ndarray) -> bool:
         """(Re-)anchor. Returns False and refuses on a zero placeholder
@@ -184,10 +210,12 @@ class ClutchArm:
             rob_pos,
             sRot.from_matrix(rob_R),
         )
+        self._tgt_slewed = rob_pos.copy()  # zero delta at engage
         return True
 
     def disengage(self) -> None:
         self.anchor = None
+        self._tgt_slewed = None
 
     @property
     def engaged(self) -> bool:
@@ -213,6 +241,20 @@ class ClutchArm:
             rz_inv = sRot.from_euler("z", -waist_yaw)
             tgt_pos = rz_inv.apply(tgt_pos)
             tgt_rot = rz_inv * tgt_rot
+        # workspace clamp: saturate radius, keep direction
+        rad = tgt_pos - self.shoulder
+        r = float(np.linalg.norm(rad))
+        if r > self.max_reach:
+            tgt_pos = self.shoulder + rad * (self.max_reach / r)
+        # target slew: bound per-tick target motion (noise floor only)
+        if self._tgt_slewed is None:
+            self._tgt_slewed = tgt_pos.copy()
+        else:
+            step_v = tgt_pos - self._tgt_slewed
+            n = float(np.linalg.norm(step_v))
+            if n > self.target_slew:
+                tgt_pos = self._tgt_slewed + step_v * (self.target_slew / n)
+            self._tgt_slewed = tgt_pos.copy()
         self.q, self.last_ik = self.solver.solve(
             self.q, tgt_pos, tgt_rot.as_quat(scalar_first=True), max_iters=IK_ITERS_PER_TICK
         )
@@ -579,6 +621,31 @@ def check_input_lpf() -> None:
     assert f3.pos is None, "zero placeholder must reset filter state"
 
 
+def check_overhead_clamp() -> None:
+    """Live 2026-10-13: "手臂无法举过头顶" -- the operator's overhead reach
+    from the anchor exceeds the robot workspace and the DLS stalled partway.
+    With the workspace clamp an impossible-radius target must still raise
+    the wrist overhead (direction kept, radius saturated) and stay inside
+    the reachable sphere."""
+    arm = ClutchArm("left", 1.0, 0.0)  # scale 1: operator delta ~1 m up
+    pos0, _ = arm.solver.fk(arm.q)
+    anchor = np.zeros(7)
+    anchor[3] = 1.0
+    anchor[:3] = pos0
+    assert arm.engage(anchor)
+    overhead = anchor.copy()
+    overhead[2] += 1.0  # a full meter up: far outside the ~0.5 m workspace
+    for _ in range(250):  # 5 s: past the 0.6 m/s slew
+        q, _ = arm.step(True, overhead)
+    p, _ = arm.solver.fk(q)
+    assert (
+        np.linalg.norm(p - arm.shoulder) <= arm.max_reach * 1.001
+    ), "wrist left the reachable sphere"
+    assert (
+        p[2] - arm.shoulder[2] > 0.35
+    ), f"wrist not overhead: only {p[2] - arm.shoulder[2]:.2f} m above shoulder"
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -587,6 +654,7 @@ CHECKS = [
     ("waist_chain_gating", check_waist_chain_gating),
     ("grip_mapping", check_grip_mapping),
     ("input_lpf", check_input_lpf),
+    ("overhead_clamp", check_overhead_clamp),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 
@@ -626,8 +694,14 @@ def main() -> int:
     ap.add_argument(
         "--input-tau",
         type=float,
-        default=0.06,
+        default=0.12,
         help="LPF time constant on the wire controller poses (s); 0 = off",
+    )
+    ap.add_argument(
+        "--target-slew",
+        type=float,
+        default=0.6,
+        help="target slew limit (m/s) after the workspace clamp; 0 = off",
     )
     ap.add_argument("--trigger-thresh", type=float, default=TRIGGER_THRESH)
     ap.add_argument("--waist-clamp", type=float, default=0.6)
@@ -666,8 +740,8 @@ def main() -> int:
     m.opt.timestep = DT / SUBSTEPS
 
     arms = {
-        "left": ClutchArm("left", args.position_scale, args.rotation_weight),
-        "right": ClutchArm("right", args.position_scale, args.rotation_weight),
+        "left": ClutchArm("left", args.position_scale, args.rotation_weight, args.target_slew),
+        "right": ClutchArm("right", args.position_scale, args.rotation_weight, args.target_slew),
     }
     lpfs = {"left": PoseLpf(args.input_tau), "right": PoseLpf(args.input_tau)}
     waist = WaistYawChain(sign=args.waist_sign, clamp_rad=args.waist_clamp)

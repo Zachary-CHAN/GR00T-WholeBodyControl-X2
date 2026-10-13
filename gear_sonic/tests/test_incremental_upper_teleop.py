@@ -45,6 +45,10 @@ def test_input_lpf():
     iutm.check_input_lpf()
 
 
+def test_overhead_clamp():
+    iutm.check_overhead_clamp()
+
+
 def test_ctrl_canonicalization_matches_wire_chain():
     """The sender's controller canonicalisation must be the EXACT rotation
     the wire smpl_joints chain applies: canonicalising the chain's own FK

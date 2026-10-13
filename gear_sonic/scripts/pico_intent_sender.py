@@ -486,6 +486,30 @@ def _canonical_root_inv(body: np.ndarray) -> Rot:
     return ((_YUP_TO_ZUP * (q_raw * _RY180)) * _SMPL_BASE_INV).inv()
 
 
+# FRAME-ROTATION SMOOTHING (live jitter round 2, 2026-10-13: jitter persisted
+# with the sim-side pose LPF + position-only IK). The canonical frame rotates
+# with the RAW per-tick pelvis quat, so its orientation noise swings the whole
+# canonicalized controller pose about the pelvis (~0.6 m radius) -- filter the
+# quat at the SOURCE, where the noise is a single rotation, not a Cartesian
+# cloud. tau 0.15 s in the tangent space; state drops with the body stream.
+_ROOT_LPF = {"rot": None, "tau_s": 0.15}
+
+
+def _smoothed_root_inv(body: np.ndarray, dt: float) -> Rot:
+    """_canonical_root_inv with the pelvis quat low-pass filtered (the
+    wire path; the pure version stays available for exactness tests)."""
+    q_raw = Rot.from_quat(
+        np.array([body[0, 6], body[0, 3], body[0, 4], body[0, 5]]), scalar_first=True
+    )
+    if _ROOT_LPF["rot"] is None or _ROOT_LPF["tau_s"] <= 0.0:
+        _ROOT_LPF["rot"] = q_raw
+    else:
+        a = dt / (_ROOT_LPF["tau_s"] + dt)
+        r = _ROOT_LPF["rot"]
+        _ROOT_LPF["rot"] = Rot.from_rotvec(a * (r.inv() * q_raw).as_rotvec()) * r
+    return ((_YUP_TO_ZUP * (_ROOT_LPF["rot"] * _RY180)) * _SMPL_BASE_INV).inv()
+
+
 def _ctrl_wire_fields(xrt, lt, rt):
     """Controller-side wire fields for the incremental (clutch-IK) teleop.
 
@@ -512,7 +536,10 @@ def _ctrl_wire_fields(xrt, lt, rt):
         return fields
     try:
         body = np.asarray(xrt.get_body_joints_pose(), np.float64).reshape(24, 7)
-        root_inv = _canonical_root_inv(body)
+        if np.linalg.norm(body[0, 3:7]) < 0.5:  # dead body stream: drop filter
+            _ROOT_LPF["rot"] = None
+            return fields
+        root_inv = _smoothed_root_inv(body, CONTROL_DT)
         fields["grip"] = np.array(
             [float(xrt.get_left_grip()), float(xrt.get_right_grip())], np.float32)
         for name, getter in (("lctrl_pose", xrt.get_left_controller_pose),
