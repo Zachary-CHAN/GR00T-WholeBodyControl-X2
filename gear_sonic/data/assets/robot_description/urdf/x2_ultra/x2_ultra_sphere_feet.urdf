@@ -1,7 +1,10 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="x2t2.5">
   <mujoco>
-    <compiler meshdir="meshes" discardvisual="false" />
+    <!-- meshdir="." keeps the search root pinned to this URDF's directory.
+         Mesh filenames below already include the "meshes/" prefix, so a
+         meshdir of "meshes" would resolve to "meshes/meshes/xxx.STL". -->
+    <compiler meshdir="." discardvisual="false" />
   </mujoco>
   <link name="pelvis">
     <inertial>
