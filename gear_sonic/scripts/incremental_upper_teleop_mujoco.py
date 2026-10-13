@@ -169,6 +169,7 @@ class ClutchArm:
         freeze_pos_err_m: float = 0.12,
         jump_guard_rad: float = 0.22,
         torso_keepout: tuple | None = None,
+        rot_err_clip_rad: float = 0.08,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
@@ -202,11 +203,29 @@ class ClutchArm:
         # distorts the step direction -> bang-bang). A null-space bent-elbow
         # bias was tried here too but its projection through the DAMPED
         # pseudo-inverse leaks into the task error (17 mm) -- not worth it.
+        # ROTATION-RESIDUAL SOFT ENVELOPE (live round 8: "增量式位姿控制还是有
+        # 抖动"): in POSE mode the operator wrist sweeps far outside the robot
+        # wrist joints' range, so a persistent large angular residual is
+        # structurally unreachable -- and DLS answers a large residual with a
+        # large per-tick step (~linear: 34 deg -> 0.14 rad/tick, 90 deg ->
+        # 0.26), a visible shake that also drags the shoulder/elbow around and
+        # wrecks position tracking. The envelope fades the orientation pull
+        # over [rot_err_clip_rad, 2.5x] and yields it entirely above, but ONLY
+        # while the wrist jams a limit AND the target holds still AND the
+        # residual isn't closing -- a driven or receding target keeps full
+        # pull (see ArmIKSolver.solve). Measurable residuals stay untouched.
+        #
+        # NOTE the real round-8 jitter root cause was upstream of this: a
+        # left-multiply bug in PoseLpf.step made the LPFed target orbit at a
+        # constant ~8 deg/tick for large orientation steps, so "target
+        # stationary" never held and this gate never armed. The envelope is
+        # hardening on top of the fixed filter, not the fix itself.
         self.solver = ArmIKSolver(
             side,
             damping=0.08,
             rotation_weight=rotation_weight,
             uniform_step_clip=True,
+            max_rotation_err_rad=rot_err_clip_rad,
         )
         self.q = ARM_NEUTRAL[side].copy()
         self.anchor = None  # (op_pos, op_rot_inv, rob_pos, rob_rot)
@@ -256,6 +275,7 @@ class ClutchArm:
             sRot.from_matrix(rob_R),
         )
         self._tgt_slewed = rob_pos.copy()  # zero delta at engage
+        self.solver.reset_rotation_err_state()
         return True
 
     def disengage(self) -> None:
@@ -402,7 +422,17 @@ class PoseLpf:
         else:
             a = dt / (self.tau + dt)
             self.pos = self.pos + a * (p - self.pos)
-            self.rot = sRot.from_rotvec(a * (self.rot.inv() * r).as_rotvec()) * self.rot
+            # One step of geodesic slerp: rot <- rot * exp(a * log(rot^-1 r)).
+            # The correction MUST be composed on the RIGHT: the rotvec of
+            # rot^-1 r lives in rot's BODY frame, and only a right-multiply
+            # applies it there. Left-multiplying treats a body vector as a
+            # world vector -- wrong by O(theta^2), invisible for the small
+            # tracking errors of gentle motion, but at a large orientation
+            # step (user whipping the wrist: the round-8 pose-mode jitter)
+            # the filter never converges: it orbits at a constant ~8 deg per
+            # tick forever, so the target never rests and every downstream
+            # freeze/limit logic reads "operator still moving".
+            self.rot = self.rot * sRot.from_rotvec(a * (self.rot.inv() * r).as_rotvec())
         return np.concatenate([self.pos, self.rot.as_quat(scalar_first=True)])
 
 
@@ -1067,6 +1097,141 @@ def check_torso_keepout() -> None:
     assert tail_err < 0.05, f"tracking should resume cleanly (err {tail_err * 1000:.0f} mm)"
 
 
+def check_pose_lpf_convergence() -> None:
+    """Live round 8 ROOT CAUSE: PoseLpf.step composed the slerp correction
+    on the LEFT (``exp(a*log(rot^-1 r)) * rot``), treating a body-frame
+    rotvec as a world vector. The two agree to O(theta^2), so gentle
+    tracking looked fine -- but at a large orientation step the filter
+    NEVER converged: measured, it orbited at a constant ~8 deg/tick
+    forever. The LPFed target therefore never rested, every downstream
+    "target stationary" gate stayed disarmed, and DLS kept re-aiming ->
+    the pose-mode jitter. The fix is the standard geodesic-slerp
+    right-composition: ``rot * exp(a*log(rot^-1 r))``.
+
+    Two assertions pin the right-composition specifically:
+    1. tau=0 (pure passthrough) must land EXACTLY on the input even for a
+       non-commuting rotation pair (left-multiply is only exact when rot
+       and r commute or one is identity);
+    2. after a warm-up, a large step must converge MONOTONICALLY (the
+       right-composition gives |log(out^-1 r)| = (1-a) * d exactly; the
+       bug orbits instead).
+    """
+    a = sRot.from_euler("xyz", [95.0, 10.0, -40.0], degrees=True)
+    b = sRot.from_euler("xyz", [5.0, 80.0, 25.0], degrees=True)
+    pa = np.concatenate([[0.3, -0.1, 0.4], a.as_quat(scalar_first=True)])
+    pb = np.concatenate([[0.3, -0.1, 0.4], b.as_quat(scalar_first=True)])
+    # 1) exact passthrough for a non-commuting pair
+    f = PoseLpf(tau_s=0.0)
+    f.step(pa, DT)
+    out = f.step(pb, DT)
+    miss = (sRot.from_quat(out[3:], scalar_first=True).inv() * b).magnitude()
+    assert miss < 1e-9, f"passthrough missed a non-commuting input by {np.degrees(miss):.2f} deg"
+    # 2) 90-deg step about the live-repro axis: monotone geodesic convergence
+    #    (the buggy left-multiply diverges to a 112-deg orbit here, +4 deg/tick)
+    ax = np.array([0.3, -0.2, 0.93])
+    ax /= np.linalg.norm(ax)
+    c = sRot.from_rotvec(ax * np.radians(90.0)) * a
+    pc = np.concatenate([[0.3, -0.1, 0.4], c.as_quat(scalar_first=True)])
+    f2 = PoseLpf(tau_s=0.12)
+    for _ in range(50):
+        f2.step(pa, DT)
+    step_rad = (a.inv() * c).magnitude()
+    d = []
+    for _ in range(300):  # 6 s: tau=0.12 needs ~5*tau to settle
+        out = f2.step(pc, DT)
+        d.append((sRot.from_quat(out[3:], scalar_first=True).inv() * c).magnitude())
+    d = np.asarray(d)
+    assert d[0] > 0.5 * step_rad, "filter jumped the full step: not a filter"
+    assert d[0] < 0.95 * step_rad, "first step overshot the input (left-multiply symptom)"
+    dd = np.diff(d)
+    assert np.all(dd < 1e-12), (
+        f"LPF orbited instead of converging: distance to the input rose by "
+        f"{np.degrees(dd.max()):.2f} deg in one tick"
+    )
+    assert d[-1] < 1e-3, f"LPF did not converge: {np.degrees(d[-1]):.2f} deg left after 6 s"
+
+
+def check_pose_envelope() -> None:
+    """Live round 8 hardening: with PoseLpf fixed, a PARKED out-of-range
+    wrist target still creeped silently (DLS kept re-aiming at an
+    unreachable residual: measured ~0.3-2 mrad/tick of wrist drift,
+    forever -- "the robot's wrist slowly turns by itself"). The soft
+    envelope fades the orientation pull above ``rot_err_clip_rad`` and
+    yields it entirely (2.5x) -- but only while the wrist jams a limit
+    AND the target holds still AND the residual is not closing.
+
+    Shipped behavior under test:
+    1. below the threshold the solver is EXACTLY the legacy one (a
+       trackable pose must keep its accuracy, bit for bit);
+    2. a driven target (operator still turning) keeps full tracking --
+       the arm must not freeze mid-rotation;
+    3. parked far out of range -> the commanded q FREEZES (dq -> 0),
+       killing the creep;
+    4. turning the target back re-arms tracking (no deadlock; residual
+       returns to ~0 at home).
+    """
+    ax = np.array([0.3, -0.2, 0.93])
+    ax /= np.linalg.norm(ax)
+
+    def feasible_err(clip: float) -> float:
+        arm = ClutchArm("right", 1.0, 0.5, rot_err_clip_rad=clip)
+        pos0, R0 = arm.solver.fk(arm.q)
+        pose0 = np.concatenate([pos0, sRot.from_matrix(R0).as_quat(scalar_first=True)])
+        assert arm.engage(pose0)
+        tgt = pose0.copy()
+        tgt[3:] = (
+            sRot.from_rotvec(ax * np.radians(3.0)) * sRot.from_quat(pose0[3:], scalar_first=True)
+        ).as_quat(scalar_first=True)
+        err = 9.9
+        for _ in range(300):
+            _, ik = arm.step(True, tgt)
+            err = ik.rot_err_rad
+        return err
+
+    e_env, e_off = feasible_err(0.08), feasible_err(0.0)
+    assert e_env < np.radians(1.0), f"trackable 3-deg twist not met: {np.degrees(e_env):.2f} deg"
+    assert abs(e_env - e_off) < 1e-12, "envelope must be an exact no-op below the threshold"
+
+    arm = ClutchArm("right", 1.0, 0.5, rot_err_clip_rad=0.08)
+    lpf = PoseLpf(0.12)
+    pos0, R0 = arm.solver.fk(arm.q)
+    pose0 = np.concatenate([pos0, sRot.from_matrix(R0).as_quat(scalar_first=True)])
+    assert arm.engage(lpf.step(pose0, DT))
+
+    def twist(deg: float) -> np.ndarray:
+        out = pose0.copy()
+        out[3:] = (
+            sRot.from_rotvec(ax * np.radians(deg)) * sRot.from_quat(pose0[3:], scalar_first=True)
+        ).as_quat(scalar_first=True)
+        return out
+
+    q_prev = [arm.q.copy()]
+
+    def run(deg_of_k, ticks: int) -> np.ndarray:
+        dqs = []
+        for k in range(ticks):
+            q, _ = arm.step(True, lpf.step(twist(deg_of_k(k)), DT))
+            dqs.append(float(np.abs(q - q_prev[0]).max()))
+            q_prev[0] = q.copy()
+        return np.asarray(dqs)
+
+    dq_drive = run(lambda k: 30.0 * k * DT, 150)  # 3 s ramp to +90 deg
+    dq_park = run(lambda k: 90.0, 400)  # parked far out of range
+    dq_back = run(lambda k: max(0.0, 90.0 - 30.0 * (k + 1) * DT), 300)  # turn back
+    err_end = 9.9
+    for _ in range(100):  # settle at home
+        _, ik = arm.step(True, lpf.step(pose0, DT))
+        err_end = ik.rot_err_rad
+    assert dq_drive.max() > 0.01, "driven target: arm must keep following"
+    assert dq_park[-100:].max() < 1e-5, (
+        f"parked out of range: creep not frozen ({dq_park[-100:].max():.2e} rad/tick)"
+    )
+    assert dq_back.max() > 0.01, "turning back must re-arm tracking (deadlock?)"
+    assert err_end < np.radians(2.0), (
+        f"tracking not restored at home: {np.degrees(err_end):.2f} deg residual"
+    )
+
+
 CHECKS = [
     ("wire_roundtrip", check_wire_roundtrip),
     ("ik_convergence", check_ik_convergence),
@@ -1080,6 +1245,8 @@ CHECKS = [
     ("extended_stability", check_extended_stability),
     ("ik_freeze_guard", check_ik_freeze_guard),
     ("torso_keepout", check_torso_keepout),
+    ("pose_lpf_convergence", check_pose_lpf_convergence),
+    ("pose_envelope", check_pose_envelope),
     ("model_and_head_hold", check_model_and_head_hold),
 ]
 
@@ -1115,6 +1282,14 @@ def main() -> int:
         type=float,
         default=0.5,
         help="IK orientation weight; 0 = position-only (try first for jitter)",
+    )
+    ap.add_argument(
+        "--rot-err-clip",
+        type=float,
+        default=0.08,
+        help="soft-envelope start for the pose-mode angular residual (rad); "
+        "pull fades to zero at 2.5x, only while the wrist jams a limit and "
+        "the target holds still; 0 = off (legacy)",
     )
     ap.add_argument(
         "--input-tau",
@@ -1166,8 +1341,20 @@ def main() -> int:
     m.opt.timestep = DT / SUBSTEPS
 
     arms = {
-        "left": ClutchArm("left", args.position_scale, args.rotation_weight, args.target_slew),
-        "right": ClutchArm("right", args.position_scale, args.rotation_weight, args.target_slew),
+        "left": ClutchArm(
+            "left",
+            args.position_scale,
+            args.rotation_weight,
+            args.target_slew,
+            rot_err_clip_rad=args.rot_err_clip,
+        ),
+        "right": ClutchArm(
+            "right",
+            args.position_scale,
+            args.rotation_weight,
+            args.target_slew,
+            rot_err_clip_rad=args.rot_err_clip,
+        ),
     }
     # trunk keep-out from the REAL model silhouette (d is still at the
     # neutral pose build_model + mj_forward left it in)
@@ -1181,6 +1368,7 @@ def main() -> int:
     print(
         f"[sim] wire mode: SUB :{args.intent_port}; trigger>{args.trigger_thresh} "
         f"engages, scale {args.position_scale}, rot_w {args.rotation_weight}, "
+        f"rot_err_clip {args.rot_err_clip}, "
         f"lpf tau {args.input_tau}s, waist sign {args.waist_sign:+.0f}"
     )
 

@@ -203,6 +203,25 @@ class ArmIKSolver:
             the live "arm shakes once extended" symptom. Uniform
             scaling keeps the descent direction and only caps the
             magnitude. Opt-in; default keeps the legacy clip.
+        max_rotation_err_rad: SOFT-envelope threshold on the angular
+            residual fed to the step (radians; 0 = off, legacy
+            behaviour). Rationale (live round 8, pose mode): the
+            operator wrist re-orients over a much wider range than the
+            robot's three wrist joints (+-0.558 rad pitch etc.), so the
+            unreachable part of the orientation error persists tick
+            after tick -- and DLS answers a large persistent residual
+            with a large per-tick step. Measured on a 90-deg twist:
+            the commanded dq scales ~linearly with the residual
+            (5 deg -> 0.006 rad/tick, 34 deg -> 0.14, 90 deg -> 0.26),
+            and at the wrist-limit boundary it turns into a symmetric
+            +-40 deg wrist_roll limit cycle (~1 Hz) that also wrecks
+            position tracking. A hard cap only shrinks the cycle. The
+            envelope instead FADES the residual: full weight below
+            ``max_rotation_err_rad`` (any trackable pose keeps exact
+            accuracy), linearly down to ZERO at ``2.5x`` the threshold
+            (an unreachable pose stops PUSHING entirely -- the
+            orientation task yields, position tracking wins, and the
+            cycle's driving force disappears).
     """
 
     def __init__(
@@ -215,6 +234,7 @@ class ArmIKSolver:
         null_space_gain: float = 0.0,
         q_preferred: np.ndarray | None = None,
         uniform_step_clip: bool = False,
+        max_rotation_err_rad: float = 0.0,
     ):
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
@@ -224,6 +244,42 @@ class ArmIKSolver:
         self.rotation_weight = float(rotation_weight)
         self.max_per_tick_step_rad = float(max_per_tick_step_rad)
         self.uniform_step_clip = bool(uniform_step_clip)
+        self.max_rotation_err_rad = float(max_rotation_err_rad)
+        # Residual above which the orientation task fully yields (rad).
+        # 2.5x keeps the fade band wide (>= e.g. 0.2 rad at the 0.08
+        # default) so the hand-off is gradual, not a switch.
+        self._rot_err_fade_rad = 2.5 * self.max_rotation_err_rad
+        # Per-tick trend of the angular residual (EMA, rad/tick), used to
+        # tell "operator is turning BACK" (closing) from "operator keeps
+        # pushing past the limit" (opening) while the residual is inside
+        # the dead band. Closing re-arms full pull-in so the wrist
+        # follows home instead of locking at the frozen pose.
+        self._last_rot_err: float | None = None
+        self._rot_err_trend = 0.0
+        # Trend below which the residual is considered "moving" (rad/tick).
+        # Sits above static noise (~2e-3) and below a deliberate return.
+        self._rot_err_trend_eps = 5.0e-3
+        # True when a wrist joint sits within ``_rot_err_jam_margin`` of
+        # its limit. Freezing a large residual is only correct then --
+        # a free wrist with a big residual is lag on a reachable target.
+        self._wrist_jammed = False
+        self._rot_err_jam_margin = 0.04
+        # Whether the orientation target itself is moving (operator is
+        # still rotating). The limit cycle is a property of a
+        # *stationary* unreachable target; while the operator keeps
+        # turning, the loop is driven, never resonant -- the unfrozen
+        # baseline tracks a moving target cleanly.
+        #
+        # Debounced over 2 consecutive ticks: live Pico streams show
+        # isolated input spikes up to ~3 deg/frame, and a one-tick
+        # "moving" blip would re-arm full pull-in for a single tick
+        # (a visible twitch). A real rotation stays above the
+        # threshold for many ticks, so the 1-tick confirmation delay
+        # costs nothing.
+        self._last_target_R: np.ndarray | None = None
+        self._move_votes = 0
+        self._target_moving = False
+        self._target_move_eps = 3.0e-3
         self._chain = left_arm_chain() if side == "left" else right_arm_chain()
 
         if side == "left":
@@ -275,6 +331,15 @@ class ArmIKSolver:
             J[3:, i] = z_i
         return J, p_e, R_e
 
+    def reset_rotation_err_state(self) -> None:
+        """Forget the angular-residual trend (call on re-anchor/clutch)."""
+        self._last_rot_err = None
+        self._rot_err_trend = 0.0
+        self._wrist_jammed = False
+        self._last_target_R = None
+        self._move_votes = 0
+        self._target_moving = False
+
     def solve(
         self,
         q_seed: np.ndarray,
@@ -305,7 +370,44 @@ class ArmIKSolver:
 
             err_lin = self.position_weight * (target_pos - p_e)
             if R_target is not None:
-                err_ang = self.rotation_weight * _rotation_error_axis_angle(R_e, R_target)
+                e_ang = _rotation_error_axis_angle(R_e, R_target)
+                n_ang = float(np.linalg.norm(e_ang))
+                if iters == 1:
+                    # Per-tick state update (solve runs once per tick,
+                    # the inner iterations share the tick's entry state).
+                    if self._last_rot_err is not None:
+                        self._rot_err_trend = 0.5 * self._rot_err_trend + 0.5 * (
+                            n_ang - self._last_rot_err
+                        )
+                    self._last_rot_err = n_ang
+                    if self._last_target_R is not None:
+                        tr = float(np.trace(self._last_target_R.T @ R_target))
+                        step = float(np.arccos(np.clip(0.5 * (tr - 1.0), -1.0, 1.0)))
+                        self._move_votes = (
+                            self._move_votes + 1 if step > self._target_move_eps else 0
+                        )
+                        self._target_moving = self._move_votes >= 2
+                    self._last_target_R = R_target
+                    m = np.minimum(q[4:] - self._lo[4:], self._hi[4:] - q[4:])
+                    self._wrist_jammed = bool(m.min() < self._rot_err_jam_margin)
+                if self.max_rotation_err_rad > 0.0:
+                    lo = self.max_rotation_err_rad
+                    hi = self._rot_err_fade_rad
+                    closing = self._rot_err_trend < -self._rot_err_trend_eps
+                    if n_ang >= hi:
+                        # Unreachable residual. Yield the orientation task
+                        # entirely (position tracking owns the arm) ONLY
+                        # in the situation that sustains the limit cycle:
+                        # a stationary far target AND a wrist jammed
+                        # against its limit. Anything else keeps pulling
+                        # -- the operator may be still turning (driven,
+                        # never resonant), may be turning back, or the
+                        # wrist may simply be lagging a reachable target.
+                        if self._wrist_jammed and not self._target_moving and not closing:
+                            e_ang = np.zeros(3)
+                    elif n_ang > lo:
+                        e_ang = e_ang * ((hi - n_ang) / (hi - lo))
+                err_ang = self.rotation_weight * e_ang
                 err = np.concatenate([err_lin, err_ang])
             else:
                 # Position-only: drop the angular rows of J so the
