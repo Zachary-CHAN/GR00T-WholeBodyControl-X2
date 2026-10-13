@@ -859,7 +859,7 @@ def main() -> int:
                 lg, rg = (float(x) for x in frame["grip"])
                 lcp = np.asarray(frame["lctrl_pose"], np.float64)
                 rcp = np.asarray(frame["rctrl_pose"], np.float64)
-                j24 = np.asarray(frame["smpl_joints"], np.float64)
+                j24 = np.asarray(frame["smpl_joints"], np.float64).reshape(24, 3)
             else:
                 lt = rt = lg = rg = 0.0  # stale -> freeze + hands closed
                 lcp = rcp = zero7
