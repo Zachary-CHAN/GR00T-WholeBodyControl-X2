@@ -182,6 +182,10 @@ class ClutchArm:
         # stalls partway up). Clamp the target onto the reachable sphere
         # around the shoulder: direction preserved, magnitude saturated --
         # the wrist still ends up overhead, just not at an impossible radius.
+        # Clamp to the INTERIOR (0.90, live round 4: clamping at 0.97 put the
+        # target exactly ON the reachable boundary, where a stretched arm's
+        # Jacobian degenerates -> the DLS stalls and the elbow flips branches
+        # -> the overhead raise moved in stutters).
         _, origins, _ = chain_fk_full(self.solver._chain, self.q)
         self.shoulder = np.asarray(origins[0], np.float64).copy()
         rng = np.random.RandomState(0)
@@ -190,11 +194,12 @@ class ClutchArm:
             q = rng.uniform(self.solver._lo, self.solver._hi)
             p, _R = self.solver.fk(q)
             reach = max(reach, float(np.linalg.norm(p - self.shoulder)))
-        self.max_reach = 0.97 * reach
+        self.max_reach = 0.90 * reach
         # TARGET SLEW (jitter fix, stage 2): whatever survives the input LPF
         # still drives the DLS at up to 0.3 rad/tick per joint. Rate-limiting
         # the target itself bounds the commanded-q steps to human-plausible
-        # motion; engaged motion is << 0.6 m/s so this only eats the noise.
+        # motion; 1.0 m/s still bounds noise (post-LPF noise is ~mm-scale)
+        # without clipping a brisk raise (0.7 scale x ~1.2 m/s > the old 0.6).
         self.target_slew = float("inf") if target_slew_m_s <= 0 else float(target_slew_m_s) * DT
         self._tgt_slewed = None
 
@@ -355,15 +360,21 @@ class TorsoFrame:
 # ubt._SIDES, verified by its self-test; NOT the swapped draft).
 # ---------------------------------------------------------------------------
 class WaistYawChain:
-    """raw -> 3 deg deadzone -> 1st-order LPF (tau) -> clamp -> slew."""
+    """raw -> 4 deg deadzone -> 1st-order LPF (tau) -> clamp -> slew.
+
+    Filtering is deliberately heavier than the arms (live round 4: the
+    waist joint sits mid-torso, so its target noise shakes EVERY joint
+    above it -- the SMPL shoulder-line estimate carries a few deg of
+    noise that the original tau 0.08 / 3 deg deadzone let straight
+    through)."""
 
     def __init__(
         self,
         sign: float = 1.0,
-        deadzone_rad: float = math.radians(3.0),
-        tau_s: float = 0.08,
+        deadzone_rad: float = math.radians(4.0),
+        tau_s: float = 0.20,
         clamp_rad: float = 0.6,
-        slew_rad_s: float = 1.0,
+        slew_rad_s: float = 0.8,
     ) -> None:
         self.sign = float(sign)
         self.deadzone = float(deadzone_rad)
@@ -783,8 +794,9 @@ def main() -> int:
     ap.add_argument(
         "--target-slew",
         type=float,
-        default=0.6,
-        help="target slew limit (m/s) after the workspace clamp; 0 = off",
+        default=1.0,
+        help="target slew limit (m/s) after the workspace clamp; 0 = off "
+        "(1.0: noise floor only -- 0.6 clipped a brisk 0.7-scale raise)",
     )
     ap.add_argument("--trigger-thresh", type=float, default=TRIGGER_THRESH)
     ap.add_argument("--waist-clamp", type=float, default=0.6)
@@ -844,8 +856,13 @@ def main() -> int:
         viewer = mj_viewer.launch_passive(m, d)
 
     zero7 = np.zeros(7, np.float64)
+    # grip LPF (live round 4: raw grip noise fluttered the fingers)
+    grip_f = {"l": 0.0, "r": 0.0}
+    GRIP_TAU = 0.15
     t0 = time.monotonic()
     last_stat = 0.0
+    n_ticks = 0
+    next_tick = time.monotonic()
     try:
         while True:
             if args.duration > 0 and time.monotonic() - t0 > args.duration:
@@ -860,8 +877,12 @@ def main() -> int:
                 lcp = np.asarray(frame["lctrl_pose"], np.float64)
                 rcp = np.asarray(frame["rctrl_pose"], np.float64)
                 j24 = np.asarray(frame["smpl_joints"], np.float64).reshape(24, 3)
+                a = DT / (GRIP_TAU + DT)
+                grip_f["l"] += a * (lg - grip_f["l"])
+                grip_f["r"] += a * (rg - grip_f["r"])
             else:
                 lt = rt = lg = rg = 0.0  # stale -> freeze + hands closed
+                grip_f["l"] = grip_f["r"] = 0.0
                 lcp = rcp = zero7
                 j24 = None
                 lpfs["left"].reset()
@@ -899,25 +920,40 @@ def main() -> int:
             apply_active_hand_ctrl(
                 d,
                 layout,
-                left_active=grasp_command_from_ratio("left", 1.0 - lg),
-                right_active=grasp_command_from_ratio("right", 1.0 - rg),
+                left_active=grasp_command_from_ratio("left", 1.0 - grip_f["l"]),
+                right_active=grasp_command_from_ratio("right", 1.0 - grip_f["r"]),
             )
             pd_and_step(m, d, jm, tgt)
             if viewer is not None:
                 viewer.sync()
+            # REAL-TIME PACING (live round 4: "举手卡顿"): the viewer branch
+            # had NO sleep -- the loop ran as fast as the sim+render allowed
+            # (~2-4x real time on this box), so the robot chased the 50 Hz
+            # operator targets in fast bursts separated by waits. Pace BOTH
+            # branches to wall-clock DT; if we fell behind, re-anchor rather
+            # than accumulating debt.
+            n_ticks += 1
+            next_tick += DT
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
             else:
-                time.sleep(DT)
+                next_tick = time.monotonic()
             now = time.monotonic()
             if now - last_stat > 2.0:
                 last_stat = now
+                hz = n_ticks / (now - t0)
                 print(
                     f"[sim] {'L' if held['left'] else '-'}"
                     f"{'R' if held['right'] else '-'} "
                     f"ik_err L {arms['left'].last_ik.pos_err_m*1000:5.1f}mm "
                     f"R {arms['right'].last_ik.pos_err_m*1000:5.1f}mm "
                     f"waist {math.degrees(waist.cmd):+5.1f}deg "
+                    f"loop {hz:4.1f}Hz "
                     f"err={nerr} stale={int(not fresh)}"
                 )
+                n_ticks = 0
+                t0 = now
     except KeyboardInterrupt:
         print("[sim] Ctrl-C")
     # NOTE: no explicit viewer.close() -- it segfaults at teardown on this
