@@ -203,12 +203,34 @@ class _IntentTapeSource:
         self.quats = np.asarray(z["human_quat"], np.float32)
         self.engaged = np.asarray(z["engaged"], np.float32)
         self.wrist = np.asarray(z["wrist_pr"], np.float32)
+        # v4 controller fields (added 2026-10-14 for the incremental
+        # clutch-IK teleop: without them a replay sent all-zero trigger/
+        # ctrl poses and the chain could never engage). Optional: legacy
+        # tapes fall back to the same zero placeholders as the live
+        # no-xrt path (== "never engage").
+        keys = set(z.files)
+        self.trigger = np.asarray(z["trigger"], np.float32) if "trigger" in keys else None
+        self.ctrl_grip = np.asarray(z["grip"], np.float32) if "grip" in keys else None
+        self.lctrl = np.asarray(z["lctrl_pose"], np.float32) if "lctrl_pose" in keys else None
+        self.rctrl = np.asarray(z["rctrl_pose"], np.float32) if "rctrl_pose" in keys else None
+        self.has_ctrl = all(a is not None for a in
+                            (self.trigger, self.ctrl_grip, self.lctrl, self.rctrl))
         self.rel_t = np.asarray(z["t"], np.float64)
         self.rel_t = self.rel_t - self.rel_t[0]
         self.t0 = time.monotonic()
         print(f"[intent] replaying intent tape {path}: "
               f"{len(self.rel_t)} frames, "
               f"{int((self.engaged > 0.5).sum())} engaged", flush=True)
+        if self.has_ctrl:
+            n_trig = int((np.asarray(self.trigger).reshape(-1, 2).max(axis=1) > 0.5).sum())
+            print(f"[intent] tape carries the v4 controller fields "
+                  f"(trigger>0.5 in {n_trig} frames) -> the incremental "
+                  f"clutch teleop engages from the tape's own triggers", flush=True)
+        else:
+            print("[intent] LEGACY tape: no lctrl_pose/rctrl_pose/trigger/grip -- "
+                  "the v1 SMPL retarget path is unaffected, but the incremental "
+                  "(clutch-IK) teleop CANNOT engage from this tape; re-record "
+                  "with the current sender", flush=True)
 
     def _idx(self, now: float) -> int:
         h = getattr(self, "_hold", None)
@@ -247,8 +269,30 @@ class _IntentTapeSource:
     def replay_wrist(self, now: float) -> np.ndarray:
         return self.wrist[self._idx(now)]
 
-    def grips(self):
-        return (0.0, 0.0)
+    def replay_ctrl(self, now: float) -> dict:
+        """The four v4 controller wire fields for the current frame
+        (trigger/grip f32[2], lctrl_pose/rctrl_pose f32[7] xyz+wxyz, framed
+        in the OPERATOR TORSO axes -- recorded post-framing, so replay sends
+        exactly what the live session sent). Legacy tapes (no v4 fields):
+        the same all-zero placeholders as _ctrl_wire_fields(None, 0, 0)."""
+        if not self.has_ctrl:
+            return {"trigger": np.zeros(2, np.float32),
+                    "grip": np.zeros(2, np.float32),
+                    "lctrl_pose": _ZERO_POSE7.copy(),
+                    "rctrl_pose": _ZERO_POSE7.copy()}
+        i = self._idx(now)
+        return {"trigger": np.asarray(self.trigger[i], np.float32).reshape(2),
+                "grip": np.asarray(self.ctrl_grip[i], np.float32).reshape(2),
+                "lctrl_pose": np.asarray(self.lctrl[i], np.float32).reshape(7),
+                "rctrl_pose": np.asarray(self.rctrl[i], np.float32).reshape(7)}
+
+    def replay_grips(self, now: float):
+        """(lg, rg) for the hand path: the recorded grip on v4 tapes, else
+        (0, 0) -- the legacy behavior (tape hands were trigger-only)."""
+        if self.ctrl_grip is None:
+            return (0.0, 0.0)
+        g = np.asarray(self.ctrl_grip[self._idx(now)], np.float32).reshape(2)
+        return (float(g[0]), float(g[1]))
 
     def stop(self) -> None:
         pass
@@ -955,7 +999,11 @@ def main() -> int:
     frame_idx, n_sent, t_rep = 0, 0, time.monotonic()
     recording = not args.no_record and not args.tape_replay
     rec = {"t": [], "smpl_joints": [], "human_quat": [],
-           "engaged": [], "wrist_pr": []} if recording else None
+           "engaged": [], "wrist_pr": [],
+           # v4 controller fields (2026-10-14): the incremental (clutch-IK)
+           # teleop reads the trigger/ctrl poses off the wire, so a tape
+           # without them replays as a no-op there
+           "trigger": [], "grip": [], "lctrl_pose": [], "rctrl_pose": []} if recording else None
     wrist_source = "off" if args.no_wrist_follow else args.wrist_source
     wrist_dbg = None
     print(f"[wrist] conversion={'FRAME (SMPL->X2 chain yaw/pitch/roll)' if _USE_FRAME_MAP else 'per-axis WRIST_SMPL_MAP'}"
@@ -1020,7 +1068,12 @@ def main() -> int:
             return
         hand_next_t = now + 1.0 / max(args.hand_hz, 1.0)
         try:
-            lg = float(src.xrt.get_left_grip()); rg = float(src.xrt.get_right_grip())
+            if isinstance(src, _IntentTapeSource):
+                # v4 tapes carry the recorded grip (replay = session);
+                # legacy tapes -> (0, 0) exactly as before
+                lg, rg = src.replay_grips(now)
+            else:
+                lg = float(src.xrt.get_left_grip()); rg = float(src.xrt.get_right_grip())
         except Exception:
             lg = rg = 0.0
         l_ratio, r_ratio = controller_grasp_ratio(
@@ -1518,6 +1571,15 @@ def main() -> int:
                 head_tx["base"] = None
                 head_dbg = None
 
+            # Controller fields for the wire AND the tape record: computed
+            # ONCE per tick (a second call would double-step the torso LPF
+            # inside _ctrl_wire_fields; and record == sent byte-for-byte).
+            # Intent-tape replays take them from the tape (v4) or the
+            # all-zero placeholder (legacy) -- never from a live xrt.
+            if isinstance(src, _IntentTapeSource):
+                ctrl_fields = src.replay_ctrl(now)
+            else:
+                ctrl_fields = _ctrl_wire_fields(getattr(src, "xrt", None), lt, rt)
             msg = pack_pose_message({
                 "smpl_joints": joints[-1].reshape(72).astype(np.float32),
                 "human_quat": quats[-1].astype(np.float32),
@@ -1528,7 +1590,7 @@ def main() -> int:
                 "frame_index": np.array([frame_idx], np.int64),
                 # controller layer for the incremental (clutch-IK) teleop;
                 # version stays 4 -- the packed protocol is additive
-                **_ctrl_wire_fields(getattr(src, "xrt", None), lt, rt),
+                **ctrl_fields,
             }, topic="pico_intent", version=4)
             sock.send(msg)
             if rec is not None:
@@ -1537,6 +1599,12 @@ def main() -> int:
                 rec["human_quat"].append(quats[-1].copy())
                 rec["engaged"].append(1.0 if (engaged and body_ok) else 0.0)
                 rec["wrist_pr"].append(wr.copy())
+                # v4 controller fields: the exact values that went on the
+                # wire, so an intent-tape replay reproduces the session
+                rec["trigger"].append(np.asarray(ctrl_fields["trigger"], np.float32).copy())
+                rec["grip"].append(np.asarray(ctrl_fields["grip"], np.float32).copy())
+                rec["lctrl_pose"].append(np.asarray(ctrl_fields["lctrl_pose"], np.float32).copy())
+                rec["rctrl_pose"].append(np.asarray(ctrl_fields["rctrl_pose"], np.float32).copy())
             if raw_rec:
                 raw_now = bool(engaged and body_ok)
                 if raw_now != raw_prev:
@@ -1600,12 +1668,21 @@ def main() -> int:
                 human_quat=np.asarray(rec["human_quat"], np.float32),
                 engaged=np.asarray(rec["engaged"], np.float32),
                 wrist_pr=np.asarray(rec["wrist_pr"], np.float32),
+                # v4 controller fields (2026-10-14) -- the incremental
+                # (clutch-IK) teleop drives ONLY from these
+                trigger=np.asarray(rec["trigger"], np.float32).reshape(-1, 2),
+                grip=np.asarray(rec["grip"], np.float32).reshape(-1, 2),
+                lctrl_pose=np.asarray(rec["lctrl_pose"], np.float32).reshape(-1, 7),
+                rctrl_pose=np.asarray(rec["rctrl_pose"], np.float32).reshape(-1, 7),
                 quat_convention="wxyz (canonical, matches sidecar "
                                 "global_orient_quat_wxyz)",
                 fps=50.0)
             n_eng = int((np.asarray(rec["engaged"]) > 0.5).sum())
+            n_trig = int((np.asarray(rec["trigger"], np.float32)
+                          .reshape(-1, 2).max(axis=1) > 0.5).sum())
             print(f"[intent] tape saved: {out}  "
-                  f"({len(rec['t'])} frames, {n_eng} engaged)", flush=True)
+                  f"({len(rec['t'])} frames, {n_eng} engaged, "
+                  f"{n_trig} frames trigger>0.5)", flush=True)
         # linger-free teardown: PUB sockets with unreachable peers otherwise
         # hold the interpreter open for seconds after a replay exits
         # (2026-09-05: the next launch's one-sender guard saw the ghost).

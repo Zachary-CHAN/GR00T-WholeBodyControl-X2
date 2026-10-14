@@ -30,11 +30,21 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from gear_sonic.utils.teleop.solver.arm.x2_arm_fk import (
-    chain_fk_full,
-    left_arm_chain,
-    right_arm_chain,
-)
+try:  # repo tree (gear_sonic package importable)
+    from gear_sonic.utils.teleop.solver.arm.x2_arm_fk import (
+        chain_fk_full,
+        left_arm_chain,
+        right_arm_chain,
+    )
+except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
+    # The X2 teleop node on the robot ships this file (and x2_arm_fk.py)
+    # copied FLAT into czq_examples/czq_examples/: there is no gear_sonic
+    # package there, so fall back to the sibling module.
+    from x2_arm_fk import (  # type: ignore[no-redef]
+        chain_fk_full,
+        left_arm_chain,
+        right_arm_chain,
+    )
 
 
 # ── X2 arm joint catalog (matches the deploy's PD config) ─────────────────
