@@ -79,7 +79,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
 )
 
 DT = 0.02  # 50 Hz control
-SUBSTEPS = 20  # 1 kHz physics under 50 Hz zero-order-held commands
+SUBSTEPS = 20  # 1 kHz physics under 50 Hz zero-order-held position references
 TRIGGER_THRESH = 0.5  # common.py convention; NOT the 0.6 walking deadman
 # DLS iterations per 50 Hz tick. 1 (the recorder default) leaves a ~1.5-tick
 # position lag under continuous motion (~10 mm at 5 mm/tick); 2 halves it
@@ -694,16 +694,31 @@ def find_root(m):
 
 
 def pd_and_step(m, d, jm, tdict):
-    # zero-order-hold the 50 Hz torque command across 1 kHz substeps --
-    # a single 20 ms mujoco step with these kp/kd oscillates violently.
+    # Torque servo emulation (live round 8.2): hold the 50 Hz position
+    # reference (zero-order), but refresh tau -- including the D term -- on
+    # every 1 kHz physics substep. The real X2 servo runs its position loop
+    # at the bus rate against the same 50 Hz reference; the previous
+    # implementation held the full torque for the whole 20 ms tick, which
+    # makes kd*qd STALE feedback. Live recording showed the wrist joints
+    # limit-cycling on exactly that (wrist_yaw ringing at ~90 deg/tick,
+    # persisting long after the trigger was released; replaying the recorded
+    # command trace through both variants reproduced it only with held
+    # torque -- fresh tau dropped every joint to <8 deg/tick).
     root_adr, root_dof = find_root(m)
     root0 = d.qpos[root_adr : root_adr + 7].copy()
-    for name, (q_des, kp, kd) in tdict.items():
-        adr, dof, aid, clo, chi = jm[name]
-        q, qd = d.qpos[adr], d.qvel[dof]
-        tau = kp * (q_des - q) - kd * qd
-        d.ctrl[aid] = np.clip(tau, clo, chi)
+    # flatten once per tick; the 1 kHz servo loop below is vectorized over
+    # all joints (the scalar-per-joint version cost 4 ms of the 20 ms tick)
+    adr = np.fromiter((jm[n][0] for n in tdict), np.int32)
+    dof = np.fromiter((jm[n][1] for n in tdict), np.int32)
+    aid = np.fromiter((jm[n][2] for n in tdict), np.int32)
+    lo = np.fromiter((jm[n][3] for n in tdict), np.float64)
+    hi = np.fromiter((jm[n][4] for n in tdict), np.float64)
+    q_des = np.fromiter((v[0] for v in tdict.values()), np.float64)
+    kp = np.fromiter((v[1] for v in tdict.values()), np.float64)
+    kd = np.fromiter((v[2] for v in tdict.values()), np.float64)
     for _ in range(SUBSTEPS):
+        tau = kp * (q_des - d.qpos[adr]) - kd * d.qvel[dof]
+        d.ctrl[aid] = np.clip(tau, lo, hi)
         mujoco.mj_step(m, d)
     # gantry: hard-pin the floating base every frame
     d.qpos[root_adr : root_adr + 7] = root0

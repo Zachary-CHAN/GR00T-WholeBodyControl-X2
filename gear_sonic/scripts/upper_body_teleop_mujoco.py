@@ -161,17 +161,21 @@ def main() -> int:
         return t
 
     def pd_and_step(tdict):
-        # zero-order-hold the 50 Hz torque command across 1 kHz substeps --
-        # the real hal servo runs at high rate; a single 20 ms mujoco step
-        # with these kp/kd is numerically unstable (violent oscillation).
+        # Torque servo emulation (live round 8.2): the real HAL servo runs
+        # its position loop at high rate against a 50 Hz reference -- hold
+        # the reference (zero-order) but refresh tau, INCLUDING the D term,
+        # on every 1 kHz substep. Holding the full torque for 20 ms makes
+        # kd*qd stale feedback; live recording showed the wrist joints
+        # limit-cycling on exactly that (see the long note in
+        # incremental_upper_teleop_mujoco.py's pd_and_step).
         root_adr = m.jnt_qposadr[0]
         root0 = d.qpos[root_adr:root_adr + 7].copy()
-        for name, (q_des, kp, kd) in tdict.items():
-            adr, dof, aid, clo, chi = jm[name]
-            q, qd = d.qpos[adr], d.qvel[dof]
-            tau = kp * (q_des - q) - kd * qd
-            d.ctrl[aid] = np.clip(tau, clo, chi)
         for _ in range(SUBSTEPS):
+            for name, (q_des, kp, kd) in tdict.items():
+                adr, dof, aid, clo, chi = jm[name]
+                q, qd = d.qpos[adr], d.qvel[dof]
+                tau = kp * (q_des - q) - kd * qd
+                d.ctrl[aid] = np.clip(tau, clo, chi)
             mujoco.mj_step(m, d)
         # gantry: hard-pin the floating base every frame
         d.qpos[root_adr:root_adr + 7] = root0
