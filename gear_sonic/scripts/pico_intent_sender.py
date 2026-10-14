@@ -193,11 +193,13 @@ class _X2DebugWatch:
 
 class _IntentTapeSource:
     """Replays an intent tape (pico_intent_sender --record output) with the
-    LiveSmplSource.window() contract the send loop expects. Holds the final
+    LiveSmplSource.window() contract the send loop expects. Loop mode
+    (default; --tape-once disables, matching LiveSmplSource) wraps at the
+    tape end so the replay keeps cycling; without loop it holds the final
     frame after the tape ends. replay_engaged/replay_wrist expose the
     recorded flags so the sim session mirrors the robot session exactly."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, loop: bool = True):
         z = np.load(path)
         self.joints = np.asarray(z["smpl_joints"], np.float32).reshape(-1, 24, 3)
         self.quats = np.asarray(z["human_quat"], np.float32)
@@ -217,10 +219,14 @@ class _IntentTapeSource:
                             (self.trigger, self.ctrl_grip, self.lctrl, self.rctrl))
         self.rel_t = np.asarray(z["t"], np.float64)
         self.rel_t = self.rel_t - self.rel_t[0]
+        self.loop = bool(loop)
+        self.dt = float(np.median(np.diff(self.rel_t))) if len(self.rel_t) > 1 else 0.02
         self.t0 = time.monotonic()
         print(f"[intent] replaying intent tape {path}: "
               f"{len(self.rel_t)} frames, "
-              f"{int((self.engaged > 0.5).sum())} engaged", flush=True)
+              f"{int((self.engaged > 0.5).sum())} engaged, "
+              + (f"looping every {self.rel_t[-1] + self.dt:.1f} s"
+                 if self.loop else "once: holds the final frame"), flush=True)
         if self.has_ctrl:
             n_trig = int((np.asarray(self.trigger).reshape(-1, 2).max(axis=1) > 0.5).sum())
             print(f"[intent] tape carries the v4 controller fields "
@@ -240,12 +246,20 @@ class _IntentTapeSource:
                 return idx                   # frozen at the engage frame (settle)
             self.t0 += (end - start)         # resume from the same frame, no jump
             self._hold = None
-        return int(min(np.searchsorted(self.rel_t, now - self.t0),
+        elapsed = now - self.t0
+        if self.loop:
+            # wrap at the tape end (one last-frame dwell of dt s, then frame
+            # 0 again) so the replay keeps cycling instead of silently
+            # freezing on the final frame after one pass
+            elapsed %= float(self.rel_t[-1]) + self.dt
+        return int(min(np.searchsorted(self.rel_t, elapsed),
                        len(self.rel_t) - 1))
 
     def finished(self, now: float) -> bool:
         """True once the tape's last frame has been reached (hold shifts included) -- lets --tape-once end an
         INTENT-tape replay too (before 2026-09-08 intent tapes streamed their last frame until the timeout)."""
+        if self.loop:
+            return False  # a looping replay never finishes
         h = getattr(self, "_hold", None)
         if h is not None and now < h[1]:
             return False
@@ -855,7 +869,7 @@ def main() -> int:
     # verbatim so sim reproduces the exact engage segments of the robot
     # session (sim2real plan phase 1). Session npz tapes keep the old path.
     if args.tape_replay and "smpl_joints" in np.load(args.tape_replay):
-        src = _IntentTapeSource(args.tape_replay)
+        src = _IntentTapeSource(args.tape_replay, loop=not args.tape_once)
     else:
         src = LiveSmplSource(args.tape_replay, loop=not args.tape_once)
         if args.tape_once:
