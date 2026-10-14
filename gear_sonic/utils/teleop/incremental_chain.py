@@ -71,6 +71,28 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         IKResult,
     )
 
+# ---------------------------------------------------------------------------
+# Quaternion codec -- scalar-first (w, x, y, z) is the wire convention.
+# scipy >= 1.14 spells this ``scalar_first=True`` on from_quat/as_quat, but
+# PC2 (Ubuntu 22.04) ships scipy 1.8.0 where the kwarg does not exist and the
+# first call dies with TypeError. The circular shifts below are exactly what
+# scalar_first=True does internally, so one code path runs bit-for-bit
+# identically on both scipy generations (A/B-verified against HEAD).
+# ---------------------------------------------------------------------------
+_Q_WXYZ_TO_XYZW = (1, 2, 3, 0)
+_Q_XYZW_TO_WXYZ = (3, 0, 1, 2)
+
+
+def _rot_from_quat_wxyz(q_wxyz) -> sRot:
+    """Rotation from a scalar-first (w, x, y, z) quaternion."""
+    return sRot.from_quat(np.asarray(q_wxyz, np.float64)[..., _Q_WXYZ_TO_XYZW])
+
+
+def _rot_to_quat_wxyz(rot: sRot) -> np.ndarray:
+    """Scalar-first (w, x, y, z) quaternion of a Rotation."""
+    return rot.as_quat()[..., _Q_XYZW_TO_WXYZ]
+
+
 DT = 0.02  # 50 Hz control
 TRIGGER_THRESH = 0.5  # common.py convention; NOT the 0.6 walking deadman
 # DLS iterations per 50 Hz tick. 1 (the recorder default) leaves a ~1.5-tick
@@ -358,7 +380,7 @@ class ClutchArm:
         rob_pos, rob_R = self.solver.fk(self.q)
         self.anchor = (
             c[:3].copy(),
-            sRot.from_quat(c[3:], scalar_first=True).inv(),
+            _rot_from_quat_wxyz(c[3:]).inv(),
             rob_pos,
             sRot.from_matrix(rob_R),
         )
@@ -422,7 +444,7 @@ class ClutchArm:
         a_op, a_op_inv, a_rob, a_rob_R = self.anchor
         c = np.asarray(ctrl_pose7, np.float64).reshape(7)
         tgt_pos = a_rob + self.position_scale * (c[:3] - a_op)
-        tgt_rot = a_rob_R * (a_op_inv * sRot.from_quat(c[3:], scalar_first=True))
+        tgt_rot = a_rob_R * (a_op_inv * _rot_from_quat_wxyz(c[3:]))
         if waist_compensate and abs(waist_yaw) > 1e-9:
             # undo the torso rotation so the wrist holds its WORLD pose
             rz_inv = sRot.from_euler("z", -waist_yaw)
@@ -453,7 +475,7 @@ class ClutchArm:
                 tgt_pos = self._tgt_slewed + step_v * (self.target_slew / n)
             self._tgt_slewed = tgt_pos.copy()
         q_new, ik = self.solver.solve(
-            self.q, tgt_pos, tgt_rot.as_quat(scalar_first=True), max_iters=IK_ITERS_PER_TICK
+            self.q, tgt_pos, _rot_to_quat_wxyz(tgt_rot), max_iters=IK_ITERS_PER_TICK
         )
         off = 0 if self.side == "left" else 7
         q_new = np.clip(q_new, ARM_LO_SOLVER[off : off + 7], ARM_HI_SOLVER[off : off + 7])
@@ -504,7 +526,7 @@ class PoseLpf:
             self.reset()
             return c
         p = c[:3]
-        r = sRot.from_quat(c[3:], scalar_first=True)
+        r = _rot_from_quat_wxyz(c[3:])
         if self.pos is None or self.tau <= 0.0:
             self.pos, self.rot = p.copy(), r
         else:
@@ -521,7 +543,7 @@ class PoseLpf:
             # tick forever, so the target never rests and every downstream
             # freeze/limit logic reads "operator still moving".
             self.rot = self.rot * sRot.from_rotvec(a * (self.rot.inv() * r).as_rotvec())
-        return np.concatenate([self.pos, self.rot.as_quat(scalar_first=True)])
+        return np.concatenate([self.pos, _rot_to_quat_wxyz(self.rot)])
 
 
 # ---------------------------------------------------------------------------
@@ -572,8 +594,8 @@ class TorsoFrame:
             return c
         out = np.empty(7)
         out[:3] = self.M @ c[:3]
-        rot = sRot.from_matrix(self.M) * sRot.from_quat(c[3:], scalar_first=True)
-        out[3:] = rot.as_quat(scalar_first=True)
+        rot = sRot.from_matrix(self.M) * _rot_from_quat_wxyz(c[3:])
+        out[3:] = _rot_to_quat_wxyz(rot)
         return out
 
 
@@ -856,7 +878,7 @@ def check_ik_convergence() -> None:
         # pos: a_rob + (op - a_op) = p_star ; rot: a_rob_R @ op = R_star
         pose = np.empty(7)
         pose[:3] = pos0 + (p_star - arm.anchor[2])
-        pose[3:] = (a_rob_R.inv() * R_star).as_quat(scalar_first=True)
+        pose[3:] = _rot_to_quat_wxyz(a_rob_R.inv() * R_star)
         q, _ = arm.step(True, pose)
         p, _ = arm.solver.fk(q)
         errs.append(float(np.linalg.norm(p_star - p)))
@@ -1178,20 +1200,20 @@ def check_pose_lpf_convergence() -> None:
     """
     a = sRot.from_euler("xyz", [95.0, 10.0, -40.0], degrees=True)
     b = sRot.from_euler("xyz", [5.0, 80.0, 25.0], degrees=True)
-    pa = np.concatenate([[0.3, -0.1, 0.4], a.as_quat(scalar_first=True)])
-    pb = np.concatenate([[0.3, -0.1, 0.4], b.as_quat(scalar_first=True)])
+    pa = np.concatenate([[0.3, -0.1, 0.4], _rot_to_quat_wxyz(a)])
+    pb = np.concatenate([[0.3, -0.1, 0.4], _rot_to_quat_wxyz(b)])
     # 1) exact passthrough for a non-commuting pair
     f = PoseLpf(tau_s=0.0)
     f.step(pa, DT)
     out = f.step(pb, DT)
-    miss = (sRot.from_quat(out[3:], scalar_first=True).inv() * b).magnitude()
+    miss = (_rot_from_quat_wxyz(out[3:]).inv() * b).magnitude()
     assert miss < 1e-9, f"passthrough missed a non-commuting input by {np.degrees(miss):.2f} deg"
     # 2) 90-deg step about the live-repro axis: monotone geodesic convergence
     #    (the buggy left-multiply diverges to a 112-deg orbit here, +4 deg/tick)
     ax = np.array([0.3, -0.2, 0.93])
     ax /= np.linalg.norm(ax)
     c = sRot.from_rotvec(ax * np.radians(90.0)) * a
-    pc = np.concatenate([[0.3, -0.1, 0.4], c.as_quat(scalar_first=True)])
+    pc = np.concatenate([[0.3, -0.1, 0.4], _rot_to_quat_wxyz(c)])
     f2 = PoseLpf(tau_s=0.12)
     for _ in range(50):
         f2.step(pa, DT)
@@ -1199,7 +1221,7 @@ def check_pose_lpf_convergence() -> None:
     d = []
     for _ in range(300):  # 6 s: tau=0.12 needs ~5*tau to settle
         out = f2.step(pc, DT)
-        d.append((sRot.from_quat(out[3:], scalar_first=True).inv() * c).magnitude())
+        d.append((_rot_from_quat_wxyz(out[3:]).inv() * c).magnitude())
     d = np.asarray(d)
     assert d[0] > 0.5 * step_rad, "filter jumped the full step: not a filter"
     assert d[0] < 0.95 * step_rad, "first step overshot the input (left-multiply symptom)"
@@ -1232,12 +1254,12 @@ def check_pose_err_cap() -> None:
     def feasible_err(clip: float) -> float:
         arm = ClutchArm("right", 1.0, 0.5, rot_err_clip_rad=clip)
         pos0, R0 = arm.solver.fk(arm.q)
-        pose0 = np.concatenate([pos0, sRot.from_matrix(R0).as_quat(scalar_first=True)])
+        pose0 = np.concatenate([pos0, _rot_to_quat_wxyz(sRot.from_matrix(R0))])
         assert arm.engage(pose0)
         tgt = pose0.copy()
-        tgt[3:] = (
-            sRot.from_rotvec(ax * np.radians(3.0)) * sRot.from_quat(pose0[3:], scalar_first=True)
-        ).as_quat(scalar_first=True)
+        tgt[3:] = _rot_to_quat_wxyz(
+            sRot.from_rotvec(ax * np.radians(3.0)) * _rot_from_quat_wxyz(pose0[3:])
+        )
         err = 9.9
         for _ in range(300):
             _, ik = arm.step(True, tgt)
@@ -1251,14 +1273,14 @@ def check_pose_err_cap() -> None:
     arm = ClutchArm("right", 1.0, 0.5, rot_err_clip_rad=0.08)
     lpf = PoseLpf(0.12)
     pos0, R0 = arm.solver.fk(arm.q)
-    pose0 = np.concatenate([pos0, sRot.from_matrix(R0).as_quat(scalar_first=True)])
+    pose0 = np.concatenate([pos0, _rot_to_quat_wxyz(sRot.from_matrix(R0))])
     assert arm.engage(lpf.step(pose0, DT))
 
     def twist(deg: float) -> np.ndarray:
         out = pose0.copy()
-        out[3:] = (
-            sRot.from_rotvec(ax * np.radians(deg)) * sRot.from_quat(pose0[3:], scalar_first=True)
-        ).as_quat(scalar_first=True)
+        out[3:] = _rot_to_quat_wxyz(
+            sRot.from_rotvec(ax * np.radians(deg)) * _rot_from_quat_wxyz(pose0[3:])
+        )
         return out
 
     q_prev = [arm.q.copy()]
