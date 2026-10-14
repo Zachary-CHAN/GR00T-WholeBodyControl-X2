@@ -64,6 +64,47 @@ Lifecycle (matches the recorder's enable_hand semantics)
    open at exit would drop it. The HAL will time out on its own and
    passive-hold the last commanded position.
 
+Alternative input: ``--wire-format msgpack`` (incremental-teleop sender)
+------------------------------------------------------------------------
+Instead of the packed ``pose`` topic, subscribe to the Pico incremental
+sender's ``hand_finger_cmd`` wire (the quest3-manager format): multipart
+``[topic, msgpack payload]`` with
+``{"left_hand_q": [10], "right_hand_q": [10], "tick": int, "ts": float}``
+-- radians, firmware-canonical motor order: the same numbers the pose
+path carries. Useful because the v2 incremental chain has no pose stream
+(the robot node drives the hal arms directly and deliberately does not
+publish hands). The socket BINDs in this mode (the sender PUB-connects
+to us); recommended invocation on PC2::
+
+    --wire-format msgpack --zmq-host '*' --zmq-port 5572 \
+        --zmq-topic hand_finger_cmd
+
+Claw output: ``--hand-mode claw`` (the mode the real robot runs)
+----------------------------------------------------------------
+The OmniHand on this robot is configured as a **two-finger CLAW
+gripper** (``HandType`` 2): one scalar ``position`` per side, 1.0 =
+fully open / 0.0 = fully closed. The SDK example the ops team ran on
+the real robot, ``py_examples/hand_control.py``, is the known-good
+reference -- every field value in this mode is taken from it verbatim
+(name ``"left_hand"``/``"right_hand"``, velocity/accel/decel/effort all
+1.0: CLAW motors do not enable with the NIMBLE 0.1 velocity hint).
+
+The bridge folds the input 10-DOF finger vector back to the single
+grasp ratio with the retarget OPEN/CLOSED anchors: each motor rides
+``(1-r)*OPEN + r*CLOSED``, so reversing any pip joint recovers ``r``
+exactly (we take the median over the four pip joints), and the
+published ``position`` is ``1 - r`` (ratio 0 = open -> position 1 =
+open). The round trip is lossless to float noise (1e-16), so this mode
+is fully equivalent to the 10-DOF path w.r.t. the operator's intent --
+the open/close *direction* stays governed by the sender's
+``--hand-close-on-grip`` flag (default: squeeze = open, release =
+closed), unchanged from the NIMBLE path.
+
+Differences from the NIMBLE path: no engage burst (``hand_control.py``
+needs none, and the burst's ``position=0`` would mean "fully closed"
+in CLAW semantics); all-zero input vectors are dropped as placeholder
+frames so a dead sender can never snap the claw.
+
 Wire contract (must match the publishers / subs that share the same socket)
 ---------------------------------------------------------------------------
 * Topic: ``--zmq-topic`` (default ``"pose"``)
@@ -160,6 +201,13 @@ from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (  # noqa: E4
     HEADER_SIZE,
     unpack_message,
 )
+from gear_sonic.utils.teleop.x2_hand_retarget import (  # noqa: E402
+    grasp_command_from_ratio,
+    HAND_GRASP_CLOSED_RAD_LEFT,
+    HAND_GRASP_CLOSED_RAD_RIGHT,
+    HAND_GRASP_OPEN_RAD_LEFT,
+    HAND_GRASP_OPEN_RAD_RIGHT,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -197,6 +245,19 @@ HAND_CMD_TOPIC = "/aima/hal/joint/hand/command"
 # fail to enable when velocity=0 even though the field is documented
 # as ignored. Mirrors HAND_CMD_VELOCITY_HINT in the recorder.
 HAND_CMD_VELOCITY_HINT = 0.1
+
+# CLAW (two-finger) mode field values, verbatim from the SDK reference
+# py_examples/hand_control.py: CLAW motors want velocity=1.0 and the
+# example fills the remaining fields with 1.0 as well.
+HAND_CMD_CLAW_VELOCITY = 1.0
+HAND_CMD_CLAW_ACCEL = 1.0
+HAND_CMD_CLAW_DECEL = 1.0
+HAND_CMD_CLAW_EFFORT = 1.0
+
+# Pip joints (index/middle/ring/pinky) -- whose OPEN->CLOSED anchors
+# span the widest range, so reversing them is the least noise-sensitive
+# way to recover the grasp ratio from a 10-DOF motor vector.
+_CLAW_FOLD_JOINT_IDX: tuple[int, ...] = (4, 5, 7, 9)
 
 # Per-motor firmware-enforced angle ranges, degrees, motor-axis order
 # (1..10), from Omnihand-2025-SDK/document/en/API_PYTHON.md. Asymmetric
@@ -259,6 +320,36 @@ def _clamp_per_finger(values: np.ndarray, side: str) -> tuple[np.ndarray, int]:
     return out, n_hit
 
 
+def _claw_position_from_joints(values: np.ndarray, side: str) -> float:
+    """Fold a 10-DOF motor vector back to the CLAW scalar position.
+
+    Exact inverse of the sender's ``grasp_command_from_ratio`` (each
+    motor rides ``(1-r)*OPEN + r*CLOSED``): reverse each pip joint
+    individually and take the median, so a single odd axis cannot skew
+    the result. Returns the CLAW ``position`` in [0, 1] with the
+    ``hand_control.py`` convention -- 1.0 = fully open, 0.0 = fully
+    closed (ratio 0 = open -> position 1).
+    """
+    if side == "left":
+        open_q = np.asarray(HAND_GRASP_OPEN_RAD_LEFT, dtype=np.float64)
+        closed_q = np.asarray(HAND_GRASP_CLOSED_RAD_LEFT, dtype=np.float64)
+    else:
+        open_q = np.asarray(HAND_GRASP_OPEN_RAD_RIGHT, dtype=np.float64)
+        closed_q = np.asarray(HAND_GRASP_CLOSED_RAD_RIGHT, dtype=np.float64)
+    q = np.asarray(values, dtype=np.float64).reshape(-1)
+    ratios: list[float] = []
+    for i in _CLAW_FOLD_JOINT_IDX:
+        if i >= q.size:
+            continue
+        den = float(closed_q[i] - open_q[i])
+        if abs(den) > 1e-9:
+            ratios.append((float(q[i]) - float(open_q[i])) / den)
+    if not ratios:
+        return 1.0  # degenerate input; report "open" rather than guessing
+    ratio = float(np.clip(np.median(ratios), 0.0, 1.0))
+    return 1.0 - ratio
+
+
 # ─────────────────────────────────────────────────────────────────────
 # ZMQ subscriber thread
 # ─────────────────────────────────────────────────────────────────────
@@ -285,7 +376,8 @@ class _ZmqPoseReader:
     can run on hosts without pyzmq installed.
     """
 
-    def __init__(self, host: str, port: int, topic: str, recv_timeout_ms: int = 200):
+    def __init__(self, host: str, port: int, topic: str, recv_timeout_ms: int = 200,
+                 *, wire_format: str = "pose", bind: bool = False):
         import zmq
 
         self._zmq = zmq
@@ -293,6 +385,12 @@ class _ZmqPoseReader:
         self._port = port
         self._topic = topic
         self._recv_timeout_ms = recv_timeout_ms
+        self._wire_format = wire_format
+        if wire_format == "msgpack":
+            import msgpack as _msgpack  # deferred: pose mode must not need it
+            self._msgpack = _msgpack
+        else:
+            self._msgpack = None
 
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
@@ -300,7 +398,12 @@ class _ZmqPoseReader:
         self._sock.setsockopt(zmq.RCVHWM, 8)
         self._sock.setsockopt(zmq.LINGER, 0)
         self._sock.setsockopt_string(zmq.SUBSCRIBE, topic)
-        self._sock.connect(f"tcp://{host}:{port}")
+        if bind:
+            # msgpack mode: the sender is a PUB that connects to us (the
+            # same topology the quest3 manager uses toward kplanner).
+            self._sock.bind(f"tcp://{host}:{port}")
+        else:
+            self._sock.connect(f"tcp://{host}:{port}")
 
         self._lock = threading.Lock()
         self._latest = _LatestPose()
@@ -338,7 +441,10 @@ class _ZmqPoseReader:
         zmq = self._zmq
         while not self._stop.is_set():
             try:
-                raw = self._sock.recv()
+                if self._wire_format == "msgpack":
+                    frames = self._sock.recv_multipart()
+                else:
+                    frames = [self._sock.recv()]
             except zmq.error.Again:
                 continue
             except Exception as exc:
@@ -347,30 +453,60 @@ class _ZmqPoseReader:
                 time.sleep(0.5)
                 continue
 
-            try:
-                msg: DecodedMessage = unpack_message(raw, expected_topic=self._topic)
-            except ValueError as exc:
-                # Malformed frame -- skip but count.
-                print(f"[x2-hand-bridge] decode error: {exc}", file=sys.stderr)
-                continue
+            if self._wire_format == "msgpack":
+                if len(frames) < 2 or not frames[0].startswith(self._topic.encode("ascii")):
+                    continue
+                try:
+                    payload = self._msgpack.unpackb(frames[1], raw=False)
+                except Exception as exc:
+                    print(f"[x2-hand-bridge] decode error: {exc}", file=sys.stderr)
+                    continue
+                left = payload.get("left_hand_q")
+                right = payload.get("right_hand_q")
+                try:
+                    frame_idx = int(payload.get("tick", -1))
+                except Exception:
+                    frame_idx = -1
+            else:
+                try:
+                    msg: DecodedMessage = unpack_message(frames[0], expected_topic=self._topic)
+                except ValueError as exc:
+                    # Malformed frame -- skip but count.
+                    print(f"[x2-hand-bridge] decode error: {exc}", file=sys.stderr)
+                    continue
 
-            left = msg.fields.get("left_hand_joints")
-            right = msg.fields.get("right_hand_joints")
-            frame_idx_arr = msg.fields.get("frame_index")
-            try:
-                frame_idx = int(frame_idx_arr[0]) if frame_idx_arr is not None else -1
-            except Exception:
-                frame_idx = -1
+                left = msg.fields.get("left_hand_joints")
+                right = msg.fields.get("right_hand_joints")
+                frame_idx_arr = msg.fields.get("frame_index")
+                try:
+                    frame_idx = int(frame_idx_arr[0]) if frame_idx_arr is not None else -1
+                except Exception:
+                    frame_idx = -1
+
+            # An all-zero vector is a "no data" placeholder (e.g. a
+            # frame the sender emits right after a source failure).
+            # Treat it like a missing frame -- keep the previous values
+            # -- instead of latching a bogus all-zero pose.
+            left_arr = None
+            if left is not None:
+                candidate = np.asarray(left, dtype=np.float32).reshape(-1)
+                if candidate.size and not np.all(candidate == 0.0):
+                    left_arr = candidate
+            right_arr = None
+            if right is not None:
+                candidate = np.asarray(right, dtype=np.float32).reshape(-1)
+                if candidate.size and not np.all(candidate == 0.0):
+                    right_arr = candidate
 
             now = time.monotonic()
             with self._lock:
                 self._latest.n_recv += 1
-                if left is not None or right is not None:
+                if left_arr is not None or right_arr is not None:
                     self._latest.n_hand_present += 1
-                if left is not None:
-                    self._latest.left = np.asarray(left, dtype=np.float32).reshape(-1)
-                if right is not None:
-                    self._latest.right = np.asarray(right, dtype=np.float32).reshape(-1)
+                if left_arr is not None:
+                    self._latest.left = left_arr
+                if right_arr is not None:
+                    self._latest.right = right_arr
                 self._latest.recv_monotonic = now
                 self._latest.frame_index = frame_idx
 
@@ -459,6 +595,23 @@ def _self_test() -> int:
               f"expected all {NUM_HAND_DOF_PER_SIDE} joints clamped, "
               f"got {n_right}.", file=sys.stderr)
         return 1
+
+    # CLAW fold round-trip: _claw_position_from_joints must invert the
+    # sender's grasp_command_from_ratio exactly (position == 1 - ratio).
+    print("[self-test] claw fold round-trip against "
+          "grasp_command_from_ratio...")
+    worst = 0.0
+    for side in ("left", "right"):
+        for r in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+            q = grasp_command_from_ratio(side, r)
+            pos = _claw_position_from_joints(q, side)
+            worst = max(worst, abs(pos - (1.0 - r)))
+    print(f"[self-test]   worst |err| = {worst:.2e} over 14 samples")
+    if worst > 1e-6:
+        print(f"[self-test] FAIL: claw fold round-trip error {worst:.2e} "
+              f"exceeds 1e-6", file=sys.stderr)
+        return 1
+
     print("[self-test] OK")
     return 0
 
@@ -519,6 +672,7 @@ def _build_node_class():
             self,
             *,
             reader: _ZmqPoseReader,
+            hand_mode: str,
             sides: str,
             detect_timeout: float,
             engage_shots: int,
@@ -530,7 +684,14 @@ def _build_node_class():
             super().__init__("x2_hand_zmq_to_aimdk_bridge")
 
             self._reader = reader
+            self._hand_mode = hand_mode
             self._sides_request = sides
+            if hand_mode == "claw":
+                # hand_control.py -- the known-good CLAW reference --
+                # sends no engage burst, and the burst's position=0
+                # would mean "fully closed" in CLAW semantics, so skip
+                # it entirely in this mode.
+                engage_shots = 0
             self._engage_shots_total = engage_shots
             self._engage_shots_left = engage_shots
             self._engage_period_s = engage_period_s
@@ -643,8 +804,9 @@ def _build_node_class():
 
             self.get_logger().info(
                 f"reader={reader.endpoint()} publish_hz={publish_hz:.0f} "
+                f"hand_mode={hand_mode} "
                 f"max_stale={max_stale_s*1000:.0f}ms engage_burst="
-                f"{engage_shots}x@{engage_period_s:.1f}s"
+                f"{self._engage_shots_total}x@{engage_period_s:.1f}s"
             )
 
         # ── Hand state subscription ────────────────────────────────
@@ -737,6 +899,11 @@ def _build_node_class():
             *,
             origin: str,
         ) -> None:
+            if self._hand_mode == "claw":
+                self._publish_command_claw(
+                    left_positions, right_positions, origin=origin,
+                )
+                return
             left_on, right_on = self._sides
             msg = HandCommandArray()
             msg.left_hand_type.value = HAND_TYPE_NIMBLE if left_on else HAND_TYPE_NONE
@@ -789,6 +956,73 @@ def _build_node_class():
                 out.append(c)
             return out
 
+        def _publish_command_claw(
+            self,
+            left_positions: Optional[np.ndarray],
+            right_positions: Optional[np.ndarray],
+            *,
+            origin: str,
+        ) -> None:
+            """CLAW mode: one scalar-position HandCommand per side."""
+            left_on, right_on = self._sides
+            msg = HandCommandArray()
+            msg.left_hand_type.value = HAND_TYPE_CLAW if left_on else HAND_TYPE_NONE
+            msg.right_hand_type.value = HAND_TYPE_CLAW if right_on else HAND_TYPE_NONE
+
+            if left_on:
+                positions = (
+                    left_positions if left_positions is not None
+                    else np.zeros(NUM_HAND_DOF_PER_SIDE)
+                )
+                msg.left_hands = self._build_claw_cmd(
+                    "left_hand", _claw_position_from_joints(positions, "left"),
+                )
+                if origin == "wire":
+                    # Keep the raw 10-DOF input (folded again at publish
+                    # time), so a stale-hold republish lands on the same
+                    # scalar without a second code path.
+                    self._last_good_left = np.asarray(positions, dtype=np.float64).reshape(-1)
+            else:
+                msg.left_hands = []
+
+            if right_on:
+                positions = (
+                    right_positions if right_positions is not None
+                    else np.zeros(NUM_HAND_DOF_PER_SIDE)
+                )
+                msg.right_hands = self._build_claw_cmd(
+                    "right_hand", _claw_position_from_joints(positions, "right"),
+                )
+                if origin == "wire":
+                    self._last_good_right = np.asarray(positions, dtype=np.float64).reshape(-1)
+            else:
+                msg.right_hands = []
+
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "x2_hand_zmq_to_aimdk_bridge"
+            self._publisher.publish(msg)
+
+            self._n_pub_total += 1
+            if origin == "wire":
+                self._n_pub_wire += 1
+            elif origin == "stale_hold":
+                self._n_pub_stale_hold += 1
+            elif origin == "engage":
+                self._n_pub_engage += 1
+
+        @staticmethod
+        def _build_claw_cmd(name: str, position: float) -> list:
+            """Single-command CLAW list; field values verbatim from
+            py_examples/hand_control.py (the known-good reference)."""
+            c = HandCommand()
+            c.name = name
+            c.position = float(position)
+            c.velocity = HAND_CMD_CLAW_VELOCITY
+            c.acceleration = HAND_CMD_CLAW_ACCEL
+            c.deceleration = HAND_CMD_CLAW_DECEL
+            c.effort = HAND_CMD_CLAW_EFFORT
+            return [c]
+
         # ── Diagnostics ────────────────────────────────────────────
         def _log_stats(self) -> None:
             now = time.monotonic()
@@ -832,6 +1066,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "Matches the deploy/recorder/MuJoCo-bridge default.")
     p.add_argument("--zmq-topic", default="pose",
                    help="ZMQ topic prefix (default: %(default)s).")
+    p.add_argument("--wire-format", default="pose", choices=["pose", "msgpack"],
+                   help="Input wire format: 'pose' = packed pose topic "
+                        "(deploy/Quest chain, SUB connect); 'msgpack' = the "
+                        "incremental sender's hand_finger_cmd payload (SUB "
+                        "binds; the PUB sender connects to us -- also pass an "
+                        "explicit --zmq-port, e.g. 5572). (default: %(default)s)")
+    p.add_argument("--hand-mode", default="nimble", choices=["nimble", "claw"],
+                   help="Output command style. 'nimble' = HandType NIMBLE, 10 "
+                        "HandCommands/side in radians (OmniHand 10-DOF). "
+                        "'claw' = HandType CLAW, one scalar position/side, "
+                        "1.0=open / 0.0=closed -- the mode the real robot "
+                        "runs (py_examples/hand_control.py). 'claw' folds the "
+                        "10-DOF input back to the grasp ratio (exact inverse, "
+                        "float-lossless) and skips the engage burst. "
+                        "(default: %(default)s)")
     p.add_argument("--sides", default="auto",
                    choices=["auto", "left", "right", "both", "off"],
                    help="Which sides to drive. 'auto' uses the latched "
@@ -871,8 +1120,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _self_test()
 
     # Build ZMQ reader first so we can fail fast on a missing pyzmq.
+    # msgpack mode (the incremental sender's hand_finger_cmd wire) implies a
+    # BIND: the sender is a PUB that connects to us (quest3-manager topology).
+    bind = args.wire_format == "msgpack"
+    if bind and args.zmq_host in ("127.0.0.1", "localhost"):
+        print("[x2-hand-bridge] note: --wire-format msgpack binds the SUB "
+              "socket; with host=127.0.0.1 only local publishers can reach "
+              "it -- pass --zmq-host '*' to accept the laptop sender.",
+              file=sys.stderr)
     try:
-        reader = _ZmqPoseReader(args.zmq_host, args.zmq_port, args.zmq_topic)
+        reader = _ZmqPoseReader(args.zmq_host, args.zmq_port, args.zmq_topic,
+                                wire_format=args.wire_format, bind=bind)
     except Exception as exc:
         print(f"[x2-hand-bridge] failed to set up ZMQ subscriber: {exc}",
               file=sys.stderr)
@@ -890,6 +1148,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     rclpy.init()
     node = HandBridgeNode(
         reader=reader,
+        hand_mode=args.hand_mode,
         sides=args.sides,
         detect_timeout=args.detect_timeout,
         engage_shots=max(0, args.engage_shots),
