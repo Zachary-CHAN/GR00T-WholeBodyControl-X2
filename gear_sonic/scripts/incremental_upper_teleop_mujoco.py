@@ -1343,6 +1343,14 @@ def main() -> int:
     ap.add_argument(
         "--duration", type=float, default=0.0, help="stop after N s (0 = until viewer closes)"
     )
+    ap.add_argument(
+        "--record",
+        type=str,
+        default="",
+        help="dump per-tick live-loop telemetry to this .npz for offline jitter "
+        "autopsy (wire poses pre-LPF, filtered poses, commanded q, realized "
+        "qpos, trigger/grip, ik errors, holding flags); empty = off",
+    )
     args = ap.parse_args()
 
     if args.self_test:
@@ -1404,6 +1412,15 @@ def main() -> int:
     t_stat = t0
     last_stat = 0.0
     n_ticks = 0
+    # --record (live round 8.2): one row per tick, flat float64. Column
+    # layout (FIXED -- the autopsy tools in /tmp index it positionally):
+    #   0 t_wall | 1 fresh | 2 lt | 3 rt | 4 grip_l | 5 grip_r | 6 frame_t
+    #   7:14  lcp_raw (pos3+quat4) | 14:21  rcp_raw | 21:28  lcp_filt
+    #   28:35 rcp_filt | 35:42 q_left_cmd | 42:49 q_right_cmd
+    #   49:53 ik err (pos,rot)x(L,R) | 53:57 hold/engaged L,R
+    #   57 waist_cmd | 58:67 torso M | 67:82 qpos arms(14)+waist(1)
+    rec_rows = None if not args.record else []
+    rec_joints = list(ubt.ARM_NAMES) + ["waist_yaw_joint"]
     next_tick = time.monotonic()
     try:
         while True:
@@ -1435,8 +1452,12 @@ def main() -> int:
                 # runs here, so engage/step/deltas all see the same smoothed
                 # anatomical pose (zero placeholders pass through)
                 torso.step(j24, DT)
+                lcp_pre_lpf = lcp.copy() if rec_rows is not None else None
+                rcp_pre_lpf = rcp.copy() if rec_rows is not None else None
                 lcp = lpfs["left"].step(lcp, DT)
                 rcp = lpfs["right"].step(rcp, DT)
+            elif rec_rows is not None:
+                lcp_pre_lpf = rcp_pre_lpf = np.zeros(7)
             held = {
                 "left": fresh and lt > args.trigger_thresh,
                 "right": fresh and rt > args.trigger_thresh,
@@ -1466,6 +1487,36 @@ def main() -> int:
                 right_active=grasp_command_from_ratio("right", 1.0 - grip_f["r"]),
             )
             pd_and_step(m, d, jm, tgt)
+            if rec_rows is not None:
+                rec_rows.append(
+                    np.concatenate(
+                        [
+                            [time.monotonic(), float(fresh), lt, rt, grip_f["l"], grip_f["r"]],
+                            [float(frame["t"]) if frame is not None else np.nan],
+                            lcp_pre_lpf,
+                            rcp_pre_lpf,
+                            ctrl["left"],
+                            ctrl["right"],
+                            arms["left"].q,
+                            arms["right"].q,
+                            [
+                                arms["left"].last_ik.pos_err_m,
+                                arms["left"].last_ik.rot_err_rad,
+                                arms["right"].last_ik.pos_err_m,
+                                arms["right"].last_ik.rot_err_rad,
+                            ],
+                            [
+                                float(arms["left"].holding),
+                                float(arms["right"].holding),
+                                float(arms["left"].engaged),
+                                float(arms["right"].engaged),
+                            ],
+                            [waist.cmd],
+                            torso.M.reshape(-1),
+                            [d.qpos[jm[n][0]] for n in rec_joints],
+                        ]
+                    )
+                )
             if viewer is not None:
                 viewer.sync()
             # REAL-TIME PACING (live round 4: "举手卡顿"): the viewer branch
@@ -1500,6 +1551,10 @@ def main() -> int:
                 t_stat = now
     except KeyboardInterrupt:
         print("[sim] Ctrl-C")
+    if rec_rows is not None:
+        arr = np.asarray(rec_rows, np.float64) if rec_rows else np.zeros((0, 82))
+        np.savez_compressed(args.record, rows=arr, joints=np.array(rec_joints))
+        print(f"[sim] recorded {len(rec_rows)} ticks -> {args.record}")
     # NOTE: no explicit viewer.close() -- it segfaults at teardown on this
     # stack; letting the interpreter exit after the window is gone is clean.
     return 0
