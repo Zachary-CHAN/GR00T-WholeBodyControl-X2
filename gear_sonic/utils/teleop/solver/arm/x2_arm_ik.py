@@ -430,3 +430,74 @@ class ArmIKSolver:
             clamped_count=clamped_count,
             iterations=iters,
         )
+
+    def solve_position_free4(
+        self,
+        q_seed: np.ndarray,
+        wrist_q3: np.ndarray,
+        target_pos: np.ndarray,
+        max_iters: int = 1,
+    ) -> tuple[np.ndarray, IKResult]:
+        """Position-only DLS over the shoulder-3 + elbow joints, with the
+        three wrist joints LOCKED at ``wrist_q3`` (v3 teleop: the wrist is
+        commanded by the per-axis controller mapping, not by this solve).
+
+        The wrist angles still ride along in the FK. They are almost
+        invisible to this solve -- measured on the left chain, the point
+        ``fk`` reports (the spherical wrist centre) moves 0.00 mm under
+        wrist_pitch/roll and at most 0.98 mm through a full wrist_yaw
+        turn -- but that is the same order as the teleop's sub-mm
+        residual budget, so the caller re-solves every tick with the
+        CURRENT wrist command instead of letting the residual go stale.
+        Kept a separate method (not a flag on ``solve``) so the v2 6-DoF
+        path stays byte-identical; the loop body below mirrors
+        ``solve``'s position-only branch over the first 4 columns of J.
+        Returns ``(q7, info)`` with ``q7[4:7] == wrist_q3`` bit-for-bit.
+        """
+        q_seed = np.asarray(q_seed, dtype=np.float64)
+        wrist_q3 = np.asarray(wrist_q3, dtype=np.float64).reshape(3)
+        q = np.concatenate([q_seed[:4], wrist_q3])
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+
+        clamped_count = 0
+        pos_err = 0.0
+        iters = 0
+        for _ in range(max(1, max_iters)):
+            iters += 1
+            J, p_e, _R_e = self._jacobian(q)
+            J = J[:3, :4]
+            err = self.position_weight * (target_pos - p_e)
+
+            JJt = J @ J.T
+            damp = (self.damping**2) * np.eye(JJt.shape[0])
+            try:
+                inv = np.linalg.solve(JJt + damp, err)
+            except np.linalg.LinAlgError:
+                inv = np.linalg.lstsq(JJt + damp, err, rcond=None)[0]
+            dq = J.T @ inv
+
+            if self.uniform_step_clip:
+                mx = float(np.max(np.abs(dq)))
+                if mx > self.max_per_tick_step_rad:
+                    dq *= self.max_per_tick_step_rad / mx
+            else:
+                np.clip(dq, -self.max_per_tick_step_rad, self.max_per_tick_step_rad, out=dq)
+
+            q_new = q + np.concatenate([dq, np.zeros(3)])
+            clamped_idx = (q_new[:4] < self._lo[:4]) | (q_new[:4] > self._hi[:4])
+            if np.any(clamped_idx):
+                clamped_count += int(np.sum(clamped_idx))
+                q_new[:4] = np.clip(q_new[:4], self._lo[:4], self._hi[:4])
+            q_new[4:7] = wrist_q3  # the wrist is NEVER touched here
+            q = q_new
+
+            pos_err = float(np.linalg.norm(target_pos - self.fk(q)[0]))
+            if pos_err < 5e-4:
+                break
+
+        return q, IKResult(
+            pos_err_m=pos_err,
+            rot_err_rad=0.0,
+            clamped_count=clamped_count,
+            iterations=iters,
+        )

@@ -307,6 +307,7 @@ A	gear_sonic/scripts/simstack_turn.sh	Pad emulator for the local sim stack (gear
 A	gear_sonic/scripts/sonic_motion_token_labeler.py	SONIC motion-token labeler for X2 LeRobot datasets (M6 / Stage C1).
 A	gear_sonic/scripts/vr_operator_calibrate.py	VR operator calibration script.
 A	gear_sonic/scripts/incremental_upper_teleop_mujoco.py	MuJoCo harness v2: clutch-IK incremental arm teleop (trigger-held 6-DoF wrist tracking via DLS IK, grip->OmniHand, SMPL shoulder-line->waist yaw, head hold) on the composed X2+OmniHand model.
+A	gear_sonic/scripts/arm_teleop_v3_mujoco.py	MuJoCo harness v3: wrist decoupled from the IK (position-only 4-DoF shoulder+elbow DLS + anchored per-axis controller-quat wrist mapping), SMPL channel closed (waist fixed), grip inverted (open at rest, closes on press, stale->open); plant functions reused from the v2 harness.
 A	gear_sonic/scripts/upper_body_teleop_mujoco.py	MuJoCo harness v1 (Plan D): replays the PC2 analytic-retarget upper-body teleop pipeline against the X2 MJCF (synthetic poses or the real sender wire).
 A	gear_sonic/scripts/window_motion_pkl.py	Window long motion-lib clips into overlapping sub-clips for kplanner training.
 A	gear_sonic/scripts/x2_gmr_to_motion_lib.py	Stage 2 of tape -> X2: GMR raw retarget npz -> motion-lib pkl (+ render).
@@ -317,6 +318,7 @@ A	gear_sonic/scripts/x2_pkl_command_source.py	PKL-driven ``planner_cmd`` publish
 A	gear_sonic/scripts/x2_pose_merger.py	x2_pose_merger.py -- laptop-side pose merger for the X2 planner stacks.
 A	gear_sonic/scripts/x2_pose_mux.py	x2_pose_mux.py -- laptop-side N-to-1 pose multiplexer.
 A	gear_sonic/tests/data/wrist_maxrange_20260905_002744Z.npz	Test fixture capture (operator headset/controller frames) via git-lfs.
+A	gear_sonic/tests/test_arm_teleop_v3.py	Layer tests for the v3 arm teleop: wrist differential mapping (zero-delta noop, per-axis direction/signs, limit clamp incl. asymmetric roll, slew + near-pi guard), 4-DoF IK convergence with frozen wrist + wrist_yaw coupling compensation, freeze/re-anchor, freeze guard, keep-out, SMPL-ignored/waist-fixed, inverted grip + stale-open.
 A	gear_sonic/tests/test_incremental_upper_teleop.py	Layer tests for the clutch-IK incremental upper teleop: wire round-trip (new controller fields), ground-truth IK convergence, anchor freeze/re-anchor, waist yaw rest/twist + gating, grip->hand mapping, composed-model joint map + head hold.
 A	gear_sonic/tests/test_root_tilt_clamp.py	Lean-guard tests: root clamp invariants (hard cap, bit-exact pass-through, azimuth/heading preserved), torso min-max convergence and continuity, at-floor counting, + the live window() insertion point.
 A	gear_sonic/tests/test_wrist_map_regression.py	Wrist mapping regression: operator max-range clip -> X2 wrist chain angles.
@@ -349,6 +351,7 @@ A	gear_sonic/utils/teleop/common.py	Shared constants, enums, and utility classes
 A	gear_sonic/utils/teleop/estop_gesture.py	Operator e-stop gesture detector (design: operator, 2026-08-04).
 A	gear_sonic/utils/teleop/finger_signal_filter.py	Per-side stateful smoother for Quest 3 hand inputs.
 A	gear_sonic/utils/teleop/incremental_chain.py	Shared 50 Hz clutch-IK chain for the incremental upper teleop: intent receiver + per-arm clutch (trigger-held incremental DLS IK) + torso keep-out + waist-yaw chain + IncrementalTeleopTicker, the ONE tick body both the MuJoCo harness and the PC2 node run (not two copies); flat-vendored to the robot as czq_examples/incremental_chain.py.
+A	gear_sonic/utils/teleop/incremental_chain_v3.py	v3 chain: WristClutch (anchored conjugation + ZYX per-axis differential wrist mapping with slew/limits/near-pi guard) + ClutchArmV3 (position-only 4-DoF IK, wrist locked at the command, all v2 guards inherited) + IncrementalTeleopTickerV3 (no smpl_joints consumption, waist fixed, stale->hands open); reuses incremental_chain.py, flat-vendorable the same way.
 A	gear_sonic/utils/teleop/motion_clip_session.py	On-demand motion-clip playback for the X2 recorder.
 A	gear_sonic/utils/teleop/online_sonic_tokenizer.py	Online wrapper around :class:`SonicMotionTokenLabeler` for closed-loop teleop.
 A	gear_sonic/utils/teleop/operator_calibration.py	Per-operator wrist position + orientation calibration for VR teleop.
@@ -538,7 +541,7 @@ A	tools/build_demo_bank_from_upstream.sh	Build the X2 motion banks (pad/dance ba
 A	tools/check_docs.py	Check that every path / command target mentioned in the X2 docs exists.
 A	tools/check_x2_ownership.py	Ownership gate: every tracked file is upstream or listed in X2_FILES.txt with a purpose; --write regenerates the list from the diff against the upstream base.
 A	tools/compare_sim_node_command_stream.py	Level-0 alignment gate: drive one shared IncrementalTeleopTicker over a v4 tape and require the sim harness's per-tick assembly and the robot node's TeleopCore.commands() to yield bit-identical per-joint positions and gains (plus identical argparse defaults, so a no-flag run means the same chain on both sides).
-A	tools/gen_v4_intent_tape.py	Synthesize a v4 intent tape (trigger/grip/lctrl_pose/rctrl_pose on a standard SMPL-24 skeleton with non-degenerate hips) so the incremental clutch chain can be exercised headset-free through pico_intent_sender --tape-replay.
+A	tools/gen_v4_intent_tape.py	Synthesize a v4 intent tape (trigger/grip/lctrl_pose/rctrl_pose on a standard SMPL-24 skeleton with non-degenerate hips) so the incremental clutch chain can be exercised headset-free through pico_intent_sender --tape-replay; --profile wrist adds the v3 pure-quaternion sweep tape (z/x/y single-axis + grip-press duty windows) for wrist-sign direction assertions.
 A	tools/git-hooks/install.sh	Install the security pre-commit hook into this clone (idempotent; chains any existing pre-commit hook).
 A	tools/git-hooks/pre-commit-security.sh	Pre-commit security gate: blocks commits whose STAGED changes contain emails, credentials, tokens, or account identifiers.
 A	tools/video_to_gif.sh	Two-pass palette mp4/mov -> README gif in the upstream media style (width, fps, trim).

@@ -479,17 +479,28 @@ class ClutchArm:
         )
         off = 0 if self.side == "left" else 7
         q_new = np.clip(q_new, ARM_LO_SOLVER[off : off + 7], ARM_HI_SOLVER[off : off + 7])
-        # FREEZE GUARD (live round 6: crossing the arms shook the robot -- a
-        # midline-crossing target has no continuous joint path from the
-        # current elbow branch, and the DLS answers with max-rate joint
-        # swings; a diverged solve is worse still). A solution is ACCEPTED
-        # only if it is finite, its position error is sane, and it is
-        # reachable from the current q without a jump; otherwise the
-        # previous command is resent unchanged (the robot holds). Diverged /
-        # non-finite solves latch instantly; a jump must persist hold_ticks
-        # consecutive ticks (transient spikes during a legitimate
-        # fold-through-shoulder pass must not freeze the arm mid-motion).
-        # Resume is automatic: the first subsequent acceptable solve wins.
+        if self._gate_q_new(q_new, ik):
+            self.q = q_new
+        self.last_ik = ik
+        return self.q.copy(), self.last_ik
+
+    def _gate_q_new(self, q_new: np.ndarray, ik) -> bool:
+        """FREEZE GUARD (live round 6: crossing the arms shook the robot -- a
+        midline-crossing target has no continuous joint path from the
+        current elbow branch, and the DLS answers with max-rate joint
+        swings; a diverged solve is worse still). A solution is ACCEPTED
+        only if it is finite, its position error is sane, and it is
+        reachable from the current q without a jump; otherwise the
+        previous command is resent unchanged (the robot holds). Diverged /
+        non-finite solves latch instantly; a jump must persist hold_ticks
+        consecutive ticks (transient spikes during a legitimate
+        fold-through-shoulder pass must not freeze the arm mid-motion).
+        Resume is automatic: the first subsequent acceptable solve wins.
+
+        Returns True iff q_new was accepted (the caller then adopts it as
+        the commanded q). Extracted as a method so the v3 chain (4-DoF
+        solve, wrist frozen separately) runs the SAME guard, not a copy.
+        """
         nonfinite = not np.isfinite(q_new).all()
         if nonfinite or ik.pos_err_m > self.freeze_pos_err_m:
             self._hold_votes = self.hold_ticks  # instant, latched
@@ -498,10 +509,7 @@ class ClutchArm:
         else:
             self._hold_votes = 0
         self.holding = self._hold_votes >= self.hold_ticks
-        if not self.holding:
-            self.q = q_new
-        self.last_ik = ik
-        return self.q.copy(), self.last_ik
+        return not self.holding
 
 
 # ---------------------------------------------------------------------------
