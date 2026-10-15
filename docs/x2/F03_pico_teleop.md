@@ -133,7 +133,8 @@ same, R = reset. Stop: Ctrl-C.
 
 选择顺序：构造参数 → 环境变量 `X2_IK_BACKEND` → 默认 `mink`。**缺 mink 时构造期
 直接报错**（提示装 mink 或 `X2_IK_BACKEND=dls`），不做静默回退。两个 harness 启动
-横幅都会打印解析到的后端（`arm IK mink/7-DoF`），`arm.backend` 是权威字段。
+横幅都会打印解析到的求解器与自由度（形如 `arm IK mink` + `7-DoF`），`arm.backend`
+是权威字段。
 
 ```bash
 X2_IK_BACKEND=dls .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire   # 回退到 DLS

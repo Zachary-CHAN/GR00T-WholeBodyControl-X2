@@ -214,7 +214,7 @@ while time.monotonic() - t0 < 60:
 - **「改了 IK 之后 sim 和真机不一样」→ 先看后端，再看行为**。增量上半身链的手臂求解器
   由 `X2_IK_BACKEND`（或 `arm.backend`）决定：sim 默认 `mink`，真机（PC2）仍是 `dls`，
   两侧本来就不同（[`F03_pico_teleop.md`](F03_pico_teleop.md) 的「手臂 IK 后端」）。
-  harness 横幅会打印 `arm IK mink/7-DoF`；拿它对齐口径，别拿 sim 的数字推断真机行为。
+  harness 横幅会打印求解器与自由度（形如 `arm IK mink` + `7-DoF`）；拿它对齐口径，别拿 sim 的数字推断真机行为。
 
 ---
 
