@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
+import os
 from pathlib import Path
 import sys
 
@@ -171,6 +173,24 @@ def main() -> int:
         waist_compensate=False,
         torso_keepout=chain.TORSO_KEEPOUT,
     )
+    # The arm IK backend does NOT enter this comparison (both assemblies read
+    # the same st), but which solver produced st decides what the numbers
+    # above are evidence ABOUT -- so name it, and refuse to let the default
+    # drift back to dls unnoticed.
+    resolved = ticker.arms["right"].backend
+    env_backend = os.environ.get("X2_IK_BACKEND")
+    print(f"\narm IK backend: {resolved}  (X2_IK_BACKEND={env_backend or '<unset>'})")
+    if env_backend is None and importlib.util.find_spec("mink") is not None:
+        if resolved != "mink":
+            print(
+                "FAIL: mink is importable but the chain resolved to dls -- the "
+                "default moved back, so every published A/B number describes the "
+                "other solver"
+            )
+            return 1
+    elif resolved == "dls":
+        print("     (dls explicitly requested: this run says nothing about the mink default)")
+
     core = node_mod.TeleopCore(
         argparse.Namespace(
             intent_port=args.intent_port,

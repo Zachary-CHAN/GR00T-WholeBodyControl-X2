@@ -288,7 +288,10 @@ def main() -> int:
         f"[sim] v3 wire mode: SUB :{args.intent_port}; trigger>{args.trigger_thresh} engages, "
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
-        f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}"
+        f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}, "
+        # which solver + which DoF split produced this run (the harness has no
+        # flag for either: full_pose_ik is the shipped default now)
+        f"arm IK {arms['right'].backend}/{'7-DoF' if arms['right'].full_pose_ik else '4-DoF'}"
     )
 
     viewer = None

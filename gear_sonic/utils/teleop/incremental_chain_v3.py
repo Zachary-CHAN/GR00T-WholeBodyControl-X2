@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""v3 incremental upper-body teleop chain -- wrist decoupled from the IK.
+"""v3 incremental upper-body teleop chain -- wrist SOLVED by the IK again.
 
 Same skeleton as v2 (``incremental_chain.py``): trigger clutch, dual
 anchoring, torso keep-out sandwich, reach sphere, target slew, freeze
-guard, pose LPF. Three deliberate changes (user decisions, 2026-10-15):
+guard, pose LPF. Deliberate changes (user decisions, 2026-10-15):
 
 1. SMPL channel CLOSED: no ``smpl_joints`` consumption, no TorsoFrame /
    WaistYawChain -- the waist joints hold a fixed stand value.
-2. Arm IK = position-only DLS over the shoulder-3 + elbow joints
+2. Arm IK = the FULL 7-DoF pose IK (``full_pose_ik=True``, the default):
+   position AND orientation go to ``solver.solve`` exactly as in the v2
+   step, and all three wrist joints are solved rather than scripted. The
+   v3 "wrist out of the IK" split is retired -- it bought a controller
+   that could not command hand orientation at all.
+
+   ``full_pose_ik=False`` restores it as an explicit switch, for
+   comparison and for the wrist-mapping self-tests: position-only DLS
+   over the shoulder-3 + elbow joints
    (``ArmIKSolver.solve_position_free4``); the three wrist joints are
    LOCKED at the wrist command and ride along in the FK (they move the
    solved point -- the spherical wrist centre -- by at most 0.98 mm, so
    the 4-DoF solve re-runs against the CURRENT wrist command every tick
-   to keep its sub-mm residual honest). The wrist itself follows the v1
-   recipe: per-axis mapping of the controller quaternion differential,
-   anchored at engage:
+   to keep its sub-mm residual honest). The wrist itself then follows the
+   v1 recipe: per-axis mapping of the controller quaternion
+   differential, anchored at engage:
        delta = a_op_inv * R_now                    (body-frame diff)
        d     = W_a^-1 * delta * W_a                (conjugation into the
                                                     wrist-anchor frame --
@@ -24,6 +32,10 @@ guard, pose LPF. Three deliberate changes (user decisions, 2026-10-15):
    The ZYX decomposition matches the wrist chain Rz->Ry->Rx exactly;
    constant grasp offsets cancel under the anchored conjugation, leaving
    only per-axis mirror signs (env/CLI knobs, tape-verified before robot).
+   ``WristClutch.step`` is called every tick on BOTH paths -- on the
+   full-pose path its command is telemetry only (record columns 49:61),
+   and keeping it running means the wrist mapping is warm and comparable
+   if the switch is flipped mid-session.
 3. GRIP INVERTED: ``r = g`` -- the hand is OPEN at rest and CLOSES when
    the grip button is pressed (v2 was the opposite). SAFETY SEMANTIC
    CHANGE: a stale/dropped frame now OPENS the hands (v2 closed them).
@@ -57,6 +69,7 @@ try:  # repo tree: the gear_sonic package is importable
         ClutchArm,
         PoseLpf,
         _rot_from_quat_wxyz,
+        _rot_to_quat_wxyz,
         run_self_test as _v2_run_self_test,
     )
     from gear_sonic.utils.teleop.solver.arm import IKResult
@@ -76,6 +89,7 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         ClutchArm,
         PoseLpf,
         _rot_from_quat_wxyz,
+        _rot_to_quat_wxyz,  # type: ignore[no-redef]
         run_self_test as _v2_run_self_test,  # type: ignore[no-redef]
     )
     from x2_arm_ik import (  # type: ignore[no-redef]
@@ -182,13 +196,24 @@ class WristClutch:
 
 
 class ClutchArmV3(ClutchArm):
-    """v2's ClutchArm with the wrist carved out of the IK.
+    """v2's ClutchArm, with the v3 wrist split now RETIRED by default.
 
     Everything positional (anchoring, keep-out sandwich, reach sphere,
-    target slew, freeze guard via ``_gate_q_new``) is inherited; the solve
-    becomes ``solve_position_free4`` with the wrist joints pinned to the
-    WristClutch command, computed FIRST in the tick so the same tick's IK
-    already compensates the wrist_yaw end-effector lever.
+    target slew, freeze guard via ``_gate_q_new``) is inherited from v2 on
+    both paths.
+
+    ``full_pose_ik=True`` (the default) is v2's own 6-DoF target path: the
+    controller's pose drives position AND orientation through the IK, so the
+    wrist joints are solved rather than scripted. ``full_pose_ik=False``
+    keeps the old 4-DoF split alive -- ``solve_position_free4`` with the
+    wrist pinned to the WristClutch command, computed FIRST in the tick so
+    the same tick's IK already compensates the wrist_yaw end-effector lever.
+    It is what the wrist-mapping self-tests exercise and what the 4-DoF
+    checks pin; it is no longer what ``--wire`` runs.
+
+    The WristClutch is stepped every tick on both paths: on the 4-DoF path it
+    IS the wrist command, on the full-pose path it is telemetry (columns
+    49:61 of the record) and keeps its slew and near-pi state warm.
     """
 
     def __init__(self, side: str, position_scale: float = 1.0, *args, **kwargs):
@@ -196,9 +221,12 @@ class ClutchArmV3(ClutchArm):
         wrist_signs = kwargs.pop("wrist_signs", None)
         wrist_slew = kwargs.pop("wrist_slew_rad_s", 6.0)
         wrist_pi_guard = kwargs.pop("wrist_pi_guard_rad", 2.94)
-        # position-only IK regardless of what v2 would default to: the
-        # orientation task moved to the wrist mapping
-        kwargs.setdefault("rotation_weight", 0.0)
+        self.full_pose_ik = bool(kwargs.pop("full_pose_ik", True))
+        if not self.full_pose_ik:
+            # the 4-DoF path: position-only IK regardless of what v2 would
+            # default to, because the orientation task moved to the wrist
+            # mapping there
+            kwargs.setdefault("rotation_weight", 0.0)
         super().__init__(side, position_scale, *args, **kwargs)
         if wrist_signs is None:
             signs = None
@@ -213,6 +241,16 @@ class ClutchArmV3(ClutchArm):
             slew_rad_s=wrist_slew,
             pi_guard_rad=wrist_pi_guard,
         )
+
+    @property
+    def wrist_record(self) -> np.ndarray:
+        """The wrist the tick actually commanded -- record columns 49:61.
+
+        Full-pose path: the SOLVED wrist (``self.q[4:7]``); the clutch
+        command is telemetry there and legitimately differs from what the
+        IK chose. 4-DoF path: the clutch command, which IS the wrist.
+        """
+        return self.q[4:7] if self.full_pose_ik else self.wrist.cmd
 
     def engage(self, ctrl_pose7: np.ndarray) -> bool:
         if not super().engage(ctrl_pose7):
@@ -230,11 +268,17 @@ class ClutchArmV3(ClutchArm):
             self.last_ik = IKResult(0.0, 0.0, 0, 0)
             return self.q.copy(), self.last_ik
         c = np.asarray(ctrl_pose7, np.float64).reshape(7)
-        # wrist FIRST: the 4-DoF solve below must see this tick's wrist
-        # command in its FK, or the wrist_yaw lever reads as arm error
+        # stepped on both paths, and FIRST: on the 4-DoF path the solve below
+        # must see this tick's wrist command in its FK, or the wrist_yaw lever
+        # reads as arm error; on the full-pose path it is telemetry only
         wrist_q3 = self.wrist.step(c[3:])
-        a_op, a_op_inv, a_rob, _a_rob_R = self.anchor
+        a_op, a_op_inv, a_rob, a_rob_R = self.anchor
         tgt_pos = a_rob + self.position_scale * (c[:3] - a_op)
+        # v2's orientation target: the controller's rotation delta carried
+        # into the robot frame by the anchor. Only the full-pose path feeds it
+        # to the solver; the 4-DoF path drops it (the wrist mapping owns
+        # orientation there, and the solver was built with rotation_weight=0)
+        tgt_rot = a_rob_R * (a_op_inv * _rot_from_quat_wxyz(c[3:]))
         # keep-out sandwich + reach sphere + target slew: identical to the
         # v2 step (copied verbatim -- see incremental_chain.ClutchArm.step
         # for the live-round rationale; the waist compensation is gone
@@ -255,15 +299,25 @@ class ClutchArmV3(ClutchArm):
             if n > self.target_slew:
                 tgt_pos = self._tgt_slewed + step_v * (self.target_slew / n)
             self._tgt_slewed = tgt_pos.copy()
-        q_new, ik = self.solver.solve_position_free4(
-            self.q, wrist_q3, tgt_pos, max_iters=IK_ITERS_PER_TICK
-        )
-        q_new[4:7] = wrist_q3  # the wrist is commanded by WristClutch only
         off = 0 if self.side == "left" else 7
-        q_new[:4] = np.clip(q_new[:4], ARM_LO_SOLVER[off : off + 4], ARM_HI_SOLVER[off : off + 4])
-        # freeze guard over the FULL q: the wrist part can never trip the
-        # jump threshold (its slew bounds the step at 0.12 rad < 0.22),
-        # and this keeps the NaN / diverged-solve latch covering the wrist
+        if self.full_pose_ik:
+            q_new, ik = self.solver.solve(
+                self.q, tgt_pos, _rot_to_quat_wxyz(tgt_rot), max_iters=IK_ITERS_PER_TICK
+            )
+            q_new = np.clip(q_new, ARM_LO_SOLVER[off : off + 7], ARM_HI_SOLVER[off : off + 7])
+        else:
+            q_new, ik = self.solver.solve_position_free4(
+                self.q, wrist_q3, tgt_pos, max_iters=IK_ITERS_PER_TICK
+            )
+            q_new[4:7] = wrist_q3  # the wrist is commanded by WristClutch only
+            q_new[:4] = np.clip(
+                q_new[:4], ARM_LO_SOLVER[off : off + 4], ARM_HI_SOLVER[off : off + 4]
+            )
+        # freeze guard over the FULL q: on the 4-DoF path the wrist part can
+        # never trip the jump threshold (its slew bounds the step at
+        # 0.12 rad < 0.22); on the full-pose path the wrist is a solved
+        # degree of freedom and must be covered, or a wrist jump would slip
+        # past the latch
         if self._gate_q_new(q_new, ik):
             self.q = q_new
         self.last_ik = ik
@@ -275,7 +329,7 @@ class IncrementalTeleopTickerV3:
 
     Ordering mirrors v2 minus the SMPL consumers:
         freshness -> grip LPF -> pose LPF -> engage/disengage -> per-arm
-        [wrist mapping -> 4-DoF IK].
+        [wrist mapping (telemetry) -> 7-DoF pose IK].
 
     ``smpl_joints`` in the frame is IGNORED (decision 1); the waist is a
     constant ``waist_stand``. Stale frame -> triggers read 0 (arms freeze)
@@ -300,6 +354,8 @@ class IncrementalTeleopTickerV3:
         wrist_slew_rad_s: float = 6.0,
         wrist_pi_guard_rad: float = 2.94,
         waist_stand: float = 0.0,
+        full_pose_ik: bool = True,
+        backend: str | None = None,
     ) -> None:
         self.dt = float(dt)
         self.trigger_thresh = float(trigger_thresh)
@@ -318,6 +374,8 @@ class IncrementalTeleopTickerV3:
                 wrist_signs={s: signs[s] for s in ("left", "right")},
                 wrist_slew_rad_s=wrist_slew_rad_s,
                 wrist_pi_guard_rad=wrist_pi_guard_rad,
+                full_pose_ik=full_pose_ik,
+                backend=backend,
             )
             for side in ("left", "right")
         }
@@ -375,7 +433,12 @@ class IncrementalTeleopTickerV3:
             "ctrl": ctrl,
             "q": q,
             "waist": self.waist_stand,
-            "wrist_tgt": {s: self.arms[s].wrist.cmd.copy() for s in ("left", "right")},
+            # on the full-pose path this is the SOLVED wrist, not the clutch
+            # command (see ClutchArmV3.wrist_record); 85-column layout and
+            # column meaning unchanged either way
+            "wrist_tgt": {
+                s: np.asarray(self.arms[s].wrist_record).copy() for s in ("left", "right")
+            },
             "wrist_delta_ypr": {
                 s: self.arms[s].wrist.last_delta_ypr.copy() for s in ("left", "right")
             },
@@ -428,13 +491,20 @@ def check_wrist_zero_delta_noop() -> None:
 def check_wrist_single_axis_direction() -> None:
     """A pure controller rotation about one world axis must map to exactly
     the corresponding wrist joint (ZYX split), on both sides, and a sign
-    flip must flip the output."""
+    flip must flip the output.
+
+    ``full_pose_ik=False`` on purpose: this pins the WristClutch mapping,
+    which only IS the wrist on the 4-DoF path. On the shipped full-pose
+    path the clutch command is telemetry and the wrist is whatever the IK
+    solved -- see check_full_pose_ik_tracks_orientation for that path."""
     axes = (("z", 0), ("y", 1), ("x", 2))  # (rot axis, wrist index)
     for side in ("left", "right"):
         for axis, idx in axes:
             for sign in (1.0, -1.0):
                 signs = tuple(sign if i == idx else 1.0 for i in range(3))
-                arm = _engaged_arm(side, wrist_signs={"left": signs, "right": signs})
+                arm = _engaged_arm(
+                    side, full_pose_ik=False, wrist_signs={"left": signs, "right": signs}
+                )
                 pose = np.zeros(7)
                 pose[3] = 1.0
                 pose[:3] = arm.solver.fk(arm.q)[0]
@@ -458,13 +528,19 @@ def check_wrist_limit_clamp() -> None:
     """A wrist driven past its limits must park AT the limit (anchored
     mapping -> no grinding) -- including the ASYMMETRIC left roll range.
     Each drive gets a FRESH neutral anchor (the anchor accumulates: an
-    anchor left at a limit would offset the next drive)."""
+    anchor left at a limit would offset the next drive).
+
+    ``full_pose_ik=False`` for the same reason as the direction check: it
+    asserts the *mapping's* clamp. A solved wrist parking at its bound
+    without grinding is a different (also tested) property."""
     limits = WristClutch("left").limits
     # (wrist idx, rot axis, drive deg) -- stay under 180: past it the
     # differential takes the shortest-path sign and parks the OTHER limit
     # (correct behaviour, different assertion)
     for idx, axis, deg in ((0, "z", 150.0), (0, "z", -150.0), (2, "x", -120.0), (2, "x", 120.0)):
-        arm = _engaged_arm("left", wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)})
+        arm = _engaged_arm(
+            "left", full_pose_ik=False, wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)}
+        )
         p = np.zeros(7)
         p[3] = 1.0
         p[:3] = arm.solver.fk(arm.q)[0]
@@ -501,7 +577,9 @@ def check_ik4_convergence_wrist_frozen() -> None:
     """Ground-truth reach about the shoulder pitch with the wrist pinned
     at a NON-ZERO anchor: the 4-DoF solve must track the exact solution
     and never touch q[4:7] (mirrors v2's check_ik_convergence)."""
-    arm = ClutchArmV3("left", wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)})
+    arm = ClutchArmV3(
+        "left", full_pose_ik=False, wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)}
+    )
     wrist_anchor = np.array([0.5, 0.2, -0.5])
     arm.q[4:7] = wrist_anchor  # a non-trivial in-range wrist anchor
     pos0, _ = arm.solver.fk(arm.q)
@@ -535,7 +613,9 @@ def check_ik4_tracks_wrist_coupling() -> None:
     point must stay on the stationary target. The wrist's own leverage
     on that point is small (< 1 mm), so the 8 mm bound here is a coarse
     regression guard, not a tight tracking figure."""
-    arm = _engaged_arm("left", wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)})
+    arm = _engaged_arm(
+        "left", full_pose_ik=False, wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)}
+    )
     target = arm.anchor[2].copy()
     pose = np.zeros(7)
     pose[3] = 1.0
@@ -576,58 +656,70 @@ def check_clutch_freeze_reanchor_v3() -> None:
 
 
 def check_ik_freeze_guard_v3() -> None:
-    """The v2 freeze guard (shared via _gate_q_new) must gate the 4-DoF
-    solve identically: sustained solver-cap steps latch after the
-    persistence window, a diverged/NaN solve latches instantly, and the
-    arm resumes when the solver recovers."""
-    arm = ClutchArmV3(
-        "right", target_slew_m_s=0.0, wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)}
-    )
-    pose = np.zeros(7)
-    pose[3] = 1.0
-    pose[:3] = arm.solver.fk(arm.q)[0]
-    assert arm.engage(pose)
-    orig = arm.solver.solve_position_free4
+    """The v2 freeze guard (shared via _gate_q_new) must gate BOTH solves:
+    sustained solver-cap steps latch after the persistence window, a
+    diverged/NaN solve latches instantly, and the arm resumes when the
+    solver recovers.
 
-    def flip_solve(q_seed, *_a, **_k):
-        return np.asarray(q_seed, np.float64) + 0.5, IKResult(0.01, 0.0, 2, 0)
+    Run over both paths -- the 4-DoF one it was written for and the
+    full-pose one that ships -- because the guard is only as good as the
+    return value it reads, and mink returns ``(q, IKResult)`` through the
+    same seam as DLS.
+    """
+    for full_pose_ik, solve_name in ((False, "solve_position_free4"), (True, "solve")):
+        arm = ClutchArmV3(
+            "right",
+            full_pose_ik=full_pose_ik,
+            target_slew_m_s=0.0,
+            wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)},
+        )
+        pose = np.zeros(7)
+        pose[3] = 1.0
+        pose[:3] = arm.solver.fk(arm.q)[0]
+        assert arm.engage(pose)
+        orig = getattr(arm.solver, solve_name)
 
-    arm.solver.solve_position_free4 = flip_solve
-    for _ in range(arm.hold_ticks - 1):
-        arm.step(True, pose)
-    assert not arm.holding, "persistence window: must not latch on the first spike"
-    q_mid = arm.step(True, pose)[0]
-    assert arm.holding, "sustained solver-cap steps must latch"
-    q_a = arm.step(True, pose)[0]
-    np.testing.assert_array_equal(q_a, q_mid, err_msg="latched: resend the last command")
+        def flip_solve(q_seed, *_a, **_k):
+            return np.asarray(q_seed, np.float64) + 0.5, IKResult(0.01, 0.0, 2, 0)
 
-    def lost_solve(q_seed, *_a, **_k):
-        return np.asarray(q_seed, np.float64), IKResult(0.9, 0.0, 2, 0)
+        setattr(arm.solver, solve_name, flip_solve)
+        for _ in range(arm.hold_ticks - 1):
+            arm.step(True, pose)
+        assert not arm.holding, "persistence window: must not latch on the first spike"
+        q_mid = arm.step(True, pose)[0]
+        assert arm.holding, "sustained solver-cap steps must latch"
+        q_a = arm.step(True, pose)[0]
+        np.testing.assert_array_equal(q_a, q_mid, err_msg="latched: resend the last command")
 
-    arm.solver.solve_position_free4 = lost_solve
-    q_b = arm.step(True, pose)[0]
-    assert arm.holding and np.array_equal(q_b, q_a), "diverged solve must hold instantly"
+        def lost_solve(q_seed, *_a, **_k):
+            return np.asarray(q_seed, np.float64), IKResult(0.9, 0.0, 2, 0)
 
-    arm.solver.solve_position_free4 = lambda _s, *_a, **_k: (
-        np.full(7, np.nan),
-        IKResult(9.9, 9.9, 0, 0),
-    )
-    q_c = arm.step(True, pose)[0]
-    assert arm.holding and np.array_equal(q_c, q_a), "NaN solve must hold instantly"
+        setattr(arm.solver, solve_name, lost_solve)
+        q_b = arm.step(True, pose)[0]
+        assert arm.holding and np.array_equal(q_b, q_a), "diverged solve must hold instantly"
 
-    arm.solver.solve_position_free4 = orig
-    arm.disengage()
-    assert arm.engage(pose)
-    q, _ = arm.step(True, pose)
-    assert not arm.holding, "resume after the solver recovers"
-    np.testing.assert_allclose(q, q_a, atol=1e-9)
+        setattr(
+            arm.solver,
+            solve_name,
+            lambda _s, *_a, **_k: (np.full(7, np.nan), IKResult(9.9, 9.9, 0, 0)),
+        )
+        q_c = arm.step(True, pose)[0]
+        assert arm.holding and np.array_equal(q_c, q_a), "NaN solve must hold instantly"
+
+        setattr(arm.solver, solve_name, orig)
+        arm.disengage()
+        assert arm.engage(pose)
+        q, _ = arm.step(True, pose)
+        assert not arm.holding, "resume after the solver recovers"
+        np.testing.assert_allclose(q, q_a, atol=1e-9)
 
 
 def check_torso_keepout_v3() -> None:
-    """The inherited keep-out sandwich still holds for the 4-DoF arm (the
-    block was copied into ClutchArmV3.step): a cross-body sweep slides
-    along the surface, latches past the limit, and resumes on pullback.
-    Scenario identical to v2's check_torso_keepout."""
+    """The inherited keep-out sandwich still holds with the 7-DoF solve
+    (the block was copied into ClutchArmV3.step, and it acts on the TARGET,
+    so the extra wrist DoF cannot route around it): a cross-body sweep
+    slides along the surface, latches past the limit, and resumes on
+    pullback. Scenario identical to v2's check_torso_keepout."""
     keepout = TORSO_KEEPOUT["right"]
     cx, cy, a_ax, b_front, b_back, _zlo, _zhi = keepout
     arm = ClutchArmV3(
@@ -749,6 +841,86 @@ def check_grip_stale_open() -> None:
     assert st2["grip"]["l"] > 0.0, "--stale-grip-close must hold the last grip"
 
 
+def _full_pose_drive(side: str, axis: str, deg: float, ticks: int = 200):
+    """Anchor at neutral, then command one controller rotation for `ticks`.
+
+    Returns (arm, pose, R_target, p_target, q_trace). Pure -- the shipped
+    ``full_pose_ik=True`` path, no monkeypatching.
+    """
+    arm = ClutchArmV3(side)
+    pose = np.zeros(7)
+    pose[3] = 1.0
+    p0, R0 = arm.solver.fk(arm.q)
+    pose[:3] = p0
+    assert arm.engage(pose)
+    pose[3:] = _quat_axis(deg, axis)
+    trace = [arm.step(True, pose)[0] for _ in range(ticks)]
+    R_target = R0 @ sRot.from_euler(axis, np.radians(deg)).as_matrix()
+    return arm, pose, R_target, p0, np.asarray(trace)
+
+
+def _ee_rot_err_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    return float(np.degrees(np.arccos(np.clip((np.trace(R_a.T @ R_b) - 1.0) / 2.0, -1.0, 1.0))))
+
+
+def check_full_pose_ik_tracks_orientation() -> None:
+    """The shipped 7-DoF path: the hand does what the operator's wrist does.
+
+    The thing the retired v3 split could not do at all. Two halves, both on
+    the default ``full_pose_ik=True``, both on the right arm:
+
+    (1) A 90 deg yaw of the controller, held at a fixed position: the
+        end-effector rotation must land within 3 deg of the commanded one
+        and 2 mm of the target. Measured 0.2 deg / 0.15 mm -- the 3 deg
+        gate is slack on purpose, this is a regression guard on the whole
+        chain (anchor -> target synthesis -> clip), not a solver figure.
+    (2) A 60 deg pitch, which PINS ``wrist_pitch`` at its +0.558 rad
+        bound: the unsaturated rotation residual must be left standing
+        (bounded, ~26 deg) instead of being bought with position. Position
+        stays within 5 mm -- the measured reason joint ranges are a
+        post-step clip and not a QP constraint (handing them to
+        ``ConfigurationLimit`` cost 50.9 mm here; see the x2_arm_mink
+        module docstring). The last 20 ticks must also be settled, not
+        grinding against the bound.
+
+    and in both halves every tick must keep q inside
+    ``X2_ARM_JOINT_LIMITS_RAD`` -- the end-to-end statement of "the limits
+    are still enforced" now that the solver, not the legacy loop, proposes
+    the step.
+    """
+    lo = np.asarray(X2_ARM_JOINT_LIMITS_RAD, float)[7:14, 0]
+    hi = np.asarray(X2_ARM_JOINT_LIMITS_RAD, float)[7:14, 1]
+
+    # (1) trackable rotation: followed, and inside the catalog all the way
+    arm, _pose, R_t, p_t, trace = _full_pose_drive("right", "z", 90.0)
+    out = np.max(np.maximum(lo - trace, trace - hi))
+    assert out <= 0.0, f"a tick left the joint catalog by {out:.3e} rad"
+    assert not arm.holding, "a reachable rotation must not trip the freeze guard"
+    p, R = arm.solver.fk(arm.q)
+    rot_err = _ee_rot_err_deg(R_t, R)
+    assert rot_err < 3.0, f"orientation tracked to {rot_err:.2f} deg"
+    pos_err = float(np.linalg.norm(p - p_t))
+    assert pos_err < 0.002, f"hand left the target by {pos_err * 1e3:.2f} mm"
+
+    # (2) saturated rotation: the limit holds, position is NOT sacrificed
+    arm, _pose, R_t, p_t, trace = _full_pose_drive("right", "y", 60.0)
+    out = np.max(np.maximum(lo - trace, trace - hi))
+    assert out <= 0.0, f"a tick left the joint catalog by {out:.3e} rad"
+    pinned = np.isclose(arm.q[5], hi[5], atol=1e-9)
+    assert pinned, f"wrist_pitch should pin at {hi[5]:.3f} rad, got {arm.q[5]:.3f}"
+    assert not arm.holding, "a pinned wrist is a legal pose, not a freeze"
+    p, R = arm.solver.fk(arm.q)
+    rot_err = _ee_rot_err_deg(R_t, R)
+    assert rot_err < 35.0, f"rotation residual must stay bounded, got {rot_err:.2f} deg"
+    pos_err = float(np.linalg.norm(p - p_t))
+    assert pos_err < 0.005, (
+        f"position sacrificed for a saturated rotation: {pos_err * 1e3:.1f} mm "
+        "(this is the ConfigurationLimit failure mode)"
+    )
+    settled = float(np.max(np.abs(trace[-1] - trace[-20])))
+    assert settled < 0.02, f"grinding against the bound: {settled:.4f} rad over 20 ticks"
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -761,6 +933,9 @@ CHECKS = [
     ("torso_keepout_v3", check_torso_keepout_v3),
     ("waist_fixed_and_smpl_ignored", check_waist_fixed_and_smpl_ignored),
     ("grip_stale_open", check_grip_stale_open),
+    # appended, never inserted: gear_sonic/tests/test_arm_teleop_v3.py
+    # indexes CHAIN_V3_CHECKS by position
+    ("full_pose_ik_tracks_orientation", check_full_pose_ik_tracks_orientation),
 ]
 
 

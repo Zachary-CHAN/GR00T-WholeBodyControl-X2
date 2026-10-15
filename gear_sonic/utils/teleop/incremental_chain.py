@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 
@@ -70,6 +71,85 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         ArmIKSolver,
         IKResult,
     )
+
+# The mink backend pulls in mujoco + mink + a QP backend, which the robot's
+# JetPack image does not carry (PC2 still runs the DLS solver). Imported
+# defensively so this module -- the one file both trees share -- stays
+# importable there; selecting the backend is what fails, and loudly.
+try:  # pragma: no cover - depends on the environment
+    from gear_sonic.utils.teleop.solver.arm.x2_arm_mink import MinkArmIK
+except ImportError:  # pragma: no cover
+    MinkArmIK = None
+
+
+# ---------------------------------------------------------------------------
+# Arm IK backend selection
+# ---------------------------------------------------------------------------
+_ARM_SOLVER_BACKENDS = ("mink", "dls")
+
+# ArmIKSolver arguments with no counterpart on MinkArmIK. Dropped rather than
+# forwarded, so one ClutchArm call site can serve both backends; anything else
+# unexpected still raises, so a typo cannot silently vanish.
+#
+# uniform_step_clip is the interesting one. Round 5 found that clipping the
+# step PER JOINT distorts its direction near the elbow-straight singularity
+# (the joints do not saturate at the same time) and knocks the arm into a
+# bang-bang; scaling the whole step uniformly fixed that, and it is why the
+# legacy solver grew the flag. On the mink backend the step cap is a
+# VelocityLimit constraint inside the QP -- a per-joint box, i.e. the shape
+# round 5 rejected -- chosen because a constraint lets the QP redistribute
+# over the rest of the arm instead of shrinking everything, and because
+# 0.30 rad/tick barely binds in normal motion (peak measured 0.167 on a legal
+# turn-around). tools/ab_arm_ik_backends.py measures what that costs instead
+# of the design arguing it away.
+_LEGACY_ONLY_SOLVER_KWARGS = {
+    "uniform_step_clip": "superseded by the mink VelocityLimit step cap",
+    "null_space_gain": "a null-space bias leaks through the damped pseudo-inverse; never enabled",
+    "q_preferred": "only used with null_space_gain; never enabled",
+}
+
+
+def resolve_arm_backend(backend: str | None = None) -> str:
+    """Arm IK backend for this process: argument, then env, then the default.
+
+    ``X2_IK_BACKEND`` exists because the two entry points on the robot side
+    (the sim harness and the node) are shipped as-is and their argument
+    parsers are compared verbatim between the sim and robot trees -- an env
+    var is the switch that does not disturb that.
+    """
+    requested = backend if backend is not None else os.environ.get("X2_IK_BACKEND")
+    resolved = (requested or "mink").strip().lower()
+    if resolved not in _ARM_SOLVER_BACKENDS:
+        raise ValueError(
+            f"unknown arm IK backend {requested!r}; expected one of "
+            f"{_ARM_SOLVER_BACKENDS} (argument or X2_IK_BACKEND)"
+        )
+    return resolved
+
+
+def make_arm_solver(side: str, backend: str | None = None, **kwargs):
+    """Build one arm's IK solver. Returns ``(solver, resolved_backend)``.
+
+    Defaults to the mink backend (a QP with declarative tasks and limits) and
+    keeps the hand-written DLS one as an explicit fallback: pass
+    ``backend="dls"`` or set ``X2_IK_BACKEND=dls``. There is deliberately no
+    silent fallback -- quietly solving with a different backend than the one
+    asked for is exactly the "you think you are testing A but you are running
+    B" failure the ALLOW_MISMATCH guard exists to prevent.
+    """
+    resolved = resolve_arm_backend(backend)
+    if resolved == "mink":
+        if MinkArmIK is None:
+            raise RuntimeError(
+                "the mink arm IK backend is the default but mink/mujoco are not "
+                "importable in this interpreter. Install them with "
+                "`pip install -e 'gear_sonic[sim]'`, or run the legacy solver "
+                "with X2_IK_BACKEND=dls."
+            )
+        kwargs = {k: v for k, v in kwargs.items() if k not in _LEGACY_ONLY_SOLVER_KWARGS}
+        return MinkArmIK(side, **kwargs), resolved
+    return ArmIKSolver(side, **kwargs), resolved
+
 
 # ---------------------------------------------------------------------------
 # Quaternion codec -- scalar-first (w, x, y, z) is the wire convention.
@@ -278,6 +358,7 @@ class ClutchArm:
         jump_guard_rad: float = 0.22,
         torso_keepout: tuple | None = None,
         rot_err_clip_rad: float = 0.08,
+        backend: str | None = None,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
@@ -334,8 +415,21 @@ class ClutchArm:
         # (The round-8.0 PoseLpf left-multiply fix -- see PoseLpf.step --
         # remains in force; that killed the orbiting target, this bounds
         # the far-out pull.)
-        self.solver = ArmIKSolver(
+        # BACKEND (2026-10-15): the solve step is a mink QP by default -- one
+        # QP over two RelativeFrameTasks (position, orientation), with the
+        # per-tick step cap handed to mink as a VelocityLimit. Joint RANGES
+        # stay a post-step clip, deliberately: as a ConfigurationLimit the QP
+        # buys saturated rotation with hand position (measured 50.9 mm off the
+        # operator's target -- x2_arm_mink.py's module docstring has the run).
+        # The DLS solver and the
+        # guards that are *not* solver-internal (freeze guard, keep-out,
+        # reachable sphere, target slew) are unchanged and still applied here.
+        # `uniform_step_clip` is dropped on the mink path (see
+        # _LEGACY_ONLY_SOLVER_KWARGS); `self.backend` is what the harness
+        # banner prints, so a run always says which solver produced it.
+        self.solver, self.backend = make_arm_solver(
             side,
+            backend=backend,
             damping=0.08,
             rotation_weight=rotation_weight,
             uniform_step_clip=True,
@@ -710,6 +804,7 @@ class IncrementalTeleopTicker:
         torso_keepout: dict | None = TORSO_KEEPOUT,
         dt: float = DT,
         grip_tau: float = GRIP_TAU,
+        backend: str | None = None,
     ) -> None:
         self.dt = float(dt)
         self.trigger_thresh = float(trigger_thresh)
@@ -724,6 +819,7 @@ class IncrementalTeleopTicker:
                 target_slew_m_s,
                 torso_keepout=None if torso_keepout is None else torso_keepout[side],
                 rot_err_clip_rad=rot_err_clip_rad,
+                backend=backend,
             )
             for side in ("left", "right")
         }

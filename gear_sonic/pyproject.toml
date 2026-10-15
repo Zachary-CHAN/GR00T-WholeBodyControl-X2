@@ -41,8 +41,13 @@ teleop = [
 ]
 # MuJoCo simulation (run_sim_loop.py and related scripts)
 # Usage: pip install -e "gear_sonic[sim]"
+# mink: the arm IK backend of the incremental upper teleop chain (sim-only
+# for now -- it pulls qpsolvers/daqp and is deliberately NOT in [teleop],
+# which is the extra the Jetson/aarch64 side can see). Without it the chain
+# still imports and runs with X2_IK_BACKEND=dls.
 sim = [
     "mujoco",
+    "mink>=1.3.0",
     "tyro",
     "pin",
     "pyyaml",

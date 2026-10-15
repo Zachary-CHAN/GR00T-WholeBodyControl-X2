@@ -569,7 +569,11 @@ def main() -> int:
         f"[sim] wire mode: SUB :{args.intent_port}; trigger>{args.trigger_thresh} "
         f"engages, scale {args.position_scale}, rot_w {args.rotation_weight}, "
         f"rot_err_clip {args.rot_err_clip}, "
-        f"lpf tau {args.input_tau}s, waist sign {args.waist_sign:+.0f}"
+        f"lpf tau {args.input_tau}s, waist sign {args.waist_sign:+.0f}, "
+        # which solver produced this run -- a silent backend switch is
+        # exactly the "tested A, ran B" failure the ALLOW_MISMATCH gate
+        # exists for, so the banner names it
+        f"arm IK {arms['right'].backend}"
     )
 
     viewer = None
