@@ -119,6 +119,30 @@ through a gait; `WRIST_SMPL_MAP=lp:+y,lr:+z,rp:-y,rr:+z` flips a wrist sign;
 CSV. Controls: both grips 0.5 s = engage / disengage, SPACE in the viewer =
 same, R = reset. Stop: Ctrl-C.
 
+## 手臂 IK 后端（incremental 上半身链，仅 sim）
+
+`incremental_chain.py` / `incremental_chain_v3.py`（harness:
+`gear_sonic/scripts/incremental_upper_teleop_mujoco.py`、
+`gear_sonic/scripts/arm_teleop_v3_mujoco.py`）的每条手臂各持一个 IK 求解器，
+由 `make_arm_solver()` 选择：
+
+| 取值 | 求解器 | 说明 |
+|---|---|---|
+| `mink`（默认） | `MinkArmIK` | mink 1.3 的一个 QP：位置 + 姿态两个 `RelativeFrameTask`，每拍步长上限交给 `VelocityLimit`；完整 7-DoF（腕在 IK 里） |
+| `dls` | `ArmIKSolver` | 手写纯 numpy 阻尼最小二乘（v1/v2 的原始实现，留作回退） |
+
+选择顺序：构造参数 → 环境变量 `X2_IK_BACKEND` → 默认 `mink`。**缺 mink 时构造期
+直接报错**（提示装 mink 或 `X2_IK_BACKEND=dls`），不做静默回退。两个 harness 启动
+横幅都会打印解析到的后端（`arm IK mink/7-DoF`），`arm.backend` 是权威字段。
+
+```bash
+X2_IK_BACKEND=dls .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire   # 回退到 DLS
+```
+
+> **真机（PC2）仍跑 DLS**：mink / mujoco 没有、也不该被推到 Jetson
+> （`gear_sonic[teleop]` 里没有 mink，`gear_sonic[sim]` 里才有）。所以
+> **sim 里的手臂行为与真机不同是预期内的**，直到另一次单独的迁移把这条链搬上去。
+
 ## Robot
 
 Ritual up ([`F10_real_robot_colcon.md`](F10_real_robot_colcon.md)) with

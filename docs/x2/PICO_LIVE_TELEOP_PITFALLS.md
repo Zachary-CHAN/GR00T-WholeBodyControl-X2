@@ -211,6 +211,10 @@ while time.monotonic() - t0 < 60:
 - **抓 deploy 日志看 `deploy.log` / `watchdog.log`**。PC Service 的 stdout 是废的
   （`/home/nvidia/Documents/czq/logs/service.log`，只有 13 字节，内容就两个字 `release mode`）；
   sender 的 stdout 直接进 pty，读不了。
+- **「改了 IK 之后 sim 和真机不一样」→ 先看后端，再看行为**。增量上半身链的手臂求解器
+  由 `X2_IK_BACKEND`（或 `arm.backend`）决定：sim 默认 `mink`，真机（PC2）仍是 `dls`，
+  两侧本来就不同（[`F03_pico_teleop.md`](F03_pico_teleop.md) 的「手臂 IK 后端」）。
+  harness 横幅会打印 `arm IK mink/7-DoF`；拿它对齐口径，别拿 sim 的数字推断真机行为。
 
 ---
 
