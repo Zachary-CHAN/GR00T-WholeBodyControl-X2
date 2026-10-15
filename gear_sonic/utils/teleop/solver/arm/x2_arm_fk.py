@@ -102,14 +102,19 @@ _RIGHT_ARM_CHAIN: list[RevoluteJoint] = [
         rpy=(0.0, 0.0, 0.0),
         axis=(0, 1, 0),
     ),
+    # wrist_yaw / wrist_pitch are NOT the left arm's values mirrored: the
+    # URDF gives the right hand a 0.72 mm longer forearm-to-wrist offset
+    # (x=-0.014 vs -0.013280) and a centred wrist_pitch (x=0 vs 0.00049).
+    # These two entries were previously the left arm's numbers rounded, which
+    # put the right wrist 1.22 mm off the URDF pose; do not "restore" them.
     RevoluteJoint(
-        xyz=(-0.0132799999999916, 9.99999999858059e-05, -0.120580000000037),
-        rpy=(0.0, 0.0, 0.0),
+        xyz=(-0.0140000017961392, 9.7526096753231e-05, -0.120694276209686),
+        rpy=(0.0, 0.0, 3.27341906322599e-05),
         axis=(0, 0, 1),
     ),
     RevoluteJoint(
-        xyz=(0.000500000000020762, 0.0, -0.0819999999999927),
-        rpy=(0.0, 0.0, 0.0),
+        xyz=(0.0, 0.0, -0.081799999999999),
+        rpy=(0.0, 0.0, -3.27341932546355e-05),
         axis=(0, 1, 0),
     ),
     RevoluteJoint(

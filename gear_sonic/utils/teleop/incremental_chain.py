@@ -121,6 +121,10 @@ ARM_NEUTRAL = {
 # hip bodies, chain-frame aligned. The sim harness RE-DERIVES them from the
 # model every run and asserts equality (check_keepout_matches_model), so
 # the plant can never silently drift from the robot node's constant.
+# The alignment subtracts the wrist offset between the MJCF body and the
+# solver chain, so these move whenever the chain's geometry does: the right
+# entry was re-derived after x2_arm_fk's right wrist offsets were corrected
+# to the URDF (1.15 mm; left unchanged).
 # ---------------------------------------------------------------------------
 TORSO_KEEPOUT = {
     "left": (
@@ -133,13 +137,13 @@ TORSO_KEEPOUT = {
         0.42569439347186194,
     ),
     "right": (
-        0.005412079758198079,
-        0.0030890547244431694,
+        0.00425748769003286,
+        0.00288685198510193,
         0.2542544365041611,
         0.18810346448531395,
         0.2553776834499313,
-        -0.5921873165340925,
-        0.4073837285969006,
+        -0.5925363011747504,
+        0.4070347439562427,
     ),
 }
 
