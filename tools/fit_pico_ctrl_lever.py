@@ -26,8 +26,9 @@ It slides a window over the record, solves the 6-unknown linear system
 Need enough rotation inside the window (``--min-sweep-deg``) or the fit is
 under-determined; need a still wrist or the translation confounds it. A low
 residual alone is NOT proof: a slowly translating wrist still fits well with
-a wrong ``r``. The report refits at +/-20% window widths; use that spread
-(and the physical size of ``|r|``) as the honesty check.
+a wrong ``r``. The report refits at +/-20% window widths around the same time
+center; use that spread (and the physical size of ``|r|``) as the honesty
+check.
 
     .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/v3_live.npz --side left
 
@@ -67,6 +68,52 @@ def _quat_wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     return q[..., [1, 2, 3, 0]]
 
 
+def _rotation_mats(quats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row rotation matrices, plus the mask of usable quaternions.
+
+    The first frames of a live record are zero placeholders until the
+    sender's first intent arrives. Build rotations only for the valid rows
+    (scipy rejects a zero-norm quaternion in the batch) and leave identity
+    in the placeholders: every window containing one is skipped.
+    """
+    n = len(quats)
+    valid = np.linalg.norm(quats, axis=1) > 1e-6
+    mats = np.tile(np.eye(3), (n, 1, 1))
+    if valid.any():
+        mats[valid] = sRot.from_quat(_quat_wxyz_to_xyzw(quats[valid])).as_matrix()
+    return mats, valid
+
+
+def _fit_window(
+    positions: np.ndarray,
+    mats: np.ndarray,
+    start: int,
+    window: int,
+    min_sweep_deg: float,
+) -> LeverFit | None:
+    """One window; the caller guarantees the slice is valid and in bounds."""
+    R = mats[start : start + window]
+    # orientation sweep inside the window, measured as the max deviation
+    # from the first frame (not just the endpoint)
+    devs = np.array([sRot.from_matrix(R[0].T @ Ri).magnitude() for Ri in R])
+    sweep = float(devs.max())
+    if sweep < np.radians(min_sweep_deg):
+        return None
+    A = np.zeros((3 * window, 6), np.float64)
+    A[:, :3] = np.tile(np.eye(3), (window, 1))
+    A[:, 3:] = R.reshape(-1, 3)  # rows: R_0; R_1; ... (3x3 each)
+    b = positions[start : start + window].reshape(-1)
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    rms = float(np.linalg.norm(A @ x - b) / np.sqrt(len(b)))
+    return LeverFit(
+        lever=x[3:].copy(),
+        wrist=x[:3].copy(),
+        rms_m=rms,
+        sweep_rad=sweep,
+        start=start,
+    )
+
+
 def fit_lever(
     positions: np.ndarray,
     quats_wxyz: np.ndarray,
@@ -85,43 +132,17 @@ def fit_lever(
     n = len(positions)
     if n < window or len(quats) != n:
         return None
-    valid = np.linalg.norm(quats, axis=1) > 1e-6
+    mats, valid = _rotation_mats(quats)
     if not valid.any():
         return None
-    # The first frames of a live record are zero placeholders until the
-    # sender's first intent arrives. Build rotations only for the valid rows
-    # (scipy rejects a zero-norm quaternion in the batch) and leave identity
-    # in the placeholders: every window containing one is skipped below.
-    mats = np.tile(np.eye(3), (n, 1, 1))
-    mats[valid] = sRot.from_quat(_quat_wxyz_to_xyzw(quats[valid])).as_matrix()
-    eye3 = np.eye(3)
 
     best: LeverFit | None = None
     for start in range(0, n - window + 1, step):
-        sl = slice(start, start + window)
-        if not valid[sl].all():
+        if not valid[start : start + window].all():
             continue
-        R = mats[sl]
-        # orientation sweep inside the window, measured as the max deviation
-        # from the first frame (not just the endpoint)
-        devs = np.array([sRot.from_matrix(R[0].T @ Ri).magnitude() for Ri in R])
-        sweep = float(devs.max())
-        if sweep < np.radians(min_sweep_deg):
-            continue
-        A = np.zeros((3 * window, 6), np.float64)
-        A[:, :3] = np.tile(eye3, (window, 1))
-        A[:, 3:] = R.reshape(-1, 3)  # rows: R_0; R_1; ... (3x3 each)
-        b = positions[sl].reshape(-1)
-        x, *_ = np.linalg.lstsq(A, b, rcond=None)
-        rms = float(np.linalg.norm(A @ x - b) / np.sqrt(len(b)))
-        if best is None or rms < best.rms_m:
-            best = LeverFit(
-                lever=x[3:].copy(),
-                wrist=x[:3].copy(),
-                rms_m=rms,
-                sweep_rad=sweep,
-                start=start,
-            )
+        f = _fit_window(positions, mats, start, window, min_sweep_deg)
+        if f is not None and (best is None or f.rms_m < best.rms_m):
+            best = f
     return best
 
 
@@ -195,26 +216,34 @@ def _self_test() -> None:
 def _window_stability(
     positions: np.ndarray,
     quats_wxyz: np.ndarray,
+    best: LeverFit,
     window: int,
-    step: int,
     min_sweep_deg: float,
 ) -> list[tuple[int, LeverFit]]:
-    """Refit at -20% / requested / +20% window widths.
+    """Refit at -20% / requested / +20% widths around the SAME segment.
 
     A rigid lever on a still wrist gives the same ``r`` at every width; a
     translating wrist lets each width absorb a different amount of the
     translation, which is the failure mode a low RMS alone does not catch.
+
+    Keep the window centered on ``best.start``: letting each width search its
+    own best start compares different time segments (and different hand
+    positions), which reports false instability. Same-segment fits isolate
+    the width effect.
     """
+    positions = np.asarray(positions, np.float64)
+    quats = np.asarray(quats_wxyz, np.float64)
+    mats, valid = _rotation_mats(quats)
+    n = len(positions)
+    center = best.start + 0.5 * window
     widths = sorted({max(10, int(round(window * s))) for s in (0.8, 1.0, 1.2)})
     out: list[tuple[int, LeverFit]] = []
     for w in widths:
-        f = fit_lever(
-            positions,
-            quats_wxyz,
-            window=w,
-            step=step,
-            min_sweep_deg=min_sweep_deg,
-        )
+        start = int(round(center - 0.5 * w))
+        start = max(0, min(start, n - w))
+        if start < 0 or not valid[start : start + w].all():
+            continue
+        f = _fit_window(positions, mats, start, w, min_sweep_deg)
         if f is not None:
             out.append((w, f))
     return out
@@ -272,14 +301,14 @@ def main() -> int:
     )
     print(f"lever  {np.round(fit.lever, 5)} m  (|r| {np.linalg.norm(fit.lever) * 1e3:.1f} mm)")
     print(f"wrist  {np.round(fit.wrist, 5)} m  (rough stationary-wrist position)")
-    alts = _window_stability(positions, quats, args.window, args.step, args.min_sweep_deg)
+    alts = _window_stability(positions, quats, fit, args.window, args.min_sweep_deg)
     if len(alts) >= 2:
         spread = max(float(np.linalg.norm(f.lever - fit.lever)) for _, f in alts)
-        print(f"window-size stability (spread vs best {spread * 1e3:.1f} mm):")
+        print(f"window-size stability (same segment; spread vs best {spread * 1e3:.1f} mm):")
         for w, f in alts:
             d = float(np.linalg.norm(f.lever - fit.lever))
             print(
-                f"  w={w:3d}  lever {np.round(f.lever, 4)}  "
+                f"  w={w:3d} start {f.start:4d}  lever {np.round(f.lever, 4)}  "
                 f"(d {d * 1e3:.1f} mm, rms {f.rms_m * 1e3:.2f} mm)"
             )
         # 20 mm absolute or 20% of |r|, whichever is larger: a still wrist at

@@ -279,9 +279,9 @@ while time.monotonic() - t0 < 60:
    .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/lever_fit.npz --side left
    ```
    **RMS 小不等于可信**：手缓慢平移时 6 个未知量仍能拟合出很低的残差。看
-   `window-size stability` 行——同一段数据在 40/50/60 帧窗口下应给出几乎相同的
-   `r`；spread 超过 `max(20 mm, 0.2|r|)`、或 `|r| > 150 mm`（超出正常握持
-   杠杆），都说明手在动，重录。左右手柄各做一次。
+   `window-size stability` 行——它在**同一时间中心**上换 40/50/60 帧窗口重拟合，
+   同一段数据应给出几乎相同的 `r`；spread 超过 `max(20 mm, 0.2|r|)`、或
+   `|r| > 150 mm`（超出正常握持杠杆），都说明手在动，重录。左右手柄各做一次。
    若报「no ... window」，先用
    `.venv/bin/python -c "import numpy as np; r=np.load('/tmp/lever_fit.npz')['rows']; print(r[:,1].mean(), np.abs(r[:,24:28]).max())"`
    确认 `fresh` 非 0、四元数非 0——否则是 sender/头显没起来，不是动作幅度不够。
