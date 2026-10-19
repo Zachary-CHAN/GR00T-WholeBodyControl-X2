@@ -262,9 +262,11 @@ while time.monotonic() - t0 < 60:
    .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire \
      --record /tmp/lever_fit.npz --no-viewer --duration 30
    ```
-   再起 sender（头显已连接、数据 ON），然后开始「腕心尽量不动、只绕腕转
-   控制器」的动作，覆盖两个以上转轴、总共 ≥ 60°；太慢可以，但单轴旋转只能
-   辨识垂直于该轴的杠杆分量。最有效的是**把前臂/肘支在桌上**，只让手腕转动。
+   再起 sender（头显已连接、数据 ON），然后做「**腕心尽量不动、控制器画圆锥/圆圈**」
+   的动作：同时绕 yaw+pitch+roll 转，累计 ≥ 60°。**不要只沿一个轴来回转**——
+   绕单轴的旋转云是秩 2 的，沿该轴的杠杆分量永远不动，拟合只能拿腕部平移去填；
+   工具用 `--min-observability 0.3`（旋转云最小与最大奇异值之比）把这种
+   窗口和 lag 直接拒掉。最有效的是**把前臂/肘支在桌上，只让手腕画圈**。
 
    **sender 仍以 body 流为发布门**（`LiveSmplSource` 要
    `is_body_data_available()` + 新 stamp），所以 v3 链不用 SMPL **不等于**
@@ -274,14 +276,28 @@ while time.monotonic() - t0 < 60:
    .venv_teleop/bin/python gear_sonic/scripts/pico_intent_sender.py \
      --pc2-host 127.0.0.1 --intent-port 15573 --hand-source off
    ```
-2. 拟合（滑窗最小二乘，`C_i = W + R_i r`；打印残差）：
+2. 拟合（短滞后增量估计 + 滑窗一致性检查）：
    ```bash
    .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/lever_fit.npz --side left
    ```
-   **RMS 小不等于可信**：手缓慢平移时 6 个未知量仍能拟合出很低的残差。看
-   `window-size stability` 行——它在**同一时间中心**上换 40/50/60 帧窗口重拟合，
-   同一段数据应给出几乎相同的 `r`；spread 超过 `max(20 mm, 0.2|r|)`、或
-   `|r| > 150 mm`（超出正常握持杠杆），都说明手在动，重录。左右手柄各做一次。
+   输出三组估计：`best window`（单窗常数 `W`）、`consensus`（多窗共享 `r`）、
+   `increment estimate`（短滞后差分 `dC = dR @ r`，默认 lags 2/5/10/20）。
+   **用 `re-run with:` 打印的向量**——它取的是 increment 估计。原因：单窗/共识
+   都假设整个窗口内腕心不动；live 标定几乎总会以几 cm/s 漂移，漂移会被吸进
+   `r`，即使 RMS 只有 1–2 mm、窗口宽度也稳定，向量仍可能错 2–3 cm。短滞后差分
+   把漂移差掉，几个 lag 的中位数 + `lag spread` 才是诚实度检查。
+
+   读法：
+   - `lag spread` 几 mm、`median pair residual` ≤ 2–3 mm ⇒ 可信；
+   - `median pair residual > 5 mm` ⇒ 标定时腕子在动，increment 比窗口法稳，
+     但仍建议重录；
+   - `increment` 与 `consensus` 相差 > 15 mm ⇒ 正是腕部漂移污染窗口法的特征，
+     以 increment 为准；
+   - `|r|` 正常约 90–110 mm；> 150 mm 是平移污染，不是握持杠杆。
+
+   左右手柄各做一次。**左右向量应近似镜像**（x 反号，y/z 接近，例如
+   左 `0.0449 0.0070 -0.0834`、右 `-0.0451 0.0042 -0.0859`）；若右手的 x 与
+   左手同号，或 `|r|` 差很多，说明其中一侧拟合坏了，不要用。
    若报「no ... window」，先用
    `.venv/bin/python -c "import numpy as np; r=np.load('/tmp/lever_fit.npz')['rows']; print(r[:,1].mean(), np.abs(r[:,24:28]).max())"`
    确认 `fresh` 非 0、四元数非 0——否则是 sender/头显没起来，不是动作幅度不够。
@@ -292,8 +308,10 @@ while time.monotonic() - t0 < 60:
 
 **注意**：
 
-- 杠杆是**控制器坐标系**的常向量；左右手柄的握持方向通常不同，分别标定、
-  分别用 `--ctrl-lever-left/right` 传入。`--ctrl-lever` 只是两臂共用的回退。
+- 杠杆是**控制器坐标系**的常向量，取决于**握持方式**：换握法、换人、或隔天
+  重新戴上控制器，都应重标；不要把一次标定的向量跨握法复用。
+- 左右手柄的握持方向通常不同，分别标定、分别用 `--ctrl-lever-left/right` 传入。
+  `--ctrl-lever` 只是两臂共用的回退。
 - 旧 record / v4 tape 里的 controller pose 仍是原始控制器原点语义，没有变；
   只有补偿后的目标变了，record 列 0:35 不需要重解释。
 - 补偿后残差（几 mm 的手抖/杠杆误差）再用 `--position-deadband-mm 3` 压掉；
