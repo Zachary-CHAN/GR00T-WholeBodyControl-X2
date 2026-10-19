@@ -9,16 +9,20 @@ headset attached.  Feed the result to the sender with::
         --hand-source off --no-locomotion
 
 Profiles:
-* ``arm`` (default, 24 s @ 50 Hz): 3 s idle -> LEFT trigger held 6 s with a
-  slow figure motion -> release 3 s (the arm must HOLD) -> RIGHT trigger
+* ``arm`` (default, 24 s @ 50 Hz): 3 s idle -> LEFT grip held 6 s with a
+  slow figure motion -> release 3 s (the arm must HOLD) -> RIGHT grip
   held 6 s -> both 4 s with a 25 deg torso twist (waist yaw must follow)
   -> release 2 s.
 * ``wrist`` (v3, 24 s): position held constant, pure controller-QUATERNION
   sweeps (z 0->+-120 deg, then x/y single-axis segments) with hold
-  windows, and grip PRESSED (=1, v3 closes on press) duty windows.  The
-  j24 skeleton still twists 25 deg during the right-arm window -- the v3
-  chain must ignore it (waist stays at stand), which the offline autopsy
+  windows, and TRIGGER PRESSED (=1, v3 closes on press) duty windows.
+  The j24 skeleton still twists 25 deg during the right-arm window -- the
+  v3 chain must ignore it (waist stays at stand), which the offline autopsy
   asserts alongside the wrist sign checks.
+
+Channel roles (2026-10 swap): the GRIP is the per-arm clutch, the TRIGGER
+drives the OmniHand. The duty windows below therefore live on the swapped
+channels -- an old tape replayed against the new chain never engages.
 
 Ctrl poses are framed in operator torso axes (fwd/lat/up, pelvis origin),
 which is what the recorder stores.
@@ -90,13 +94,15 @@ def make(n_frames: int = 1200, seed: int = 7):
     rng = np.random.default_rng(seed)
     t = np.arange(n_frames) * DT
     # schedule (s):     idle 0-3 | L 3-9 | hold 9-12 | R 12-18 | both 18-22 | end 22-24
-    trig = np.zeros((n_frames, 2), np.float32)
-    trig[(t >= 3) & (t < 9), 0] = 0.9
-    trig[(t >= 12) & (t < 18), 1] = 0.9
-    trig[(t >= 18) & (t < 22)] = 0.9
+    # clutch = GRIP (2026-10 swap): the LPF'd grip crosses 0.5
     grip = np.zeros((n_frames, 2), np.float32)
-    grip[(t >= 3) & (t < 9), 0] = 0.8
-    grip[(t >= 18) & (t < 22), 0] = 0.6
+    grip[(t >= 3) & (t < 9), 0] = 0.9
+    grip[(t >= 12) & (t < 18), 1] = 0.9
+    grip[(t >= 18) & (t < 22)] = 0.9
+    # hand = TRIGGER: v2 ratio = 1 - trigger, so 0.8/0.6 OPEN the hand
+    trig = np.zeros((n_frames, 2), np.float32)
+    trig[(t >= 3) & (t < 9), 0] = 0.8
+    trig[(t >= 18) & (t < 22), 0] = 0.6
 
     lc = np.zeros((n_frames, 7), np.float32)
     rc = np.zeros((n_frames, 7), np.float32)
@@ -104,7 +110,7 @@ def make(n_frames: int = 1200, seed: int = 7):
     l_rest = np.array([0.10, 0.30, -0.25])
     r_rest = np.array([0.10, -0.30, -0.25])
     for i, ti in enumerate(t):
-        # slow raise/forward figure while the left trigger is held
+        # slow raise/forward figure while the left grip is held
         if 3.0 <= ti < 9.0:
             u = (ti - 3.0) / 6.0
             lc[i, :3] = l_rest + np.array(
@@ -163,20 +169,21 @@ def make_wrist(n_frames: int = 1200, seed: int = 7):
     """v3 wrist-direction tape: positions constant, pure quat sweeps.
 
     Schedule (s): idle 0-3 | L held 3-12: z 0->+120 (3-6), hold +120 with
-    grip PRESSED (6-8), z back to 0 (8-9), x 0->+60 (9-11), hold (11-12) |
+    trigger PRESSED (6-8), z back to 0 (8-9), x 0->+60 (9-11), hold (11-12) |
     release 12-15 (freeze) | R held 15-21: z 0->-120 (15-18), hold -120
-    with grip pressed (18-19), z back (19-20), y 0->-60 (20-21) | end.
+    with trigger pressed (18-19), z back (19-20), y 0->-60 (20-21) | end.
     The j24 twists 25 deg during 15-21 -- v3 must ignore it.
     """
     rng = np.random.default_rng(seed)
     t = np.arange(n_frames) * DT
-    trig = np.zeros((n_frames, 2), np.float32)
-    trig[(t >= 3) & (t < 12), 0] = 0.9
-    trig[(t >= 15) & (t < 21), 1] = 0.9
-    # v3: grip 1 = PRESSED = closed; duty windows sit inside the sweeps
+    # clutch = GRIP (2026-10 swap)
     grip = np.zeros((n_frames, 2), np.float32)
-    grip[(t >= 6) & (t < 8), 0] = 0.8
-    grip[(t >= 18) & (t < 19), 1] = 0.6
+    grip[(t >= 3) & (t < 12), 0] = 0.9
+    grip[(t >= 15) & (t < 21), 1] = 0.9
+    # hand = TRIGGER; v3 ratio = trigger, so 1 = PRESSED = closed
+    trig = np.zeros((n_frames, 2), np.float32)
+    trig[(t >= 6) & (t < 8), 0] = 0.8
+    trig[(t >= 18) & (t < 19), 1] = 0.6
 
     l_rest = np.array([0.10, 0.30, -0.25])
     r_rest = np.array([0.10, -0.30, -0.25])
@@ -255,7 +262,9 @@ def main() -> int:
     n = len(d["t"])
     print(
         f"wrote {args.path}: profile={args.profile} {n} frames ({n * DT:.1f}s), "
-        f"trigger>0.5 frames L={int((d['trigger'][:, 0] > 0.5).sum())} "
+        f"grip>0.5 (clutch) L={int((d['grip'][:, 0] > 0.5).sum())} "
+        f"R={int((d['grip'][:, 1] > 0.5).sum())}, "
+        f"trigger>0.5 (hand) L={int((d['trigger'][:, 0] > 0.5).sum())} "
         f"R={int((d['trigger'][:, 1] > 0.5).sum())}"
     )
     return 0

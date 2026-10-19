@@ -8,10 +8,12 @@ The X2 incremental upper teleop exists twice as a *front end*:
            front end vendored flat into x2_sdk_v100/src/py_examples/py_examples/)
 
 Both drive the SAME :class:`IncrementalTeleopTicker` from
-``gear_sonic/utils/teleop/incremental_chain.py`` (bit-identical copies,
-md5-checked by this tool).  So for one state dict ``st`` the only place the
-two can diverge is the mapping ``st -> (joint names, positions, gains)``
-each side applies before handing values to its plant.
+``gear_sonic/utils/teleop/incremental_chain.py``.  The robot tree ships a
+flat copy of that module; this tool imports what Python resolves from the
+node's directory and PRINTS the resolved chain path (a vendored copy may
+carry older semantics).  For one state dict ``st`` the only place the two
+can diverge is the mapping ``st -> (joint names, positions, gains)`` each
+side applies before handing values to its plant.
 
 This tool drives ONE ticker over a v4 tape and, every tick, compares:
 
@@ -123,7 +125,13 @@ def main() -> int:
     print(f"repo  {args.repo}")
     print(f"sim   {args.sim_script}")
     print(f"node  {Path(node_mod.__file__).resolve()}")
-    print(f"chain {Path(chain.__file__).resolve()}   (must be the file both trees share)")
+    repo_chain = (Path(args.repo) / "gear_sonic/utils/teleop/incremental_chain.py").resolve()
+    resolved_chain = Path(chain.__file__).resolve()
+    print(f"chain {resolved_chain}   (must be the file both trees share)")
+    if resolved_chain != repo_chain:
+        print(f"WARNING: chain resolved OUTSIDE the repo ({repo_chain} expected);")
+        print("         a vendored copy may still carry the OLD trigger/grip roles --")
+        print("         this gate only says the two ASSEMBLIES agree on whatever chain won.")
 
     stale = check_mirror_sync(Path(args.sim_script))
     if stale:
@@ -245,6 +253,7 @@ def main() -> int:
     n = len(tape["t"])
     tgt = tgt_init()
     worst, first_bad, n_joints = 0.0, None, 0
+    held_ticks = {"left": 0, "right": 0}
     t0 = 1000.0
     for k in range(n):
         frame = {
@@ -256,6 +265,8 @@ def main() -> int:
             "smpl_joints": tape["smpl_joints"][k].astype(np.float64),
         }
         st = ticker.step(frame, now=frame["t"])
+        for side in held_ticks:
+            held_ticks[side] += int(bool(st["held"][side]))
         a = sim_assembly(st, dict(tgt))
         b = node_assembly(st)
         if set(a) != set(b):
@@ -288,7 +299,14 @@ def main() -> int:
             f"gains ({kpa},{kda}) vs ({kpb},{kdb})"
         )
     print(f"  argparse defaults differ on: {bad_cfg if bad_cfg else 'nothing'}")
-    ok = (worst == 0.0) and not bad_cfg
+    print(f"  held ticks (clutch closed): L={held_ticks['left']} R={held_ticks['right']}")
+    vacuous = held_ticks["left"] == 0 or held_ticks["right"] == 0
+    if vacuous:
+        print(
+            "  FAIL: a side never engages, so its command stream is a frozen "
+            "constant -- regenerate the tape for the current trigger/grip roles."
+        )
+    ok = (worst == 0.0) and not bad_cfg and not vacuous
     print("\nLEVEL-0:", "PASS (bit-exact)" if ok else "FAIL")
     core.stop()
     return 0 if ok else 1

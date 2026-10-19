@@ -136,6 +136,11 @@ same, R = reset. Stop: Ctrl-C.
 横幅都会打印解析到的求解器与自由度（形如 `arm IK mink` + `7-DoF`），`arm.backend`
 是权威字段。
 
+这条链的角色（2026-10 互换）：**握把键 grip 是每臂 clutch**（经 LPF 后过阈值；
+`TRIGGER_THRESH` / `--trigger-thresh` 是历史名），**扳机 trigger 驱动 OmniHand
+手指**（v2 `ratio = 1 - hand`，v3 `ratio = hand`）。真机 PC2 的平铺副本**尚未同步**，
+仍是旧的 trigger clutch / grip 手指；读数前先确认跑的是哪一侧。
+
 ```bash
 X2_IK_BACKEND=dls .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire   # 回退到 DLS
 ```

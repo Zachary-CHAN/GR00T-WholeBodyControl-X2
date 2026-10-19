@@ -215,6 +215,10 @@ while time.monotonic() - t0 < 60:
   由 `X2_IK_BACKEND`（或 `arm.backend`）决定：sim 默认 `mink`，真机（PC2）仍是 `dls`，
   两侧本来就不同（[`F03_pico_teleop.md`](F03_pico_teleop.md) 的「手臂 IK 后端」）。
   harness 横幅会打印求解器与自由度（形如 `arm IK mink` + `7-DoF`）；拿它对齐口径，别拿 sim 的数字推断真机行为。
+- **「改了 trigger/grip 之后 sim 和真机反了」→ 先看运行侧**。2026-10 起 sim 的增量链
+  把 **grip 当 clutch、trigger 当手指**；PC2 平铺副本未同步，仍是旧的 trigger clutch /
+  grip 手指。读 record 列 2/3（原始 trigger）与 4/5（滤波 grip），或看节点横幅（仍写
+  `trigger>... clutches`）时，先确认是 sim 还是真机。
 
 ---
 
