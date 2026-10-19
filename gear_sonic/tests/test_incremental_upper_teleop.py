@@ -41,6 +41,10 @@ def test_grip_mapping():
     iutm.check_grip_mapping()
 
 
+def test_trigger_hand_grip_clutch():
+    iutm.check_trigger_hand_grip_clutch()
+
+
 def test_input_lpf():
     iutm.check_input_lpf()
 

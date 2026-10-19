@@ -20,10 +20,14 @@ imported at module level").
 
 Chain (per side), 50 Hz:
     wire ctrl pose (already framed in the operator torso axes by the
-    sender) -> trigger clutch: trigger > TRIGGER_THRESH engages --
+    sender) -> grip clutch: LPF'd grip > TRIGGER_THRESH engages (the
+    constant / CLI names are historical -- before the 2026-10 role swap
+    the raw trigger was the clutch) --
     ``engage()`` anchors the operator pose against the robot wrist FK at
     the current commanded q -- release disengages and the arm HOLDS its
     last q (v2 semantics; v1 slewed back to neutral);
+    the raw trigger is LPF'd into ``hand`` -- the OmniHand drive (v2
+    polarity: ratio = 1 - hand, rest closed);
     -> incremental target ``anchor_rob + scale*(ctrl - anchor_op)`` (pos)
     and ``anchor_rob_R * (anchor_op_inv * R_now)`` (rot)
     -> torso keep-out (elliptical cylinder, project -> clamp -> project)
@@ -174,12 +178,18 @@ def _rot_to_quat_wxyz(rot: sRot) -> np.ndarray:
 
 
 DT = 0.02  # 50 Hz control
-TRIGGER_THRESH = 0.5  # common.py convention; NOT the 0.6 walking deadman
+# common.py convention; NOT the 0.6 walking deadman. Historical name: it now
+# gates the LPF'd GRIP clutch (the node/CLI still import this symbol).
+TRIGGER_THRESH = 0.5
 # DLS iterations per 50 Hz tick. 1 (the recorder default) leaves a ~1.5-tick
 # position lag under continuous motion (~10 mm at 5 mm/tick); 2 halves it
 # (<5 mm) for negligible cost (two 6x6 solves). 3 buys nothing here.
 IK_ITERS_PER_TICK = 2
-GRIP_TAU = 0.15  # grip LPF (live round 4: raw grip noise fluttered the fingers)
+# One-pole LPF time constant (a = dt/(tau+dt)) applied to the raw grips (the
+# clutch) and the raw triggers (the hands). Historical name: live round 4
+# added it because raw grip noise fluttered the fingers; the 2026-10 role
+# swap kept the value and now uses it on both channels.
+GRIP_TAU = 0.15
 
 # Per-side arm neutral. Identical to vr_arm_teleop's
 # DEFAULT_{LEFT,RIGHT}_ARM_NEUTRAL_RAD (the sim harness asserts equality);
@@ -765,21 +775,22 @@ class IncrementalTeleopTicker:
     frame and applies the returned commands to MuJoCo (PD servos); the robot
     node feeds it the same frame and publishes the commands on the hal
     topics. All chain state lives here (arms + anchors, pose LPFs, torso
-    frame, waist chain, grip filter), so "what the sim validated" IS "what
+    frame, waist chain, hand / clutch LPFs), so "what the sim validated" IS "what
     the robot runs" structurally -- and a tape can be driven through it
     OFFLINE with a synthetic clock and compared tick-for-tick against either
     plant (the level-0 alignment gate of czq_test_v2_incremental.md).
 
     step() ordering is load-bearing (live rounds 3-8.2); it is the exact
     order of the validated sim loop:
-        freshness -> grip LPF -> torso frame -> pose LPF -> engage/disengage
-        -> waist -> per-arm IK.
+        freshness -> grip + trigger LPF -> torso frame -> pose LPF ->
+        engage/disengage -> waist -> per-arm IK.
 
     Returns a dict (per tick):
         fresh:    bool          -- frame newer than stale_s
-        lt, rt:   float         -- trigger values (0 when stale)
-        grip_raw / grip:   {'l','r'} -- wire / LPF'd grip
-        held:     {'left','right'}   -- trigger > thresh (the clutch)
+        lt, rt:   float         -- trigger values (0 when stale; hand input)
+        grip_raw / grip:   {'l','r'} -- wire / LPF'd grip (the clutch)
+        hand:     {'l','r'}    -- LPF'd trigger (the OmniHand drive)
+        held:     {'left','right'}   -- LPF'd grip > thresh (the clutch)
         ctrl_pre, ctrl:    {'left','right'} -- wire pose / post-LPF pose
                            (zeros when stale)
         q:        {'left','right'}   -- the 7 commanded joints per side
@@ -826,7 +837,10 @@ class IncrementalTeleopTicker:
         self.lpfs = {"left": PoseLpf(input_tau), "right": PoseLpf(input_tau)}
         self.torso = TorsoFrame()
         self.waist = WaistYawChain(sign=waist_sign, clamp_rad=waist_clamp)
+        # grip_f: LPF'd wire grip, the clutch decision (recorded in cols 4/5).
+        # hand_f: LPF'd wire trigger, the OmniHand drive (ratio = 1 - hand_f).
         self.grip_f = {"l": 0.0, "r": 0.0}
+        self.hand_f = {"l": 0.0, "r": 0.0}
 
     def step(self, frame, now: float | None = None) -> dict:
         now = time.monotonic() if now is None else now
@@ -841,14 +855,20 @@ class IncrementalTeleopTicker:
             lcp = np.asarray(frame.get("lctrl_pose", zero7), np.float64)
             rcp = np.asarray(frame.get("rctrl_pose", zero7), np.float64)
             j24 = np.asarray(frame["smpl_joints"], np.float64).reshape(24, 3)
-            # grip LPF (live round 4: raw grip noise fluttered the fingers;
-            # both plants filter identically -- it is THIS line and no copy)
+            # Role swap (2026-10): the TRIGGER drives the hands (hand_f) and
+            # the GRIP drives the clutch (grip_f). Both use the same one-pole
+            # LPF; both plants filter identically -- it is THIS line and no
+            # copy. Held is decided on grip_f, which is also what the record
+            # logs (cols 4/5), so the clutch decision stays reproducible.
             a = dt / (self.grip_tau + dt)
+            self.hand_f["l"] += a * (lt - self.hand_f["l"])
+            self.hand_f["r"] += a * (rt - self.hand_f["r"])
             self.grip_f["l"] += a * (lg - self.grip_f["l"])
             self.grip_f["r"] += a * (rg - self.grip_f["r"])
         else:
             lt = rt = lg = rg = 0.0  # stale -> freeze + hands closed
             self.grip_f["l"] = self.grip_f["r"] = 0.0
+            self.hand_f["l"] = self.hand_f["r"] = 0.0
             lcp = rcp = zero7
             j24 = None
             self.lpfs["left"].reset()
@@ -866,8 +886,8 @@ class IncrementalTeleopTicker:
         else:
             lcp_pre_lpf = rcp_pre_lpf = np.zeros(7)
         held = {
-            "left": fresh and lt > self.trigger_thresh,
-            "right": fresh and rt > self.trigger_thresh,
+            "left": fresh and self.grip_f["l"] > self.trigger_thresh,
+            "right": fresh and self.grip_f["r"] > self.trigger_thresh,
         }
         ctrl = {"left": lcp, "right": rcp}
         for side, arm in self.arms.items():
@@ -888,6 +908,7 @@ class IncrementalTeleopTicker:
             "rt": rt,
             "grip_raw": {"l": lg, "r": rg},
             "grip": dict(self.grip_f),
+            "hand": dict(self.hand_f),
             "held": held,
             "ctrl_pre": {"left": lcp_pre_lpf, "right": rcp_pre_lpf},
             "ctrl": ctrl,
@@ -1429,6 +1450,59 @@ def check_pose_err_cap() -> None:
     ), f"tracking not restored at home: {np.degrees(err_end):.2f} deg residual"
 
 
+def check_trigger_hand_grip_clutch() -> None:
+    """Role contract after the 2026-10 swap: the TRIGGER drives the OmniHand
+    (``hand``) and the GRIP is the per-arm clutch (``held``). The constants
+    and flags kept their historical names; only the signal sources moved.
+
+    Phase A: triggers pressed, grips released -- neither arm may engage while
+    the filtered trigger rises. Phase B: triggers released, grips pressed --
+    both arms engage off the filtered grips and the hand channel decays.
+    """
+    tick = IncrementalTeleopTicker()
+    now = 100.0
+
+    def pose_for(side: str) -> np.ndarray:
+        pos, _ = tick.arms[side].solver.fk(tick.arms[side].q)
+        out = np.zeros(7)
+        out[:3] = pos
+        out[3] = 1.0  # unit quat (wxyz): engage() refuses zero placeholders
+        return out
+
+    frame = {
+        "t": now,
+        "trigger": np.array([1.0, 1.0]),
+        "grip": np.array([0.0, 0.0]),
+        "lctrl_pose": pose_for("left"),
+        "rctrl_pose": pose_for("right"),
+        "smpl_joints": np.zeros(72),
+    }
+    for _ in range(20):  # 0.4 s: inside stale_s, past the hand LPF rise
+        st = tick.step(frame, now)
+        now += DT
+    assert not any(st["held"].values()), "trigger alone must not engage the clutch"
+    assert not any(arm.engaged for arm in tick.arms.values()), "trigger alone engaged an arm"
+    assert (
+        st["hand"]["l"] > 0.5 and st["hand"]["r"] > 0.5
+    ), f"trigger must drive the hand channel, got {st['hand']}"
+
+    frame["t"] = now
+    frame["trigger"] = np.zeros(2)
+    frame["grip"] = np.ones(2)
+    for _ in range(20):  # 0.4 s: grip LPF rises past the 0.5 threshold
+        st = tick.step(frame, now)
+        now += DT
+    assert st["held"]["left"] and st["held"]["right"], "grip must engage the clutch"
+    assert (
+        tick.arms["left"].engaged and tick.arms["right"].engaged
+    ), "grip > threshold must engage both arms"
+    assert (
+        st["hand"]["l"] < 0.5 and st["hand"]["r"] < 0.5
+    ), f"released trigger must decay the hand channel, got {st['hand']}"
+    for side, q in st["q"].items():
+        assert np.all(np.isfinite(q)), f"{side} arm produced a non-finite command"
+
+
 CHECKS = [
     ("wire_decode", check_wire_decode),
     ("ik_convergence", check_ik_convergence),
@@ -1443,6 +1517,7 @@ CHECKS = [
     ("torso_keepout", check_torso_keepout),
     ("pose_lpf_convergence", check_pose_lpf_convergence),
     ("pose_err_cap", check_pose_err_cap),
+    ("trigger_hand_grip_clutch", check_trigger_hand_grip_clutch),
 ]
 
 

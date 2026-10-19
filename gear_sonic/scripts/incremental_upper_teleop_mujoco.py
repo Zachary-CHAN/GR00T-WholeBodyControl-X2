@@ -5,11 +5,13 @@ v1 (upper_body_teleop_mujoco.py, Plan D) follows the Pico SMPL body
 estimate globally -- which compresses overhead reaches by 40-70 deg (the
 operator holds 180 deg, SMPL reports ~113). v2 replaces the arm path:
 each Pico controller drives its arm's wrist 6-DoF INCREMENTALLY while
-its trigger is held (clutch), the OmniHand opens/closes with the grip
-button, the waist follows the operator's shoulder-line twist, and head
-motion control is disabled (hold 0).
+its grip is held (clutch; the LPF'd grip crosses TRIGGER_THRESH), the
+OmniHand opens/closes with the trigger, the waist follows the operator's
+shoulder-line twist, and head motion control is disabled (hold 0). The
+trigger/grip roles were swapped in 2026-10; the constant / flag names
+are historical.
 
-Per side, trigger held -> the wrist target is
+Per side, grip held -> the wrist target is
 ``anchor_rob + scale * (ctrl_pose - anchor_op)`` (position) and
 ``anchor_rob_R * (anchor_op_inv * R_now)`` (orientation), solved with
 one DLS tick per 50 Hz frame (x2_arm_ik.ArmIKSolver, ported anchor
@@ -18,8 +20,8 @@ logic from vr_arm_teleop.py v1). Trigger released -> the arm freezes.
 Input: the laptop sender's pico_intent wire (SUB-bind), which now also
 packs lctrl_pose/rctrl_pose f32[7] ALREADY in the operator torso frame
 (fwd=+x, left=+y, up=+z, pelvis origin -- the sender builds it from the
-raw SDK joints), trigger f32[2], grip f32[2]. The SMPL stream only feeds
-the waist (shoulder line vs hip line). Model: X2 + OmniHand
+raw SDK joints), trigger f32[2] (hands), grip f32[2] (clutch). The SMPL
+stream only feeds the waist (shoulder line vs hip line). Model: X2 + OmniHand
 (compose_x2_with_omnihand), floating base pinned (gantry), 20x1 ms
 substeps under the 50 Hz commands.
 
@@ -92,6 +94,7 @@ from gear_sonic.utils.teleop.incremental_chain import (  # noqa: E402
     check_pose_lpf_convergence,
     check_torso_frame,
     check_torso_keepout,
+    check_trigger_hand_grip_clutch,
     check_waist_chain_gating,
     check_waist_rest_and_twist,
     check_wire_decode,
@@ -334,6 +337,8 @@ def check_wire_roundtrip() -> None:
 
 
 def check_grip_mapping() -> None:
+    """v2 hand polarity: ratio = 1 - hand. The hand signal is now the LPF'd
+    TRIGGER (2026-10 swap); the ratio math itself is unchanged."""
     for side in ("left", "right"):
         open_q = grasp_command_from_ratio(side, 0.0)
         closed_q = grasp_command_from_ratio(side, 1.0)
@@ -451,6 +456,7 @@ CHECKS = [
     ("limits_match_sdk", check_limits_match_sdk),
     ("neutral_matches_vr_defaults", check_neutral_matches_vr_defaults),
     ("model_and_head_hold", check_model_and_head_hold),
+    ("trigger_hand_grip_clutch", check_trigger_hand_grip_clutch),
 ]
 
 
@@ -529,7 +535,8 @@ def main() -> int:
         default="",
         help="dump per-tick live-loop telemetry to this .npz for offline jitter "
         "autopsy (wire poses pre-LPF, filtered poses, commanded q, realized "
-        "qpos, trigger/grip, ik errors, holding flags); empty = off",
+        "qpos, raw trigger (hands) / LPF'd grip (clutch), ik errors, "
+        "holding flags); empty = off",
     )
     args = ap.parse_args()
 
@@ -566,8 +573,8 @@ def main() -> int:
     rx = IncrementalIntentReceiver(args.intent_port)
     rx.start()
     print(
-        f"[sim] wire mode: SUB :{args.intent_port}; trigger>{args.trigger_thresh} "
-        f"engages, scale {args.position_scale}, rot_w {args.rotation_weight}, "
+        f"[sim] wire mode: SUB :{args.intent_port}; grip (LPF'd)>{args.trigger_thresh} "
+        f"engages, trigger drives the hands, scale {args.position_scale}, rot_w {args.rotation_weight}, "
         f"rot_err_clip {args.rot_err_clip}, "
         f"lpf tau {args.input_tau}s, waist sign {args.waist_sign:+.0f}, "
         # which solver produced this run -- a silent backend switch is
@@ -591,7 +598,8 @@ def main() -> int:
     n_ticks = 0
     # --record (live round 8.2): one row per tick, flat float64. Column
     # layout (FIXED -- the autopsy tools in /tmp index it positionally):
-    #   0 t_wall | 1 fresh | 2 lt | 3 rt | 4 grip_l | 5 grip_r | 6 frame_t
+    #   0 t_wall | 1 fresh | 2 lt | 3 rt (raw trigger = hand input)
+    #   4 grip_l | 5 grip_r (LPF'd grip = clutch) | 6 frame_t
     #   7:14  lcp_raw (pos3+quat4) | 14:21  rcp_raw | 21:28  lcp_filt
     #   28:35 rcp_filt | 35:42 q_left_cmd | 42:49 q_right_cmd
     #   49:53 ik err (pos,rot)x(L,R) | 53:57 hold/engaged L,R
@@ -606,13 +614,14 @@ def main() -> int:
             if viewer is not None and not viewer.is_running():
                 break
             frame, nerr = rx.snapshot()
-            # ---- the whole per-tick chain (freshness -> grip LPF -> torso
-            # frame -> pose LPF -> engage/disengage -> waist -> IK). Shared
-            # with the robot node; see IncrementalTeleopTicker for ordering.
+            # ---- the whole per-tick chain (freshness -> grip + trigger LPF
+            # -> torso frame -> pose LPF -> engage/disengage -> waist -> IK).
+            # Shared with the robot node; see IncrementalTeleopTicker.
             st = ticker.step(frame)
             fresh = st["fresh"]
             lt, rt = st["lt"], st["rt"]
-            grip_f = st["grip"]
+            grip_f = st["grip"]  # clutch telemetry (record cols 4/5)
+            hand_f = st["hand"]  # OmniHand drive (v2 polarity: 1 - hand)
             lcp_pre_lpf = st["ctrl_pre"]["left"]
             rcp_pre_lpf = st["ctrl_pre"]["right"]
             ctrl = st["ctrl"]
@@ -623,12 +632,12 @@ def main() -> int:
                 for i, n in enumerate(ubt.ARM_NAMES[base : base + 7]):
                     tgt[n] = (q[i], *tgt[n][1:])
             tgt["waist_yaw_joint"] = (st["waist"], ubt.WAIST[0][4], ubt.WAIST[0][5])
-            # grip: squeeze (grip=1) opens the hand; rest/zero closes it
+            # trigger: squeeze (trigger=1) opens the hand; rest/zero closes it
             apply_active_hand_ctrl(
                 d,
                 layout,
-                left_active=grasp_command_from_ratio("left", 1.0 - grip_f["l"]),
-                right_active=grasp_command_from_ratio("right", 1.0 - grip_f["r"]),
+                left_active=grasp_command_from_ratio("left", 1.0 - hand_f["l"]),
+                right_active=grasp_command_from_ratio("right", 1.0 - hand_f["r"]),
             )
             pd_and_step(m, d, jm, tgt)
             if rec_rows is not None:
