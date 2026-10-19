@@ -128,13 +128,14 @@ same, R = reset. Stop: Ctrl-C.
 
 | 取值 | 求解器 | 说明 |
 |---|---|---|
-| `mink`（默认） | `MinkArmIK` | mink 1.3 的一个 QP：位置 + 姿态两个 `RelativeFrameTask`，每拍步长上限交给 `VelocityLimit`；完整 7-DoF（腕在 IK 里） |
-| `dls` | `ArmIKSolver` | 手写纯 numpy 阻尼最小二乘（v1/v2 的原始实现，留作回退） |
+| `mink`（默认） | `MinkArmIK` | mink 1.3 的一个 QP；v3 默认走 4-DoF：`solve_position_free4` 只解肩 3 + 肘，腕由 `WristClutch` 直填；`full_pose_ik=True` 时改为位置 + 姿态两个 `RelativeFrameTask`（权重都 1.0），完整 7-DoF |
+| `dls` | `ArmIKSolver` | 手写纯 numpy 阻尼最小二乘（v1/v2 的原始实现，留作回退）；同样支持 4-DoF `solve_position_free4` 与 7-DoF `solve` |
 
 选择顺序：构造参数 → 环境变量 `X2_IK_BACKEND` → 默认 `mink`。**缺 mink 时构造期
 直接报错**（提示装 mink 或 `X2_IK_BACKEND=dls`），不做静默回退。两个 harness 启动
-横幅都会打印解析到的求解器与自由度（形如 `arm IK mink` + `7-DoF`），`arm.backend`
-是权威字段。
+横幅都会打印解析到的求解器与自由度（v3 默认形如 `arm IK mink` + `4-DoF`；
+v3 harness 加 `--full-pose-ik` 时为 `7-DoF`），`arm.backend` /
+`arm.full_pose_ik` 是权威字段。
 
 这条链的角色（2026-10 互换）：**握把键 grip 是每臂 clutch**（经 LPF 后过阈值；
 `TRIGGER_THRESH` / `--trigger-thresh` 是历史名），**扳机 trigger 驱动 OmniHand

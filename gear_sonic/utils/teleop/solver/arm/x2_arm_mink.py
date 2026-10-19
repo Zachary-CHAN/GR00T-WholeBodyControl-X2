@@ -99,10 +99,13 @@ resolutions part ways the moment ``wrist_pitch`` reaches its -0.558 rad bound:
 
 Position is the operator-visible quantity here (``position_weight`` 1.0
 against 0.5) and the torso keep-out upstream is enforced on the *target*, so a
-wrist lagging its target walks straight into the ellipse. The QP therefore
-gets the step cap only, and joint ranges are clipped after the step exactly as
-the legacy loop did; with that, the two backends agree to 0.00122 rad max /
-1.3e-4 RMS on the same drive.
+wrist lagging its target walks straight into the ellipse. (The v3 opt-in
+full-pose path raises both gains to 1.0; on the same saturated drive the split
+becomes ~11.8 deg rotation / ~12 mm position, both bounded. It still keeps the
+post-step-clip choice below.) The QP therefore gets the step cap only, and
+joint ranges are clipped after the step exactly as the legacy loop did; with
+that, the two backends agree to 0.00122 rad max / 1.3e-4 RMS on the same
+drive.
 """
 
 from __future__ import annotations

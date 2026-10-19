@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""MuJoCo harness for the v3 arm teleop (wrist decoupled from the IK).
+"""MuJoCo harness for the v3 arm teleop (4-DoF arm IK + direct wrist fill).
 
 v2 (incremental_upper_teleop_mujoco.py) keeps the wrist inside the 7-DoF
 6-DoF DLS solve; on the robot the gripper shows spurious orientations
 (narrow wrist limits x open-loop differential anchoring x min-norm
 rotation spreading over the whole arm). v3 changes three things
-(decisions 2026-10-15; chain + rationale in
+(chain + rationale in
 ``gear_sonic/utils/teleop/incremental_chain_v3.py``):
 
 * SMPL channel closed: the waist holds a fixed stand value, smpl_joints
   is ignored end to end;
-* arm IK = position-only DLS over shoulder-3 + elbow, the three wrist
-  joints LOCKED at the wrist command (re-fed into the FK every tick --
-  wrist_yaw has an ~82 mm EE lever) and driven by a v1-style per-axis
-  differential mapping of the controller quaternion (anchored conjugation
-  + ZYX split, slew + near-pi guard + joint limits);
+* arm IK defaults to the v1-style 4-DoF split: position-only solve over
+  shoulder-3 + elbow, the three wrist joints LOCKED at the wrist command
+  (re-fed into the FK every tick -- wrist_yaw has an ~82 mm EE lever) and
+  driven by a v1-style per-axis differential mapping of the controller
+  quaternion (anchored conjugation + ZYX split, slew + near-pi guard +
+  joint limits). ``--full-pose-ik`` opts into the 7-DoF pose solve
+  instead (position and orientation task gains both 1.0);
 * HAND INVERTED: the hand is OPEN at rest and CLOSES when the TRIGGER is
   pressed (the LPF'd trigger is the hand channel); the GRIP is the per-arm
   clutch (2026-10 role swap; the constant / flag names are historical).
@@ -178,6 +180,13 @@ def main() -> int:
     )
     ap.add_argument("--trigger-thresh", type=float, default=iutm.TRIGGER_THRESH)
     ap.add_argument(
+        "--full-pose-ik",
+        action="store_true",
+        help="opt into the 7-DoF pose IK (wrist solved; position and rotation "
+        "gains both 1.0) instead of the default 4-DoF position solve + "
+        "WristClutch direct wrist fill",
+    )
+    ap.add_argument(
         "--wrist-scale",
         type=float,
         default=1.0,
@@ -281,6 +290,7 @@ def main() -> int:
         wrist_slew_rad_s=args.wrist_slew,
         wrist_pi_guard_rad=args.wrist_pi_guard,
         waist_stand=args.waist_stand,
+        full_pose_ik=args.full_pose_ik,
     )
     # trunk keep-out from the REAL model silhouette (d is still at the
     # neutral pose build_model + mj_forward left it in)
@@ -295,8 +305,8 @@ def main() -> int:
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
         f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}, "
-        # which solver + which DoF split produced this run (the harness has no
-        # flag for either: full_pose_ik is the shipped default now)
+        # which solver + which DoF split produced this run (--full-pose-ik
+        # opts into 7-DoF; the shipped default is the 4-DoF split)
         f"arm IK {arms['right'].backend}/{'7-DoF' if arms['right'].full_pose_ik else '4-DoF'}"
     )
 

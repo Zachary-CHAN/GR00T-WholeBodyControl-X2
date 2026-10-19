@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
-"""v3 incremental upper-body teleop chain -- wrist SOLVED by the IK again.
+"""v3 incremental upper-body teleop chain -- 4-DoF arm IK + direct wrist fill.
 
 Same skeleton as v2 (``incremental_chain.py``): grip clutch, dual
 anchoring, torso keep-out sandwich, reach sphere, target slew, freeze
-guard, pose LPF. Deliberate changes (user decisions, 2026-10-15):
+guard, pose LPF. Deliberate changes:
 
 1. SMPL channel CLOSED: no ``smpl_joints`` consumption, no TorsoFrame /
    WaistYawChain -- the waist joints hold a fixed stand value.
-2. Arm IK = the FULL 7-DoF pose IK (``full_pose_ik=True``, the default):
-   position AND orientation go to ``solver.solve`` exactly as in the v2
-   step, and all three wrist joints are solved rather than scripted. The
-   v3 "wrist out of the IK" split is retired -- it bought a controller
-   that could not command hand orientation at all.
-
-   ``full_pose_ik=False`` restores it as an explicit switch, for
-   comparison and for the wrist-mapping self-tests: position-only DLS
-   over the shoulder-3 + elbow joints
-   (``ArmIKSolver.solve_position_free4``); the three wrist joints are
-   LOCKED at the wrist command and ride along in the FK (they move the
-   solved point -- the spherical wrist centre -- by at most 0.98 mm, so
-   the 4-DoF solve re-runs against the CURRENT wrist command every tick
-   to keep its sub-mm residual honest). The wrist itself then follows the
-   v1 recipe: per-axis mapping of the controller quaternion
-   differential, anchored at engage:
+2. Arm IK = the v1-style 4-DoF split (``full_pose_ik=False``, the
+   default): position-only DLS/QP over the shoulder-3 + elbow joints
+   (``ArmIKSolver.solve_position_free4`` / ``MinkArmIK.solve_position_free4``);
+   the three wrist joints are LOCKED at the WristClutch command and ride
+   along in the FK (they move the solved point -- the spherical wrist
+   centre -- by at most 0.98 mm, so the 4-DoF solve re-runs against the
+   CURRENT wrist command every tick to keep its sub-mm residual honest).
+   The wrist itself follows the v1 recipe: per-axis mapping of the
+   controller quaternion differential, anchored at engage:
        delta = a_op_inv * R_now                    (body-frame diff)
        d     = W_a^-1 * delta * W_a                (conjugation into the
                                                     wrist-anchor frame --
@@ -32,10 +25,12 @@ guard, pose LPF. Deliberate changes (user decisions, 2026-10-15):
    The ZYX decomposition matches the wrist chain Rz->Ry->Rx exactly;
    constant grasp offsets cancel under the anchored conjugation, leaving
    only per-axis mirror signs (env/CLI knobs, tape-verified before robot).
-   ``WristClutch.step`` is called every tick on BOTH paths -- on the
-   full-pose path its command is telemetry only (record columns 49:61),
-   and keeping it running means the wrist mapping is warm and comparable
-   if the switch is flipped mid-session.
+
+   ``full_pose_ik=True`` is an explicit opt-in alternative: the FULL
+   7-DoF pose IK (position AND orientation tasks, both gains 1.0 -- equal
+   weighting) solves the wrist too. ``WristClutch.step`` still runs every
+   tick on both paths; on the full-pose path its command is telemetry only
+   (record columns 49:61).
 3. HAND INVERTED: ``r = hand`` -- the hand is OPEN at rest and CLOSES when
    the TRIGGER is pressed (v2 was the opposite). ``hand`` is the LPF'd raw
    trigger; the GRIP now drives the per-arm clutch (2026-10 role swap; the
@@ -197,20 +192,23 @@ class WristClutch:
 
 
 class ClutchArmV3(ClutchArm):
-    """v2's ClutchArm, with the v3 wrist split now RETIRED by default.
+    """v2's ClutchArm, with the v1-style 4-DoF split as the default.
 
     Everything positional (anchoring, keep-out sandwich, reach sphere,
     target slew, freeze guard via ``_gate_q_new``) is inherited from v2 on
     both paths.
 
-    ``full_pose_ik=True`` (the default) is v2's own 6-DoF target path: the
+    ``full_pose_ik=False`` (the default) is the v1-style split:
+    ``solve_position_free4`` over shoulder-3 + elbow, with the wrist pinned
+    to the WristClutch command. The wrist mapping is computed FIRST in the
+    tick so the same tick's IK already compensates the wrist_yaw
+    end-effector lever. There is no orientation task on this path -- the
+    wrist mapping owns orientation -- so its rotation weight is 0.
+
+    ``full_pose_ik=True`` opts into v2's full-pose target path: the
     controller's pose drives position AND orientation through the IK, so the
-    wrist joints are solved rather than scripted. ``full_pose_ik=False``
-    keeps the old 4-DoF split alive -- ``solve_position_free4`` with the
-    wrist pinned to the WristClutch command, computed FIRST in the tick so
-    the same tick's IK already compensates the wrist_yaw end-effector lever.
-    It is what the wrist-mapping self-tests exercise and what the 4-DoF
-    checks pin; it is no longer what ``--wire`` runs.
+    wrist joints are solved rather than scripted. Position and rotation task
+    gains are both 1.0 on this path (equal weighting).
 
     The WristClutch is stepped every tick on both paths: on the 4-DoF path it
     IS the wrist command, on the full-pose path it is telemetry (columns
@@ -222,12 +220,17 @@ class ClutchArmV3(ClutchArm):
         wrist_signs = kwargs.pop("wrist_signs", None)
         wrist_slew = kwargs.pop("wrist_slew_rad_s", 6.0)
         wrist_pi_guard = kwargs.pop("wrist_pi_guard_rad", 2.94)
-        self.full_pose_ik = bool(kwargs.pop("full_pose_ik", True))
+        self.full_pose_ik = bool(kwargs.pop("full_pose_ik", False))
         if not self.full_pose_ik:
             # the 4-DoF path: position-only IK regardless of what v2 would
             # default to, because the orientation task moved to the wrist
-            # mapping there
-            kwargs.setdefault("rotation_weight", 0.0)
+            # mapping there. Force it even if a caller passed a weight.
+            kwargs["rotation_weight"] = 0.0
+        else:
+            # equal weighting: position and orientation are both first-class
+            # on the opt-in full-pose path (the 4-DoF default has no
+            # orientation task at all -- WristClutch owns it)
+            kwargs.setdefault("rotation_weight", 1.0)
         super().__init__(side, position_scale, *args, **kwargs)
         if wrist_signs is None:
             signs = None
@@ -330,7 +333,8 @@ class IncrementalTeleopTickerV3:
 
     Ordering mirrors v2 minus the SMPL consumers:
         freshness -> grip + trigger LPF -> pose LPF -> engage/disengage ->
-        per-arm [wrist mapping (telemetry) -> 7-DoF pose IK].
+        per-arm [wrist mapping -> 4-DoF position IK] (or, with
+        ``full_pose_ik=True``, [wrist mapping telemetry -> 7-DoF pose IK]).
 
     ``smpl_joints`` in the frame is IGNORED (decision 1); the waist is a
     constant ``waist_stand``. Stale frame -> triggers/grips read 0 (arms
@@ -356,7 +360,8 @@ class IncrementalTeleopTickerV3:
         wrist_slew_rad_s: float = 6.0,
         wrist_pi_guard_rad: float = 2.94,
         waist_stand: float = 0.0,
-        full_pose_ik: bool = True,
+        rotation_weight: float = 1.0,
+        full_pose_ik: bool = False,
         backend: str | None = None,
     ) -> None:
         self.dt = float(dt)
@@ -376,6 +381,7 @@ class IncrementalTeleopTickerV3:
                 wrist_signs={s: signs[s] for s in ("left", "right")},
                 wrist_slew_rad_s=wrist_slew_rad_s,
                 wrist_pi_guard_rad=wrist_pi_guard_rad,
+                rotation_weight=rotation_weight,
                 full_pose_ik=full_pose_ik,
                 backend=backend,
             )
@@ -506,7 +512,7 @@ def check_wrist_single_axis_direction() -> None:
     flip must flip the output.
 
     ``full_pose_ik=False`` on purpose: this pins the WristClutch mapping,
-    which only IS the wrist on the 4-DoF path. On the shipped full-pose
+    which only IS the wrist on the 4-DoF path. On the opt-in full-pose
     path the clutch command is telemetry and the wrist is whatever the IK
     solved -- see check_full_pose_ik_tracks_orientation for that path."""
     axes = (("z", 0), ("y", 1), ("x", 2))  # (rot axis, wrist index)
@@ -727,11 +733,11 @@ def check_ik_freeze_guard_v3() -> None:
 
 
 def check_torso_keepout_v3() -> None:
-    """The inherited keep-out sandwich still holds with the 7-DoF solve
-    (the block was copied into ClutchArmV3.step, and it acts on the TARGET,
-    so the extra wrist DoF cannot route around it): a cross-body sweep
-    slides along the surface, latches past the limit, and resumes on
-    pullback. Scenario identical to v2's check_torso_keepout."""
+    """The inherited keep-out sandwich still holds with the default 4-DoF
+    solve (the block was copied into ClutchArmV3.step, and it acts on the
+    TARGET, so the wrist being scripted cannot route around it): a
+    cross-body sweep slides along the surface, latches past the limit, and
+    resumes on pullback. Scenario identical to v2's check_torso_keepout."""
     keepout = TORSO_KEEPOUT["right"]
     cx, cy, a_ax, b_front, b_back, _zlo, _zhi = keepout
     arm = ClutchArmV3(
@@ -861,10 +867,10 @@ def check_grip_stale_open() -> None:
 def _full_pose_drive(side: str, axis: str, deg: float, ticks: int = 200):
     """Anchor at neutral, then command one controller rotation for `ticks`.
 
-    Returns (arm, pose, R_target, p_target, q_trace). Pure -- the shipped
+    Returns (arm, pose, R_target, p_target, q_trace). Pure -- the opt-in
     ``full_pose_ik=True`` path, no monkeypatching.
     """
-    arm = ClutchArmV3(side)
+    arm = ClutchArmV3(side, full_pose_ik=True)
     pose = np.zeros(7)
     pose[3] = 1.0
     p0, R0 = arm.solver.fk(arm.q)
@@ -881,10 +887,11 @@ def _ee_rot_err_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
 
 
 def check_full_pose_ik_tracks_orientation() -> None:
-    """The shipped 7-DoF path: the hand does what the operator's wrist does.
+    """The opt-in 7-DoF path: the hand does what the operator's wrist does.
 
-    The thing the retired v3 split could not do at all. Two halves, both on
-    the default ``full_pose_ik=True``, both on the right arm:
+    The thing the default 4-DoF split does not do (there the wrist is
+    scripted by WristClutch). Two halves, both on
+    ``full_pose_ik=True``, both on the right arm:
 
     (1) A 90 deg yaw of the controller, held at a fixed position: the
         end-effector rotation must land within 3 deg of the commanded one
@@ -893,12 +900,15 @@ def check_full_pose_ik_tracks_orientation() -> None:
         chain (anchor -> target synthesis -> clip), not a solver figure.
     (2) A 60 deg pitch, which PINS ``wrist_pitch`` at its +0.558 rad
         bound: the unsaturated rotation residual must be left standing
-        (bounded, ~26 deg) instead of being bought with position. Position
-        stays within 5 mm -- the measured reason joint ranges are a
-        post-step clip and not a QP constraint (handing them to
-        ``ConfigurationLimit`` cost 50.9 mm here; see the x2_arm_mink
-        module docstring). The last 20 ticks must also be settled, not
-        grinding against the bound.
+        (bounded, ~11.8 deg) instead of being bought with position. Both
+        task gains are 1.0 on this path (equal weighting by design), so the
+        saturated residual is split between the two tasks instead of the
+        rotation giving way to position: measured ~12.2 mm (mink) / 12.5 mm
+        (dls) of position error against ~11.8 deg of rotation residual. The
+        20 mm gate is a regression guard on that split, well above the
+        measurement and far below the 50.9 mm ``ConfigurationLimit`` failure
+        mode (see the x2_arm_mink module docstring). The last 20 ticks must
+        also be settled, not grinding against the bound.
 
     and in both halves every tick must keep q inside
     ``X2_ARM_JOINT_LIMITS_RAD`` -- the end-to-end statement of "the limits
@@ -930,9 +940,9 @@ def check_full_pose_ik_tracks_orientation() -> None:
     rot_err = _ee_rot_err_deg(R_t, R)
     assert rot_err < 35.0, f"rotation residual must stay bounded, got {rot_err:.2f} deg"
     pos_err = float(np.linalg.norm(p - p_t))
-    assert pos_err < 0.005, (
-        f"position sacrificed for a saturated rotation: {pos_err * 1e3:.1f} mm "
-        "(this is the ConfigurationLimit failure mode)"
+    assert pos_err < 0.020, (
+        f"equal-weight saturated split leaked position: {pos_err * 1e3:.1f} mm "
+        "(measured ~12 mm; the ConfigurationLimit failure mode is ~51 mm)"
     )
     settled = float(np.max(np.abs(trace[-1] - trace[-20])))
     assert settled < 0.02, f"grinding against the bound: {settled:.4f} rad over 20 ticks"
@@ -990,6 +1000,27 @@ def check_trigger_hand_grip_clutch() -> None:
         assert np.all(np.isfinite(q)), f"{side} arm produced a non-finite command"
 
 
+def check_default_4dof_and_equal_full_pose_weights() -> None:
+    """Pin the split/weight contract requested for v3:
+
+    * the shipped default is the v1-style 4-DoF position solve + WristClutch
+      direct fill, so both arms report ``full_pose_ik=False`` and the solver
+      carries no orientation weight (WristClutch owns orientation);
+    * the opt-in full-pose path weights position and rotation equally (1.0 /
+      1.0), instead of the historical 1.0 / 0.5.
+    """
+    tick = IncrementalTeleopTickerV3()
+    for side, arm in tick.arms.items():
+        assert not arm.full_pose_ik, f"{side}: default must be the 4-DoF split"
+        assert (
+            arm.solver.rotation_weight == 0.0
+        ), f"{side}: 4-DoF path must not carry an orientation task weight"
+    full = ClutchArmV3("left", full_pose_ik=True)
+    assert full.full_pose_ik
+    assert full.solver.position_weight == 1.0
+    assert full.solver.rotation_weight == 1.0, "full-pose path must weight position == rotation"
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -1006,6 +1037,7 @@ CHECKS = [
     # indexes CHAIN_V3_CHECKS by position
     ("full_pose_ik_tracks_orientation", check_full_pose_ik_tracks_orientation),
     ("trigger_hand_grip_clutch", check_trigger_hand_grip_clutch),
+    ("default_4dof_equal_full_pose_weights", check_default_4dof_and_equal_full_pose_weights),
 ]
 
 

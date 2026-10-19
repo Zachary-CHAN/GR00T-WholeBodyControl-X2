@@ -65,6 +65,10 @@ def test_trigger_hand_grip_clutch():
     a3.CHAIN_V3_CHECKS[12][1]()
 
 
+def test_default_4dof_and_equal_full_pose_weights():
+    a3.CHAIN_V3_CHECKS[13][1]()
+
+
 def test_wire_roundtrip():
     a3.check_wire_roundtrip()
 
