@@ -434,7 +434,7 @@ class IncrementalTeleopTickerV3:
         rotation_weight: float = 1.0,
         full_pose_ik: bool = False,
         backend: str | None = None,
-        ctrl_lever: tuple | None = None,
+        ctrl_lever: tuple | dict | None = None,
         position_deadband_m: float = 0.003,
         posture_gain: float = 0.01,
     ) -> None:
@@ -444,11 +444,16 @@ class IncrementalTeleopTickerV3:
         self.stale_grip_close = bool(stale_grip_close)
         self.grip_tau = float(grip_tau)
         self.waist_stand = float(waist_stand)
-        self.ctrl_lever = (
-            np.zeros(3, np.float64)
-            if ctrl_lever is None
-            else np.asarray(ctrl_lever, np.float64).reshape(3)
-        )
+        # A single 3-vector applies to both arms; a {"left": v, "right": v}
+        # mapping calibrates them separately. The two controllers are held at
+        # different orientations in the body frame, so a real fit differs by
+        # tens of millimetres between hands (see
+        # tools/fit_pico_ctrl_lever.py and PICO_LIVE_TELEOP_PITFALLS.md §9).
+        self.ctrl_levers = self._normalize_ctrl_levers(ctrl_lever)
+        # Legacy single-vector view. It is exactly the left arm's lever; the
+        # per-side mapping above is authoritative. Kept for callers written
+        # before per-hand calibration existed.
+        self.ctrl_lever = self.ctrl_levers["left"]
         self.full_pose_ik = bool(full_pose_ik)
         # The deadband and posture term ship on the 4-DoF default path; the
         # opt-in full-pose path keeps its pre-A/B/C behavior (see
@@ -469,7 +474,7 @@ class IncrementalTeleopTickerV3:
                 rotation_weight=rotation_weight,
                 full_pose_ik=full_pose_ik,
                 backend=backend,
-                ctrl_lever=self.ctrl_lever,
+                ctrl_lever=self.ctrl_levers[side],
                 position_deadband_m=self.position_deadband_m,
                 posture_gain=self.posture_gain,
             )
@@ -480,6 +485,30 @@ class IncrementalTeleopTickerV3:
         # hand_f: LPF'd wire trigger, the OmniHand drive (v3 ratio = hand_f).
         self.grip_f = {"l": 0.0, "r": 0.0}
         self.hand_f = {"l": 0.0, "r": 0.0}
+
+    @staticmethod
+    def _normalize_ctrl_levers(ctrl_lever: tuple | dict | None) -> dict[str, np.ndarray]:
+        """Resolve the requested controller lever to one vector per side.
+
+        ``None`` / a 3-vector is the common case (both arms). A mapping lets
+        the two hands carry the vectors their own calibration produced; a
+        missing side keeps the legacy zero (no compensation) rather than
+        silently borrowing the other hand's vector, which they do NOT share.
+        """
+        if ctrl_lever is None:
+            return {side: np.zeros(3, np.float64) for side in ("left", "right")}
+        if isinstance(ctrl_lever, dict):
+            unknown = set(ctrl_lever) - {"left", "right"}
+            if unknown:
+                raise ValueError(
+                    f"ctrl_lever: unknown side(s) {sorted(unknown)}; use 'left'/'right'"
+                )
+            return {
+                side: np.asarray(ctrl_lever.get(side, (0.0, 0.0, 0.0)), np.float64).reshape(3)
+                for side in ("left", "right")
+            }
+        v = np.asarray(ctrl_lever, np.float64).reshape(3)
+        return {"left": v.copy(), "right": v.copy()}
 
     def step(self, frame, now: float | None = None) -> dict:
         now = time.monotonic() if now is None else now
@@ -1131,7 +1160,9 @@ def check_ctrl_lever_pure_wrist_rotation() -> None:
     "human shoulder/elbow still, wrist rotates" motion from the live report.
     With ``--ctrl-lever = r_true`` the compensated target is invariant; with
     the legacy estimate (0,0,0) it sweeps by centimetres -- the non-vacuity
-    control that shows this check can fail.
+    control that shows this check can fail. Also pins the per-side routing:
+    a single vector feeds both arms, a mapping keeps the two calibrated
+    levers apart (they differ by tens of mm in practice).
     """
     r_true = np.array([0.0, 0.02, 0.09])
     R0 = sRot.from_euler("ZYX", [0.4, -0.3, 0.2])
@@ -1184,6 +1215,21 @@ def check_ctrl_lever_pure_wrist_rotation() -> None:
         f"legacy upstream joints barely moved ({np.degrees(legacy_q):.1f} deg); "
         "the drift assertion would be vacuous"
     )
+    # Per-side routing. The controllers are not held in mirrored body-frame
+    # orientations, so the fitted vectors differ (the live fit was
+    # +55.5 mm vs -4.6 mm in x); handing one arm the other's vector would
+    # leave a ~60 mm error that this feature exists to remove.
+    other = np.array([-0.01, -0.03, 0.07])
+    paired = IncrementalTeleopTickerV3(ctrl_lever={"left": r_true, "right": other})
+    assert np.allclose(paired.arms["left"].ctrl_lever, r_true)
+    assert np.allclose(
+        paired.arms["right"].ctrl_lever, other
+    ), "per-side ctrl_lever was not routed to the right arm"
+    common = IncrementalTeleopTickerV3(ctrl_lever=r_true)
+    assert np.allclose(common.arms["left"].ctrl_lever, r_true)
+    assert np.allclose(
+        common.arms["right"].ctrl_lever, r_true
+    ), "a single ctrl_lever must apply to both arms"
 
 
 def check_position_deadband() -> None:

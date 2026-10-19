@@ -157,7 +157,7 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
-| `--ctrl-lever X Y Z` | `0 0 0` | 控制器坐标系下的「控制器原点 → 腕心」杠杆（m）。`W = C - R_c @ r_c`，锚点同样扣除；纯腕转时补偿后的目标保持不动。默认 0 = 旧行为，**必须按 [`PICO_LIVE_TELEOP_PITFALLS.md`](PICO_LIVE_TELEOP_PITFALLS.md) §9 标定后再填** |
+| `--ctrl-lever X Y Z`（`--ctrl-lever-left/right` 覆盖单侧） | `0 0 0` | 控制器坐标系下的「控制器原点 → 腕心」杠杆（m）。`W = C - R_c @ r_c`，锚点同样扣除；纯腕转时补偿后的目标保持不动。默认 0 = 旧行为，**必须按 [`PICO_LIVE_TELEOP_PITFALLS.md`](PICO_LIVE_TELEOP_PITFALLS.md) §9 标定后再填**；左右手柄握持方向不同，向量也不同，分别用单侧旗标传入 |
 | `--position-deadband-mm` | `3.0` | 对补偿后的平移做软径向死区：`d -> d * max(0, 1 - r / |d|)`；半径内目标=锚点，半径外斜率 1（输出 `|d|-r`）。压手抖/重锚漂移，不改变真实位移的增益 |
 | `--posture-gain` | `0.01` | 4-DoF 路径的零空间姿态正则：mink 是 `PostureTask` 的 cost，DLS 是 `(I - pinv(J)J)` 精确投影上的增益。目标在 engage 时设为当时的 `q`，只选肩-腕连线上的肘部 swivel，不动腕点 |
 
@@ -166,8 +166,8 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 把它推过线；7-DoF 的零空间姿态是另一次迁移。`--ctrl-lever` 两条路径都用。
 
 自检：`CHAIN_V3_CHECKS` 末尾新增 `ctrl_lever_pure_wrist_rotation`（合成「腕心不动、
-控制器原点随姿态画弧」，断言补偿后目标 < 1e-6 m 且 q[:4] 漂移 < 0.01 rad）、
-`position_deadband`、`posture_gain_null_space`（mink/DLS 都跑）。
+控制器原点随姿态画弧」，断言补偿后目标 < 1e-6 m 且 q[:4] 漂移 < 0.01 rad；同时
+断言单侧向量按臂路由）、`position_deadband`、`posture_gain_null_space`（mink/DLS 都跑）。
 
 > **真机（PC2）仍跑 DLS**：mink / mujoco 没有、也不该被推到 Jetson
 > （`gear_sonic[teleop]` 里没有 mink，`gear_sonic[sim]` 里才有）。所以

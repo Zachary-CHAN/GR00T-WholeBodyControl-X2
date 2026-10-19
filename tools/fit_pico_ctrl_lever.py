@@ -9,8 +9,8 @@ controller body frame::
 
 so with a STATIONARY wrist, a wrist-only rotation sweeps ``C`` on the lever
 arc and the v3 position target chases it -- the "shoulder/elbow moves while
-only my wrist turns" symptom. ``arm_teleop_v3_mujoco.py --ctrl-lever X Y Z``
-removes exactly that term (``W = C - R @ r``).
+only my wrist turns" symptom. ``arm_teleop_v3_mujoco.py --ctrl-lever-left X Y Z``
+(or ``--ctrl-lever-right``) removes exactly that term (``W = C - R @ r``).
 
 This tool estimates ``r`` from the per-tick controller telemetry the v3
 harness records (``--record``):
@@ -32,8 +32,9 @@ check.
 
     .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/v3_live.npz --side left
 
-Then re-run the same wrist-only sweep with the printed ``--ctrl-lever`` and
-confirm the robot's shoulder/elbow stop moving before trusting it live.
+Then re-run the same wrist-only sweep with the printed per-hand
+``--ctrl-lever-left`` / ``--ctrl-lever-right`` and confirm the robot's
+shoulder/elbow stop moving before trusting it live.
 """
 
 from __future__ import annotations
@@ -329,7 +330,8 @@ def main() -> int:
         )
     print()
     print("re-run with:")
-    print("  --ctrl-lever " + " ".join(f"{v:.4f}" for v in fit.lever))
+    print(f"  --ctrl-lever-{args.side} " + " ".join(f"{v:.4f}" for v in fit.lever))
+    print("(fit the other hand separately and pass both flags: the vectors differ)")
     if fit.rms_m > 0.015:
         print(
             "\nWARNING: rms > 15 mm -- the hand was probably translating, not just "

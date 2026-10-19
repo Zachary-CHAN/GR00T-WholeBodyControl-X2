@@ -250,9 +250,9 @@ while time.monotonic() - t0 < 60:
 `tgt = a_rob + scale*(C - a_op)` 把这根弧当成平移，4-DoF IK 只能把位移摊给
 肩/肘。
 
-**修复**：v3 链的 `--ctrl-lever X Y Z`（米，控制器坐标系）做
+**修复**：v3 链的 `--ctrl-lever-left/right X Y Z`（米，控制器坐标系）做
 `W = C - R @ r`，锚点也扣同一项；纯腕转时补偿后的位置目标保持不变。
-默认 `0 0 0` 是旧行为——**必须标定**。
+`--ctrl-lever` 仍是两臂共用的回退值，默认 `0 0 0` 是旧行为——**必须标定**。
 
 **标定步骤**（v3 sim / live wire 模式）：
 
@@ -285,12 +285,15 @@ while time.monotonic() - t0 < 60:
    若报「no ... window」，先用
    `.venv/bin/python -c "import numpy as np; r=np.load('/tmp/lever_fit.npz')['rows']; print(r[:,1].mean(), np.abs(r[:,24:28]).max())"`
    确认 `fresh` 非 0、四元数非 0——否则是 sender/头显没起来，不是动作幅度不够。
-3. 用打印出的 `--ctrl-lever X Y Z` 重跑同一动作，确认 TUI 里
-   `q_left_cmd` 的肩 3 + 肘（record 列 35:39）基本不动，再上真机。
+3. 用打印出的 `--ctrl-lever-left` / `--ctrl-lever-right X Y Z` 重跑同一动作
+   （两侧都传；只传 `--ctrl-lever` 会把同一个向量给两臂，实测左右 x 分量
+   可差 ~60 mm），确认 TUI 里 `q_left_cmd` 的肩 3 + 肘（record 列 35:39）基本不动，
+   再上真机。
 
 **注意**：
 
-- 杠杆是**控制器坐标系**的常向量；左右手柄的握持方向通常不同，分别标定。
+- 杠杆是**控制器坐标系**的常向量；左右手柄的握持方向通常不同，分别标定、
+  分别用 `--ctrl-lever-left/right` 传入。`--ctrl-lever` 只是两臂共用的回退。
 - 旧 record / v4 tape 里的 controller pose 仍是原始控制器原点语义，没有变；
   只有补偿后的目标变了，record 列 0:35 不需要重解释。
 - 补偿后残差（几 mm 的手抖/杠杆误差）再用 `--position-deadband-mm 3` 压掉；

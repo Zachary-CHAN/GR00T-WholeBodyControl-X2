@@ -176,7 +176,26 @@ def main() -> int:
         "controller body frame (W = C - R @ r). Default 0 keeps the raw "
         "controller origin. A pure wrist rotation with a stationary hand "
         "should leave the robot target still; if it sweeps, fit this vector "
-        "(docs/x2/PICO_LIVE_TELEOP_PITFALLS.md)",
+        "(docs/x2/PICO_LIVE_TELEOP_PITFALLS.md). Common default for both "
+        "hands; --ctrl-lever-left/right override it",
+    )
+    ap.add_argument(
+        "--ctrl-lever-left",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="left-hand override of --ctrl-lever (fit each controller "
+        "separately: the two hands are held at different orientations and "
+        "the vectors differ by tens of mm)",
+    )
+    ap.add_argument(
+        "--ctrl-lever-right",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="right-hand override of --ctrl-lever (see --ctrl-lever-left)",
     )
     ap.add_argument(
         "--position-deadband-mm",
@@ -305,6 +324,9 @@ def main() -> int:
             args.wrist_roll_sign_r,
         ),
     }
+    ctrl_levers = {
+        side: getattr(args, f"ctrl_lever_{side}") or args.ctrl_lever for side in ("left", "right")
+    }
     ticker = IncrementalTeleopTickerV3(
         position_scale=args.position_scale,
         target_slew_m_s=args.target_slew,
@@ -318,7 +340,7 @@ def main() -> int:
         wrist_pi_guard_rad=args.wrist_pi_guard,
         waist_stand=args.waist_stand,
         full_pose_ik=args.full_pose_ik,
-        ctrl_lever=tuple(args.ctrl_lever),
+        ctrl_lever=ctrl_levers,
         position_deadband_m=args.position_deadband_mm * 1e-3,
         posture_gain=args.posture_gain,
     )
@@ -334,7 +356,8 @@ def main() -> int:
         f"{args.trigger_thresh} engages, trigger drives the hands, "
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
-        f"ctrl lever {tuple(np.round(ticker.ctrl_lever, 4))}m, "
+        f"ctrl lever L{tuple(np.round(ticker.ctrl_levers['left'], 4))} "
+        f"R{tuple(np.round(ticker.ctrl_levers['right'], 4))}m, "
         f"deadband {ticker.position_deadband_m * 1e3:.1f}mm, "
         f"posture {ticker.posture_gain:g}, "
         f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}, "
