@@ -61,6 +61,10 @@ def test_grip_stale_open():
     a3.CHAIN_V3_CHECKS[10][1]()
 
 
+def test_trigger_hand_grip_clutch():
+    a3.CHAIN_V3_CHECKS[12][1]()
+
+
 def test_wire_roundtrip():
     a3.check_wire_roundtrip()
 

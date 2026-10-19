@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """v3 incremental upper-body teleop chain -- wrist SOLVED by the IK again.
 
-Same skeleton as v2 (``incremental_chain.py``): trigger clutch, dual
+Same skeleton as v2 (``incremental_chain.py``): grip clutch, dual
 anchoring, torso keep-out sandwich, reach sphere, target slew, freeze
 guard, pose LPF. Deliberate changes (user decisions, 2026-10-15):
 
@@ -36,12 +36,13 @@ guard, pose LPF. Deliberate changes (user decisions, 2026-10-15):
    full-pose path its command is telemetry only (record columns 49:61),
    and keeping it running means the wrist mapping is warm and comparable
    if the switch is flipped mid-session.
-3. GRIP INVERTED: ``r = g`` -- the hand is OPEN at rest and CLOSES when
-   the grip button is pressed (v2 was the opposite). SAFETY SEMANTIC
-   CHANGE: a stale/dropped frame now OPENS the hands (v2 closed them).
-   If holding an object through a dropout matters more, pass
-   ``stale_grip_close=True`` (--stale-grip-close) to keep the last
-   filtered grip instead.
+3. HAND INVERTED: ``r = hand`` -- the hand is OPEN at rest and CLOSES when
+   the TRIGGER is pressed (v2 was the opposite). ``hand`` is the LPF'd raw
+   trigger; the GRIP now drives the per-arm clutch (2026-10 role swap; the
+   constant / CLI names are historical). SAFETY SEMANTIC CHANGE: a
+   stale/dropped frame now OPENS the hands (v2 closed them). If holding an
+   object through a dropout matters more, pass ``stale_grip_close=True``
+   (--stale-grip-close) to keep the last filtered trigger instead.
 
 Like the v2 chain this module imports no mujoco / rclpy / ROS: the
 robot node ships it flat next to ``incremental_chain.py`` and
@@ -328,14 +329,15 @@ class IncrementalTeleopTickerV3:
     """One 50 Hz tick of the v3 teleop, frame-in / commands-out.
 
     Ordering mirrors v2 minus the SMPL consumers:
-        freshness -> grip LPF -> pose LPF -> engage/disengage -> per-arm
-        [wrist mapping (telemetry) -> 7-DoF pose IK].
+        freshness -> grip + trigger LPF -> pose LPF -> engage/disengage ->
+        per-arm [wrist mapping (telemetry) -> 7-DoF pose IK].
 
     ``smpl_joints`` in the frame is IGNORED (decision 1); the waist is a
-    constant ``waist_stand``. Stale frame -> triggers read 0 (arms freeze)
-    and, by default, the filtered grip goes to 0 = hands OPEN (see the
-    module docstring: this is the inverted-grip safety semantic; pass
-    ``stale_grip_close=True`` to hold the last grip instead).
+    constant ``waist_stand``. Stale frame -> triggers/grips read 0 (arms
+    freeze) and, by default, the filtered hand channel (trigger) goes to
+    0 = hands OPEN (see the module docstring: this is the inverted-hand
+    safety semantic; pass ``stale_grip_close=True`` to hold the last
+    filtered trigger instead).
     """
 
     def __init__(
@@ -380,7 +382,10 @@ class IncrementalTeleopTickerV3:
             for side in ("left", "right")
         }
         self.lpfs = {"left": PoseLpf(input_tau), "right": PoseLpf(input_tau)}
+        # grip_f: LPF'd wire grip, the clutch decision (recorded in cols 4/5).
+        # hand_f: LPF'd wire trigger, the OmniHand drive (v3 ratio = hand_f).
         self.grip_f = {"l": 0.0, "r": 0.0}
+        self.hand_f = {"l": 0.0, "r": 0.0}
 
     def step(self, frame, now: float | None = None) -> dict:
         now = time.monotonic() if now is None else now
@@ -392,13 +397,19 @@ class IncrementalTeleopTickerV3:
             lg, rg = (float(x) for x in frame.get("grip", (0.0, 0.0)))
             lcp = np.asarray(frame.get("lctrl_pose", zero7), np.float64)
             rcp = np.asarray(frame.get("rctrl_pose", zero7), np.float64)
+            # Role swap (2026-10): trigger -> hands (hand_f), grip -> clutch
+            # (grip_f). Both one-pole LPFs; held uses grip_f, which is also
+            # the recorded clutch channel (cols 4/5), so it stays diagnosable.
             a = dt / (self.grip_tau + dt)
+            self.hand_f["l"] += a * (lt - self.hand_f["l"])
+            self.hand_f["r"] += a * (rt - self.hand_f["r"])
             self.grip_f["l"] += a * (lg - self.grip_f["l"])
             self.grip_f["r"] += a * (rg - self.grip_f["r"])
         else:
             lt = rt = lg = rg = 0.0
             if not self.stale_grip_close:  # v3 default: stale -> hands OPEN
                 self.grip_f["l"] = self.grip_f["r"] = 0.0
+                self.hand_f["l"] = self.hand_f["r"] = 0.0
             lcp = rcp = zero7
             self.lpfs["left"].reset()
             self.lpfs["right"].reset()
@@ -410,8 +421,8 @@ class IncrementalTeleopTickerV3:
         else:
             lcp_pre_lpf = rcp_pre_lpf = np.zeros(7)
         held = {
-            "left": fresh and lt > self.trigger_thresh,
-            "right": fresh and rt > self.trigger_thresh,
+            "left": fresh and self.grip_f["l"] > self.trigger_thresh,
+            "right": fresh and self.grip_f["r"] > self.trigger_thresh,
         }
         ctrl = {"left": lcp, "right": rcp}
         for side, arm in self.arms.items():
@@ -428,6 +439,7 @@ class IncrementalTeleopTickerV3:
             "rt": rt,
             "grip_raw": {"l": lg, "r": rg},
             "grip": dict(self.grip_f),
+            "hand": dict(self.hand_f),
             "held": held,
             "ctrl_pre": {"left": lcp_pre_lpf, "right": rcp_pre_lpf},
             "ctrl": ctrl,
@@ -794,16 +806,21 @@ def check_waist_fixed_and_smpl_ignored() -> None:
     lcp[3] = 1.0
     lcp[:3] = tick.arms["left"].solver.fk(tick.arms["left"].q)[0]
     base = {
-        "trigger": np.array([0.9, 0.0]),
-        "grip": np.array([0.0, 0.0]),
+        "trigger": np.array([0.0, 0.0]),
+        "grip": np.array([0.9, 0.0]),  # the clutch is the GRIP (2026-10 swap)
         "lctrl_pose": lcp,
         "rctrl_pose": np.zeros(7),
         "t": 100.0,
     }
+    # the grip LPF needs several ticks to cross the 0.5 clutch threshold;
+    # one tick would leave grip_f at 0.12 and the SMPL comparison vacuous
+    for k in range(10):
+        tick.step(dict(base, smpl_joints=_pack_j24(_twist_j24(0.0))), now=100.01 + k * DT)
+    assert tick.arms["left"].engaged, "grip warm-up failed to engage the left arm"
     out = {}
     for tag, j24 in (("straight", _twist_j24(0.0)), ("twisted", _twist_j24(25.0))):
         f = dict(base, smpl_joints=_pack_j24(j24))
-        out[tag] = tick.step(f, now=100.01)
+        out[tag] = tick.step(f, now=100.21)
     assert out["straight"]["waist"] == out["twisted"]["waist"] == tick.waist_stand
     for side in ("left", "right"):
         np.testing.assert_array_equal(
@@ -818,27 +835,27 @@ def _pack_j24(j24: np.ndarray) -> np.ndarray:
 
 
 def check_grip_stale_open() -> None:
-    """Stale frame -> grip 0 = hands OPEN (the v3 inverted semantic);
-    --stale-grip-close holds the last filtered grip instead."""
+    """Stale frame -> hand channel 0 = hands OPEN (the v3 inverted semantic);
+    --stale-grip-close holds the last filtered trigger instead. The check
+    name is historical: the hand signal is now the TRIGGER (2026-10 swap)."""
     tick = IncrementalTeleopTickerV3()
     frame = {
-        "trigger": np.array([0.9, 0.9]),
-        "grip": np.array([1.0, 1.0]),
+        "trigger": np.array([1.0, 1.0]),  # the hand channel (2026-10 swap)
+        "grip": np.array([0.9, 0.9]),  # the clutch channel
         "lctrl_pose": np.zeros(7),
         "rctrl_pose": np.zeros(7),
         "smpl_joints": np.zeros(72),
         "t": 100.0,
     }
     tick.step(frame, now=100.01)
-    held = dict(tick.grip_f)
-    assert held["l"] > 0.0, "grip LPF must have started rising"
+    assert tick.hand_f["l"] > 0.0, "trigger LPF must have started rising"
     st = tick.step(frame, now=100.01 + 5.0)  # way past stale_s
     assert not st["fresh"]
-    assert st["grip"]["l"] == 0.0 and st["grip"]["r"] == 0.0, "stale must OPEN the hands"
+    assert st["hand"]["l"] == 0.0 and st["hand"]["r"] == 0.0, "stale must OPEN the hands"
     tick2 = IncrementalTeleopTickerV3(stale_grip_close=True)
     tick2.step(frame, now=100.01)
     st2 = tick2.step(frame, now=100.01 + 5.0)
-    assert st2["grip"]["l"] > 0.0, "--stale-grip-close must hold the last grip"
+    assert st2["hand"]["l"] > 0.0, "--stale-grip-close must hold the last hand"
 
 
 def _full_pose_drive(side: str, axis: str, deg: float, ticks: int = 200):
@@ -921,6 +938,58 @@ def check_full_pose_ik_tracks_orientation() -> None:
     assert settled < 0.02, f"grinding against the bound: {settled:.4f} rad over 20 ticks"
 
 
+def check_trigger_hand_grip_clutch() -> None:
+    """Role contract after the 2026-10 swap: the TRIGGER drives the OmniHand
+    (``hand``) and the GRIP is the per-arm clutch (``held``). The constants
+    and flags kept their historical names; only the signal sources moved.
+
+    Phase A: triggers pressed, grips released -- neither arm may engage while
+    the filtered trigger rises. Phase B: triggers released, grips pressed --
+    both arms engage off the filtered grips and the hand channel decays.
+    """
+    tick = IncrementalTeleopTickerV3()
+    now = 100.0
+
+    def pose_for(side: str) -> np.ndarray:
+        pos, _ = tick.arms[side].solver.fk(tick.arms[side].q)
+        out = np.zeros(7)
+        out[:3] = pos
+        out[3] = 1.0  # unit quat (wxyz): engage() refuses zero placeholders
+        return out
+
+    frame = {
+        "t": now,
+        "trigger": np.array([1.0, 1.0]),
+        "grip": np.array([0.0, 0.0]),
+        "lctrl_pose": pose_for("left"),
+        "rctrl_pose": pose_for("right"),
+    }
+    for _ in range(20):  # 0.4 s: inside stale_s, past the hand LPF rise
+        st = tick.step(frame, now)
+        now += DT
+    assert not any(st["held"].values()), "trigger alone must not engage the clutch"
+    assert not any(arm.engaged for arm in tick.arms.values()), "trigger alone engaged an arm"
+    assert (
+        st["hand"]["l"] > 0.5 and st["hand"]["r"] > 0.5
+    ), f"trigger must drive the hand channel, got {st['hand']}"
+
+    frame["t"] = now
+    frame["trigger"] = np.zeros(2)
+    frame["grip"] = np.ones(2)
+    for _ in range(20):  # 0.4 s: grip LPF rises past the 0.5 threshold
+        st = tick.step(frame, now)
+        now += DT
+    assert st["held"]["left"] and st["held"]["right"], "grip must engage the clutch"
+    assert (
+        tick.arms["left"].engaged and tick.arms["right"].engaged
+    ), "grip > threshold must engage both arms"
+    assert (
+        st["hand"]["l"] < 0.5 and st["hand"]["r"] < 0.5
+    ), f"released trigger must decay the hand channel, got {st['hand']}"
+    for side, q in st["q"].items():
+        assert np.all(np.isfinite(q)), f"{side} arm produced a non-finite command"
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -936,6 +1005,7 @@ CHECKS = [
     # appended, never inserted: gear_sonic/tests/test_arm_teleop_v3.py
     # indexes CHAIN_V3_CHECKS by position
     ("full_pose_ik_tracks_orientation", check_full_pose_ik_tracks_orientation),
+    ("trigger_hand_grip_clutch", check_trigger_hand_grip_clutch),
 ]
 
 

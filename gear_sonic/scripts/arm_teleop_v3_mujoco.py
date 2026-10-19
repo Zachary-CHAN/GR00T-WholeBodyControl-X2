@@ -15,12 +15,14 @@ rotation spreading over the whole arm). v3 changes three things
   wrist_yaw has an ~82 mm EE lever) and driven by a v1-style per-axis
   differential mapping of the controller quaternion (anchored conjugation
   + ZYX split, slew + near-pi guard + joint limits);
-* GRIP INVERTED: the hand is OPEN at rest and CLOSES when the grip
-  button is pressed; a stale frame OPENS the hands (v2 closed them) --
-  --stale-grip-close restores the hold behaviour if that ever matters
-  more than dropping the object.
+* HAND INVERTED: the hand is OPEN at rest and CLOSES when the TRIGGER is
+  pressed (the LPF'd trigger is the hand channel); the GRIP is the per-arm
+  clutch (2026-10 role swap; the constant / flag names are historical).
+  A stale frame OPENS the hands (v2 closed them) -- --stale-grip-close
+  holds the last filtered trigger if that ever matters more than dropping
+  the object.
 
-Everything else (trigger clutch, dual anchors, torso keep-out sandwich,
+Everything else (grip clutch, dual anchors, torso keep-out sandwich,
 reach sphere, target slew, freeze guard, pose LPF, 20x1 ms substeps
 with per-substep tau refresh) is inherited from the v2 chain.
 
@@ -75,10 +77,12 @@ def check_wire_roundtrip() -> None:
 
 
 def check_grip_mapping_v3() -> None:
-    """v3: r = grip DIRECTLY (0 = open at rest, 1 = closed on press) --
+    """v3: r = hand DIRECTLY (0 = open at rest, 1 = closed on press) --
     every mapping in v2's check_grip_mapping is INVERTED here, including
-    the stale path (a stale frame forces grip 0 -> hand OPEN; v2 closed
-    it). See also check_grip_stale_open in the chain module."""
+    the stale path (a stale frame forces hand 0 -> hand OPEN; v2 closed
+    it). The hand signal is now the LPF'd TRIGGER (2026-10 swap); the
+    ratio math itself is unchanged. See also check_grip_stale_open in the
+    chain module (historical name)."""
     for side in ("left", "right"):
         open_q = grasp_command_from_ratio(side, 0.0)
         closed_q = grasp_command_from_ratio(side, 1.0)
@@ -214,8 +218,9 @@ def main() -> int:
     ap.add_argument(
         "--stale-grip-close",
         action="store_true",
-        help="stale frame HOLDS the last grip instead of OPENING the hands "
-        "(v3 default opens: dropping the object beats crushing it uncommanded)",
+        help="stale frame HOLDS the last filtered trigger (the hand channel) "
+        "instead of OPENING the hands (v3 default opens: dropping the object "
+        "beats crushing it uncommanded)",
     )
     ap.add_argument(
         "--hand-collisions",
@@ -285,7 +290,8 @@ def main() -> int:
     rx = IncrementalIntentReceiver(args.intent_port)
     rx.start()
     print(
-        f"[sim] v3 wire mode: SUB :{args.intent_port}; trigger>{args.trigger_thresh} engages, "
+        f"[sim] v3 wire mode: SUB :{args.intent_port}; grip (LPF'd)>"
+        f"{args.trigger_thresh} engages, trigger drives the hands, "
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
         f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}, "
@@ -306,7 +312,8 @@ def main() -> int:
     n_ticks = 0
     # --record: one row per tick, flat float64. Column layout (FIXED --
     # the autopsy tools index it positionally):
-    #   0 t_wall | 1 fresh | 2 lt | 3 rt | 4 grip_l | 5 grip_r | 6 frame_t
+    #   0 t_wall | 1 fresh | 2 lt | 3 rt (raw trigger = hand input)
+    #   4 grip_l | 5 grip_r (LPF'd grip = clutch) | 6 frame_t
     #   7:14  lcp_raw (pos3+quat4) | 14:21  rcp_raw
     #   21:28 lcp_filt | 28:35 rcp_filt
     #   35:42 q_left_cmd | 42:49 q_right_cmd
@@ -329,7 +336,8 @@ def main() -> int:
             st = ticker.step(frame)
             fresh = st["fresh"]
             lt, rt = st["lt"], st["rt"]
-            grip_f = st["grip"]
+            grip_f = st["grip"]  # clutch telemetry (record cols 4/5)
+            hand_f = st["hand"]  # OmniHand drive (v3 polarity: hand)
             ctrl = st["ctrl"]
 
             for side, arm in ticker.arms.items():
@@ -339,14 +347,14 @@ def main() -> int:
                     tgt[n] = (q[i], *tgt[n][1:])
             # waist: NOT driven by the operator -- v3 holds the stand value
             # (hold_targets set it; only --waist-stand ever overrides)
-            # grip v3: r = g -- hand OPEN at rest, CLOSED on press; a stale
-            # frame forces grip 0 -> OPEN (unless --stale-grip-close)
+            # trigger v3: r = hand -- hand OPEN at rest, CLOSED on press; a
+            # stale frame forces hand 0 -> OPEN (unless --stale-grip-close)
             apply = iutm.apply_active_hand_ctrl
             apply(
                 d,
                 layout,
-                left_active=grasp_command_from_ratio("left", np.clip(grip_f["l"], 0.0, 1.0)),
-                right_active=grasp_command_from_ratio("right", np.clip(grip_f["r"], 0.0, 1.0)),
+                left_active=grasp_command_from_ratio("left", np.clip(hand_f["l"], 0.0, 1.0)),
+                right_active=grasp_command_from_ratio("right", np.clip(hand_f["r"], 0.0, 1.0)),
             )
             iutm.pd_and_step(m, d, jm, tgt)
             if rec_rows is not None:
