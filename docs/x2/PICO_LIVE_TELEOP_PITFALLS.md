@@ -264,7 +264,12 @@ while time.monotonic() - t0 < 60:
    ```
    再起 sender（头显已连接、数据 ON），然后开始「腕心尽量不动、只绕腕转
    控制器」的动作，覆盖两个以上转轴、总共 ≥ 60°；太慢可以，但单轴旋转只能
-   辨识垂直于该轴的杠杆分量。最有效的是**把前臂/肘支在桌上**，只让手腕转动：
+   辨识垂直于该轴的杠杆分量。最有效的是**把前臂/肘支在桌上**，只让手腕转动。
+
+   **sender 仍以 body 流为发布门**（`LiveSmplSource` 要
+   `is_body_data_available()` + 新 stamp），所以 v3 链不用 SMPL **不等于**
+   可以只开手柄：头显需 Full body 模式、追踪器已配对并完成校准，否则会一直
+   停在 `Waiting for body stream ...`。`--hand-source off` 不会绕过这个门。
    ```bash
    .venv_teleop/bin/python gear_sonic/scripts/pico_intent_sender.py \
      --pc2-host 127.0.0.1 --intent-port 15573 --hand-source off
