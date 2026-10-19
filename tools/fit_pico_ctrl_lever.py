@@ -18,6 +18,9 @@ harness records (``--record``):
     column 21:24 / 24:28   left  filtered controller pos / quat (w,x,y,z)
     column 28:31 / 31:35   right filtered controller pos / quat
 
+The harness writes ``np.savez_compressed(..., rows=arr, joints=...)``; this
+tool reads the ``rows`` member (a bare ``.npy`` matrix is accepted too).
+
 It slides a window over the record, solves the 6-unknown linear system
 ``[I | R_i] [W; r] = C_i`` per window, and reports the lowest-residual window.
 Need enough rotation inside the window (``--min-sweep-deg``) or the fit is
@@ -34,6 +37,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
+import tempfile
 
 import numpy as np
 from scipy.spatial.transform import Rotation as sRot
@@ -43,6 +48,7 @@ LEFT_POS = 21
 LEFT_QUAT = 24
 RIGHT_POS = 28
 RIGHT_QUAT = 31
+N_COLS = 35  # last column used here is RIGHT_QUAT + 3 = 34
 
 
 @dataclass
@@ -113,6 +119,24 @@ def fit_lever(
     return best
 
 
+def load_rows(path: str | Path) -> np.ndarray:
+    """Load the flat per-tick matrix from a v3 harness ``--record`` file.
+
+    The harness writes ``np.savez_compressed(..., rows=arr, joints=...)``, so
+    ``np.load`` returns an ``NpzFile``, not an array. A bare ``.npy`` matrix
+    is accepted too.
+    """
+    data = np.load(path, allow_pickle=False)
+    if isinstance(data, np.ndarray):
+        return data
+    if "rows" not in data.files:
+        raise SystemExit(
+            f"{path}: no 'rows' array (keys: {data.files}); expected a v3 "
+            "harness --record .npz or a .npy matrix"
+        )
+    return data["rows"]
+
+
 def _self_test() -> None:
     """Synthetic stationary wrist: recover a known lever within 5 mm."""
     rng = np.random.RandomState(0)
@@ -138,6 +162,17 @@ def _self_test() -> None:
         f"{np.round(fit.lever, 5)} vs true {r_true} (err {err * 1e3:.2f} mm), "
         f"rms {fit.rms_m * 1e3:.2f} mm, sweep {np.degrees(fit.sweep_rad):.0f} deg"
     )
+    # The harness record is an npz with a 'rows' member; indexing the NpzFile
+    # directly (the original bug) raises KeyError. Round-trip one here.
+    rows = np.zeros((len(pos), 35), np.float64)
+    rows[:, LEFT_POS : LEFT_POS + 3] = np.asarray(pos)
+    rows[:, LEFT_QUAT : LEFT_QUAT + 4] = np.asarray(quats)
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "record.npz"
+        np.savez_compressed(path, rows=rows, joints=np.array(["x"]))
+        loaded = load_rows(path)
+    assert loaded.shape == rows.shape and np.array_equal(loaded, rows), "record loader round-trip"
+    print("[self-test] record loader: rows member round-trip OK")
 
 
 def main() -> int:
@@ -159,9 +194,17 @@ def main() -> int:
         _self_test()
         return 0
 
-    rec = np.load(args.record)
+    rec = load_rows(args.record)
+    if rec.ndim != 2 or rec.shape[1] < N_COLS:
+        raise SystemExit(f"{args.record}: expected (N, >= {N_COLS}) rows; got {rec.shape}")
     pos_col = LEFT_POS if args.side == "left" else RIGHT_POS
     quat_col = LEFT_QUAT if args.side == "left" else RIGHT_QUAT
+    if not np.any(np.linalg.norm(rec[:, quat_col : quat_col + 4], axis=1) > 1e-6):
+        raise SystemExit(
+            f"{args.record}: {args.side} controller quaternions are all zero. "
+            "A harness-only --record stores no intent frames; start "
+            "pico_intent_sender.py (headset connected) during the recording."
+        )
     fit = fit_lever(
         rec[:, pos_col : pos_col + 3],
         rec[:, quat_col : quat_col + 4],

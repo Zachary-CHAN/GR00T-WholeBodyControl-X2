@@ -256,17 +256,27 @@ while time.monotonic() - t0 < 60:
 
 **标定步骤**（v3 sim / live wire 模式）：
 
-1. 录一段「腕心尽量不动、只绕腕转控制器」的数据，覆盖两个以上转轴、总共
-   ≥ 60°；太慢可以，但单轴旋转只能辨识垂直于该轴的杠杆分量。
+1. **两个终端都要起**。只跑 harness 时 `--record` 里控制器列全是 0
+   （`fresh=0`），拟合会报「no window with >= 20 deg」。先起 harness：
    ```bash
    .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire \
      --record /tmp/lever_fit.npz --no-viewer --duration 30
+   ```
+   再起 sender（头显已连接、数据 ON），然后开始「腕心尽量不动、只绕腕转
+   控制器」的动作，覆盖两个以上转轴、总共 ≥ 60°；太慢可以，但单轴旋转只能
+   辨识垂直于该轴的杠杆分量：
+   ```bash
+   .venv_teleop/bin/python gear_sonic/scripts/pico_intent_sender.py \
+     --pc2-host 127.0.0.1 --intent-port 15573 --hand-source off
    ```
 2. 拟合（滑窗最小二乘，`C_i = W + R_i r`；打印残差）：
    ```bash
    .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/lever_fit.npz --side left
    ```
    `rms > 15 mm` 表示手在平移，杠杆不可信，重录。左右手柄各做一次。
+   若报「no ... window」，先用
+   `.venv/bin/python -c "import numpy as np; r=np.load('/tmp/lever_fit.npz')['rows']; print(r[:,1].mean(), np.abs(r[:,24:28]).max())"`
+   确认 `fresh` 非 0、四元数非 0——否则是 sender/头显没起来，不是动作幅度不够。
 3. 用打印出的 `--ctrl-lever X Y Z` 重跑同一动作，确认 TUI 里
    `q_left_cmd` 的肩 3 + 肘（record 列 35:39）基本不动，再上真机。
 
