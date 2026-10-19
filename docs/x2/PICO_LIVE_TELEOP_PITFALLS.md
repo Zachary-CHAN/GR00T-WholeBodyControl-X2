@@ -264,7 +264,7 @@ while time.monotonic() - t0 < 60:
    ```
    再起 sender（头显已连接、数据 ON），然后开始「腕心尽量不动、只绕腕转
    控制器」的动作，覆盖两个以上转轴、总共 ≥ 60°；太慢可以，但单轴旋转只能
-   辨识垂直于该轴的杠杆分量：
+   辨识垂直于该轴的杠杆分量。最有效的是**把前臂/肘支在桌上**，只让手腕转动：
    ```bash
    .venv_teleop/bin/python gear_sonic/scripts/pico_intent_sender.py \
      --pc2-host 127.0.0.1 --intent-port 15573 --hand-source off
@@ -273,7 +273,10 @@ while time.monotonic() - t0 < 60:
    ```bash
    .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/lever_fit.npz --side left
    ```
-   `rms > 15 mm` 表示手在平移，杠杆不可信，重录。左右手柄各做一次。
+   **RMS 小不等于可信**：手缓慢平移时 6 个未知量仍能拟合出很低的残差。看
+   `window-size stability` 行——同一段数据在 40/50/60 帧窗口下应给出几乎相同的
+   `r`；spread 超过 `max(20 mm, 0.2|r|)`、或 `|r| > 150 mm`（超出正常握持
+   杠杆），都说明手在动，重录。左右手柄各做一次。
    若报「no ... window」，先用
    `.venv/bin/python -c "import numpy as np; r=np.load('/tmp/lever_fit.npz')['rows']; print(r[:,1].mean(), np.abs(r[:,24:28]).max())"`
    确认 `fresh` 非 0、四元数非 0——否则是 sender/头显没起来，不是动作幅度不够。

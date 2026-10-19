@@ -24,8 +24,10 @@ tool reads the ``rows`` member (a bare ``.npy`` matrix is accepted too).
 It slides a window over the record, solves the 6-unknown linear system
 ``[I | R_i] [W; r] = C_i`` per window, and reports the lowest-residual window.
 Need enough rotation inside the window (``--min-sweep-deg``) or the fit is
-under-determined; need a still wrist (low residual) or the translation
-confounds it. Use the residual as the honesty check, not the lever alone.
+under-determined; need a still wrist or the translation confounds it. A low
+residual alone is NOT proof: a slowly translating wrist still fits well with
+a wrong ``r``. The report refits at +/-20% window widths; use that spread
+(and the physical size of ``|r|``) as the honesty check.
 
     .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/v3_live.npz --side left
 
@@ -86,8 +88,12 @@ def fit_lever(
     valid = np.linalg.norm(quats, axis=1) > 1e-6
     if not valid.any():
         return None
-    rots = sRot.from_quat(_quat_wxyz_to_xyzw(quats))
-    mats = rots.as_matrix()
+    # The first frames of a live record are zero placeholders until the
+    # sender's first intent arrives. Build rotations only for the valid rows
+    # (scipy rejects a zero-norm quaternion in the batch) and leave identity
+    # in the placeholders: every window containing one is skipped below.
+    mats = np.tile(np.eye(3), (n, 1, 1))
+    mats[valid] = sRot.from_quat(_quat_wxyz_to_xyzw(quats[valid])).as_matrix()
     eye3 = np.eye(3)
 
     best: LeverFit | None = None
@@ -173,6 +179,45 @@ def _self_test() -> None:
         loaded = load_rows(path)
     assert loaded.shape == rows.shape and np.array_equal(loaded, rows), "record loader round-trip"
     print("[self-test] record loader: rows member round-trip OK")
+    # A live record starts with zero placeholders until the sender's first
+    # intent frame. scipy rejects a zero-norm quaternion in the batch, so the
+    # fit must build rotations from the valid rows only (the second bug).
+    mixed = fit_lever(
+        np.vstack([np.zeros((30, 3)), np.asarray(pos)]),
+        np.vstack([np.zeros((30, 4)), np.asarray(quats)]),
+    )
+    assert mixed is not None, "mixed zero/valid record did not qualify"
+    err_mixed = float(np.linalg.norm(mixed.lever - r_true))
+    assert err_mixed < 0.005, f"mixed-record lever error {err_mixed * 1e3:.2f} mm (> 5 mm)"
+    print("[self-test] mixed zero/valid frames: fit skips placeholders OK")
+
+
+def _window_stability(
+    positions: np.ndarray,
+    quats_wxyz: np.ndarray,
+    window: int,
+    step: int,
+    min_sweep_deg: float,
+) -> list[tuple[int, LeverFit]]:
+    """Refit at -20% / requested / +20% window widths.
+
+    A rigid lever on a still wrist gives the same ``r`` at every width; a
+    translating wrist lets each width absorb a different amount of the
+    translation, which is the failure mode a low RMS alone does not catch.
+    """
+    widths = sorted({max(10, int(round(window * s))) for s in (0.8, 1.0, 1.2)})
+    out: list[tuple[int, LeverFit]] = []
+    for w in widths:
+        f = fit_lever(
+            positions,
+            quats_wxyz,
+            window=w,
+            step=step,
+            min_sweep_deg=min_sweep_deg,
+        )
+        if f is not None:
+            out.append((w, f))
+    return out
 
 
 def main() -> int:
@@ -205,9 +250,11 @@ def main() -> int:
             "A harness-only --record stores no intent frames; start "
             "pico_intent_sender.py (headset connected) during the recording."
         )
+    positions = rec[:, pos_col : pos_col + 3]
+    quats = rec[:, quat_col : quat_col + 4]
     fit = fit_lever(
-        rec[:, pos_col : pos_col + 3],
-        rec[:, quat_col : quat_col + 4],
+        positions,
+        quats,
         window=args.window,
         step=args.step,
         min_sweep_deg=args.min_sweep_deg,
@@ -225,6 +272,32 @@ def main() -> int:
     )
     print(f"lever  {np.round(fit.lever, 5)} m  (|r| {np.linalg.norm(fit.lever) * 1e3:.1f} mm)")
     print(f"wrist  {np.round(fit.wrist, 5)} m  (rough stationary-wrist position)")
+    alts = _window_stability(positions, quats, args.window, args.step, args.min_sweep_deg)
+    if len(alts) >= 2:
+        spread = max(float(np.linalg.norm(f.lever - fit.lever)) for _, f in alts)
+        print(f"window-size stability (spread vs best {spread * 1e3:.1f} mm):")
+        for w, f in alts:
+            d = float(np.linalg.norm(f.lever - fit.lever))
+            print(
+                f"  w={w:3d}  lever {np.round(f.lever, 4)}  "
+                f"(d {d * 1e3:.1f} mm, rms {f.rms_m * 1e3:.2f} mm)"
+            )
+        # 20 mm absolute or 20% of |r|, whichever is larger: a still wrist at
+        # ~90 mm lever reproduces r within a few mm, while a translating one
+        # shifts it by tens of mm as the window width changes.
+        limit = max(0.02, 0.2 * float(np.linalg.norm(fit.lever)))
+        if spread > limit:
+            print(
+                f"WARNING: lever spread > {limit * 1e3:.0f} mm across window widths -- "
+                "the wrist was probably moving, and the low RMS is absorbing that "
+                "translation. Do not trust this vector; re-record with the wrist "
+                "truly still."
+            )
+    if np.linalg.norm(fit.lever) > 0.15:
+        print(
+            "WARNING: |r| > 150 mm is larger than a typical controller-to-wrist "
+            "lever; treat it as translation contamination, not a handle offset."
+        )
     print()
     print("re-run with:")
     print("  --ctrl-lever " + " ".join(f"{v:.4f}" for v in fit.lever))
