@@ -23,6 +23,7 @@ A	docs/x2/F09_mujoco_sim.md	F09 — MuJoCo sim stack — Two launchers, one stac
 A	docs/x2/F10_real_robot_colcon.md	F10 — Real robot: PC2 bring-up, colcon build, push, ritual — The robot side runs on PC2 (Jetson Orin NX, aarch64) under one prefix
 A	docs/x2/F11_docker.md	F11 — Docker test image — `gear_sonic_deploy/docker_x2/` is a ROS 2 Humble + ONNX Runtime + MuJoCo
 A	docs/x2/F12_training_nebius.md	F12 — Training and finetuning on Nebius — Training uses the upstream SONIC trainer (`gear_sonic/train_agent_trl.py`,
+A	docs/x2/MODES_AND_MC_NOTES.md	Code-level analysis notes (2026-10-09): MC version coupling (waistmc tuning), hybrid locomotion+Pico-arms support, WHOLE_BODY vs LOCOMOTION data/control flow table, 31-DOF + floating-base evidence.
 A	docs/x2/PICO_LIVE_TELEOP_PITFALLS.md	Pico live teleop pitfalls (2026-09-30) — The three gates that keep the robot still, the failure signatures, and the hypotheses that were disproved.
 A	docs/x2/README.md	AgiBot X2 Ultra on GEAR-SONIC — runbook index — This directory documents the X2 feature set carried on this branch: gamepad
 A	docs/x2/TRAINING_NOTES.md	Public run history: lineages and GPU-hours of the shipped sets, the reward terms that differ from the SONIC paper and the A/B that would settle them, the traps that cost GPU-hours.
@@ -232,6 +233,7 @@ A	gear_sonic/data_process/validate_pico_corpus.py	Validate a retargeted Pico tel
 A	gear_sonic/envs/manager_env/robots/mapping_utils.py	Generate IsaacLab<->MuJoCo index maps from name lists (never hand-type them).
 A	gear_sonic/envs/manager_env/robots/plant_config.py	Load an X2 actuator plant (armature / effort / PD) from YAML.
 A	gear_sonic/envs/manager_env/robots/x2_ultra.py	Agibot X2 Ultra motor parameters.
+A	gear_sonic/scripts/arm_teleop_v3_mujoco.py	MuJoCo harness v3: v1-style 4-DoF position IK by default (solve_position_free4 over shoulder-3 + elbow; WristClutch directly fills the three wrist joints, v1-style) on the selectable arm IK backend (mink by default); --full-pose-ik opts into the 7-DoF pose IK with position and rotation gains both 1.0; --ctrl-lever X Y Z removes the Pico controller-origin -> operator-wrist lever (W = C - R@r; default 0 = legacy, fit with tools/fit_pico_ctrl_lever.py) and --ctrl-lever-left/right override it per hand (the two controllers are held at different orientations, so the fitted vectors differ), --position-deadband-mm (default 3) and --posture-gain (default 0.01) add the soft radial deadband and 4-DoF null-space posture bias (both disabled on --full-pose-ik to keep its A/B gate); SMPL channel closed (waist fixed), trigger-driven inverted hand (open at rest, closes on press, stale->open) with the grip as the per-arm clutch (2026-10 swap; PC2 flat copy keeps the old roles until synced); the startup banner prints the resolved backend, DoF split and effective A/B/C values; plant functions reused from the v2 harness.
 A	gear_sonic/scripts/bringup_sim.py	Assisted bring-up ("clay-hold") sim battery.
 A	gear_sonic/scripts/build_x2_planner_primitives.py	Build ``x2_planner_primitives.pkl`` from a recipes YAML.
 A	gear_sonic/scripts/check_plant_consistency.py	Assert the THREE copies of the X2 plant agree — yaml, training, MJCF.
@@ -264,6 +266,7 @@ A	gear_sonic/scripts/frozen_core_token_onnx_export.py	Export the TOKEN-INPUT dep
 A	gear_sonic/scripts/g1_onnx_policy_shim.py	Drop-in ``model.policy`` shim that runs the STOCK G1 SONIC ONNX inside the IsaacLab ``im_eval`` vectorized sweep.
 A	gear_sonic/scripts/gen_kplanner_clip.py	Generate a motion clip by driving the PLANNER ONNX with a scripted intent.
 A	gear_sonic/scripts/gen_pico_audio_cues.py	Generate the Pico teleop room-audio cues (gear_sonic/data/audio/cue_<name>.wav).
+A	gear_sonic/scripts/incremental_upper_teleop_mujoco.py	MuJoCo harness v2: clutch-IK incremental arm teleop (grip-held 6-DoF wrist tracking via the selectable arm IK backend (mink QP by default, hand-written DLS as the fallback; the startup banner names the one this run used), trigger->OmniHand, SMPL shoulder-line->waist yaw, head hold) on the composed X2+OmniHand model. 2026-10 swap: the clutch is the LPF'd GRIP, the TRIGGER drives the hands; the PC2 flat copy keeps the old roles until synced.
 A	gear_sonic/scripts/live_pico_smpl_teleop.py	LIVE whole-body Pico teleop -> SONIC smpl encoder -> X2 in MuJoCo.
 A	gear_sonic/scripts/make_g1_lora_warmstart.py	Build the G1-LoRA warm-start checkpoint from the frozen release.
 A	gear_sonic/scripts/native_dual_head_onnx_export.py	Export ONE deploy graph with BOTH reference heads of a native 3-encoder X2 checkpoint ("one SONIC on the robot, both pipelines hot").
@@ -305,10 +308,8 @@ A	gear_sonic/scripts/simstack_pad_drive.py	Scripted gamepad on the planner_cmd w
 A	gear_sonic/scripts/simstack_replay_tape.py	Replay a kplanner intent tape into the LIVE local sim stack (gear_sonic/scripts/simstack_local.sh).
 A	gear_sonic/scripts/simstack_turn.sh	Pad emulator for the local sim stack (gear_sonic/scripts/simstack_local.sh).
 A	gear_sonic/scripts/sonic_motion_token_labeler.py	SONIC motion-token labeler for X2 LeRobot datasets (M6 / Stage C1).
-A	gear_sonic/scripts/vr_operator_calibrate.py	VR operator calibration script.
-A	gear_sonic/scripts/incremental_upper_teleop_mujoco.py	MuJoCo harness v2: clutch-IK incremental arm teleop (grip-held 6-DoF wrist tracking via the selectable arm IK backend (mink QP by default, hand-written DLS as the fallback; the startup banner names the one this run used), trigger->OmniHand, SMPL shoulder-line->waist yaw, head hold) on the composed X2+OmniHand model. 2026-10 swap: the clutch is the LPF'd GRIP, the TRIGGER drives the hands; the PC2 flat copy keeps the old roles until synced.
-A	gear_sonic/scripts/arm_teleop_v3_mujoco.py	MuJoCo harness v3: v1-style 4-DoF position IK by default (solve_position_free4 over shoulder-3 + elbow; WristClutch directly fills the three wrist joints, v1-style) on the selectable arm IK backend (mink by default); --full-pose-ik opts into the 7-DoF pose IK with position and rotation gains both 1.0; --ctrl-lever X Y Z removes the Pico controller-origin -> operator-wrist lever (W = C - R@r; default 0 = legacy, fit with tools/fit_pico_ctrl_lever.py) and --ctrl-lever-left/right override it per hand (the two controllers are held at different orientations, so the fitted vectors differ), --position-deadband-mm (default 3) and --posture-gain (default 0.01) add the soft radial deadband and 4-DoF null-space posture bias (both disabled on --full-pose-ik to keep its A/B gate); SMPL channel closed (waist fixed), trigger-driven inverted hand (open at rest, closes on press, stale->open) with the grip as the per-arm clutch (2026-10 swap; PC2 flat copy keeps the old roles until synced); the startup banner prints the resolved backend, DoF split and effective A/B/C values; plant functions reused from the v2 harness.
 A	gear_sonic/scripts/upper_body_teleop_mujoco.py	MuJoCo harness v1 (Plan D): replays the PC2 analytic-retarget upper-body teleop pipeline against the X2 MJCF (synthetic poses or the real sender wire).
+A	gear_sonic/scripts/vr_operator_calibrate.py	VR operator calibration script.
 A	gear_sonic/scripts/window_motion_pkl.py	Window long motion-lib clips into overlapping sub-clips for kplanner training.
 A	gear_sonic/scripts/x2_gmr_to_motion_lib.py	Stage 2 of tape -> X2: GMR raw retarget npz -> motion-lib pkl (+ render).
 A	gear_sonic/scripts/x2_kplanner.py	Neural kinematic planner daemon for AgiBot X2 Ultra.
@@ -509,8 +510,8 @@ A	gear_sonic_deploy/thirdparty/aimdk_msgs/.gitignore	AgiBot SDK content is fetch
 A	gear_sonic_deploy/thirdparty/aimdk_msgs/README.md	aimdk_msgs (bring your own — from AgiBot's official SDK) — The deploy node and the docker sim image build against AgiBot's `aimdk_msgs
 A	install_scripts/install_quest3.sh	install_quest3.sh Sets up the gear_sonic_teleop venv for Quest 3 VR teleop.
 A	install_scripts/setup_x2.sh	setup_x2.sh — zero-friction setup for the X2 SONIC sim + deploy stacks.
-A	media/x2/x2_training_topology.png	ARCHITECTURE section 6 / F12: training topology diagram (Nebius 32-GPU cluster, shared filesystem, probe, workstation, robot).
 A	media/x2/x2_reference_to_real.gif	README hero: reference motion -> sim -> real X2 (from the project page video).
+A	media/x2/x2_training_topology.png	ARCHITECTURE section 6 / F12: training topology diagram (Nebius 32-GPU cluster, shared filesystem, probe, workstation, robot).
 A	media/x2/x2_vs_g1_gangnam.gif	README: Gangnam-style dance on the X2 (right) next to a stock-SONIC G1 (left).
 A	media/x2/x2_wholebody_teleop.gif	README: live whole-body Pico teleoperation on the X2.
 A	motionbricks/MODEL_REGISTRY.md	Kplanner model registry (X2 planner: vqvae / root / pose) — Why this exists: checkpoints accumulate across training eras in
@@ -568,6 +569,9 @@ A	x2_pc2/start_x2_deploy_ritual.sh	PC2-resident deploy launcher for GAMEPAD RITU
 A	x2_pc2/start_x2_hand_bridge.sh	autogenerated by x2_pc2_daemons.sh for tmux session: x2_hand_bridge regenerated on every 'start'; edit the daemon script, not this file
 A	x2_pc2/start_x2_motor_monitor.sh	autogenerated by x2_pc2_daemons.sh for tmux session: x2_motor_monitor regenerated on every 'start'; edit the daemon script, not this file
 A	x2_pc2/start_x2_pose_watchdog_local.sh	Per-run log stamp.
+A	x2_pc2/v3_upper_teleop/README.md	PC2 runbook for the v3 incremental upper-body node: local self-test + wrist tape, scp/colcon install, live-day command (grip clutch, trigger hand, 4-DoF + WristClutch, fixed waist), 85-column record autopsy, risks and v2 rollback.
+A	x2_pc2/v3_upper_teleop/build_bundle.sh	Builds the flat self-contained PC2 bundle (node + v3 chain + base chain as incremental_chain_v3base.py + DLS IK/FK + HAL tables), py_compiles, smoke-imports, writes SHA256SUMS, optional self-test.
+A	x2_pc2/v3_upper_teleop/incremental_upper_teleop_v3.py	PC2 robot node for the v3 incremental chain: same IncrementalTeleopTickerV3 as the MuJoCo harness, 50 Hz hal arm/waist (+head/leg hold) publishers, dls default, no hand publish, 85-column record with qpos NaN, --self-test/--dry-run.
 A	x2_pc2/x2-camera-bridge.service	Boot service on PC2 (Jetson).
 A	x2_pc2/x2-pad-autopair.service	Paths are the default PC2_PREFIX; x2_pc2/install_pad_autopair_service.sh rewrites them when the install prefix differs.
 A	x2_repro_checklist.html	GR00T-X2 reproduction checklist (rendered HTML): red lines, local deploy state, and the sim / Pico teleop / real-robot acceptance items.
@@ -606,4 +610,3 @@ M	motionbricks/motionbricks/motion_backbone/demo/clips.py	get the actual data in
 M	motionbricks/motionbricks/motion_backbone/models/pose_model.py	the other key args here: most of them for compatibility only and won't be used at all
 M	motionbricks/motionbricks/motionlib/core/skeletons/__init__.py	flake8: noqa
 M	pyproject.toml	Root pyproject.toml — tooling configuration only.
-A	docs/x2/MODES_AND_MC_NOTES.md	Code-level analysis notes (2026-10-09): MC version coupling (waistmc tuning), hybrid locomotion+Pico-arms support, WHOLE_BODY vs LOCOMOTION data/control flow table, 31-DOF + floating-base evidence.

@@ -74,22 +74,44 @@ try:  # repo tree: the gear_sonic package is importable
         X2_ARM_JOINT_LIMITS_RAD,
     )
 except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
-    from incremental_chain import (
-        ARM_HI_SOLVER,
-        ARM_LO_SOLVER,
-        ARM_NEUTRAL,
-        DT,
-        GRIP_TAU,
-        IK_ITERS_PER_TICK,
-        TORSO_KEEPOUT,
-        TRIGGER_THRESH,
-        ClutchArm,
-        PoseLpf,
-        _rot_from_quat_wxyz,
-        _rot_to_quat_wxyz,  # type: ignore[no-redef]
-        make_arm_solver,  # type: ignore[no-redef]
-        run_self_test as _v2_run_self_test,  # type: ignore[no-redef]
-    )
+    # The v3 robot bundle ships its base chain as ``incremental_chain_v3base``
+    # so it does NOT overwrite the PC2 copy of ``incremental_chain`` that the
+    # v2 node still imports (the v2 trigger/grip semantics predate the role
+    # swap in this tree). Fall back to the bare name for older bundles.
+    try:
+        from incremental_chain_v3base import (
+            ARM_HI_SOLVER,
+            ARM_LO_SOLVER,
+            ARM_NEUTRAL,
+            DT,
+            GRIP_TAU,
+            IK_ITERS_PER_TICK,
+            TORSO_KEEPOUT,
+            TRIGGER_THRESH,
+            ClutchArm,
+            PoseLpf,
+            _rot_from_quat_wxyz,
+            _rot_to_quat_wxyz,  # type: ignore[no-redef]
+            make_arm_solver,  # type: ignore[no-redef]
+            run_self_test as _v2_run_self_test,  # type: ignore[no-redef]
+        )
+    except ImportError:
+        from incremental_chain import (  # type: ignore[no-redef]
+            ARM_HI_SOLVER,
+            ARM_LO_SOLVER,
+            ARM_NEUTRAL,
+            DT,
+            GRIP_TAU,
+            IK_ITERS_PER_TICK,
+            TORSO_KEEPOUT,
+            TRIGGER_THRESH,
+            ClutchArm,
+            PoseLpf,
+            _rot_from_quat_wxyz,
+            _rot_to_quat_wxyz,  # type: ignore[no-redef]
+            make_arm_solver,  # type: ignore[no-redef]
+            run_self_test as _v2_run_self_test,  # type: ignore[no-redef]
+        )
     from x2_arm_ik import (  # type: ignore[no-redef]
         X2_ARM_JOINT_LIMITS_RAD,
         IKResult,
