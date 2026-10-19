@@ -66,6 +66,7 @@ try:  # repo tree: the gear_sonic package is importable
         PoseLpf,
         _rot_from_quat_wxyz,
         _rot_to_quat_wxyz,
+        make_arm_solver,
         run_self_test as _v2_run_self_test,
     )
     from gear_sonic.utils.teleop.solver.arm import IKResult
@@ -86,6 +87,7 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         PoseLpf,
         _rot_from_quat_wxyz,
         _rot_to_quat_wxyz,  # type: ignore[no-redef]
+        make_arm_solver,  # type: ignore[no-redef]
         run_self_test as _v2_run_self_test,  # type: ignore[no-redef]
     )
     from x2_arm_ik import (  # type: ignore[no-redef]
@@ -220,7 +222,37 @@ class ClutchArmV3(ClutchArm):
         wrist_signs = kwargs.pop("wrist_signs", None)
         wrist_slew = kwargs.pop("wrist_slew_rad_s", 6.0)
         wrist_pi_guard = kwargs.pop("wrist_pi_guard_rad", 2.94)
+        # CONTROLLER LEVER (Pico origin -> operator wrist centre), metres in
+        # the controller body frame. The Pico pose is the controller's
+        # tracking origin, not the human wrist: rotating the controller about
+        # a stationary wrist sweeps that origin on a lever arc, which the
+        # position target used to chase -- dragging the robot's shoulder and
+        # elbow. ``r_c`` removes the arc: ``W = C - R_c @ r_c``.
+        # Zero = legacy behaviour; measure it with a wrist-only sweep (see
+        # docs/x2/PICO_LIVE_TELEOP_PITFALLS.md) before trusting a value.
+        lever = kwargs.pop("ctrl_lever", None)
+        self.ctrl_lever = (
+            np.zeros(3, np.float64) if lever is None else np.asarray(lever, np.float64).reshape(3)
+        )
         self.full_pose_ik = bool(kwargs.pop("full_pose_ik", False))
+        # Soft radial deadband on the compensated translation, metres. The
+        # operator's hand tremor and the clutch re-anchor both live at the
+        # millimetre scale; subtracting a small radius (ramped continuously
+        # past it) keeps that noise out of the upstream joints while a real
+        # reach still passes through with slope 1.
+        #
+        # B/C are DEFAULT-PATH features. The full-pose path is the opt-in
+        # alternative whose A/B gate is already marginal (4.38 mm of the
+        # 5 mm budget at its freeze-guard bifurcation, tick 854); even a
+        # 1 mm deadband perturbs that latch and pushes the two backends
+        # apart (measured 5.84 mm). Keep `--full-pose-ik` bit-identical to
+        # the pre-A/B/C path; its posture term is a separate migration.
+        self.position_deadband_m = float(kwargs.pop("position_deadband_m", 0.0))
+        if self.position_deadband_m < 0.0:
+            raise ValueError("position_deadband_m must be >= 0")
+        if self.full_pose_ik:
+            self.position_deadband_m = 0.0
+            kwargs["posture_gain"] = 0.0
         if not self.full_pose_ik:
             # the 4-DoF path: position-only IK regardless of what v2 would
             # default to, because the orientation task moved to the wrist
@@ -256,10 +288,45 @@ class ClutchArmV3(ClutchArm):
         """
         return self.q[4:7] if self.full_pose_ik else self.wrist.cmd
 
+    def _operator_wrist_pos(self, c: np.ndarray) -> np.ndarray:
+        """Controller origin -> operator wrist centre, ``C - R_c @ r_c``."""
+        if np.linalg.norm(c[3:]) < 1e-6:
+            # zero placeholder (no-xrt / SDK failure): no orientation, no
+            # lever correction. engage() refuses this pose before we get here.
+            return np.asarray(c[:3], np.float64).copy()
+        return c[:3] - _rot_from_quat_wxyz(c[3:]).apply(self.ctrl_lever)
+
+    def _compensated_target(self, c: np.ndarray, a_op, a_rob) -> np.ndarray:
+        """Robot position target from the lever-corrected operator wrist."""
+        return a_rob + self.position_scale * (self._operator_wrist_pos(c) - a_op)
+
+    def _deadband(self, tgt_pos: np.ndarray, a_rob: np.ndarray) -> np.ndarray:
+        """Soft radial deadband around the engage anchor.
+
+        ``d -> d * max(0, 1 - r/|d|)``: inside radius ``r`` the target is the
+        anchor exactly; outside it the output is ``|d| - r`` along the same
+        direction (continuous, unit slope). Applied to the COMPENSATED
+        translation, before the keep-out / reach / slew sandwich.
+        """
+        r = self.position_deadband_m
+        if r <= 0.0:
+            return tgt_pos
+        d = tgt_pos - a_rob
+        n = float(np.linalg.norm(d))
+        if n <= r:
+            return a_rob.copy()
+        return a_rob + d * (1.0 - r / n)
+
     def engage(self, ctrl_pose7: np.ndarray) -> bool:
-        if not super().engage(ctrl_pose7):
-            return False
         c = np.asarray(ctrl_pose7, np.float64).reshape(7)
+        if np.linalg.norm(c[:3]) < 1e-6 or np.linalg.norm(c[3:]) < 1e-6:
+            return False  # same zero-placeholder refusal as ClutchArm.engage
+        # Anchor the corrected wrist-centre position; the orientation used by
+        # WristClutch and the full-pose path is the raw controller rotation.
+        c_corr = c.copy()
+        c_corr[:3] = self._operator_wrist_pos(c)
+        if not super().engage(c_corr):
+            return False
         return self.wrist.engage(self.q[4:7], c[3:])
 
     def disengage(self) -> None:
@@ -277,7 +344,11 @@ class ClutchArmV3(ClutchArm):
         # reads as arm error; on the full-pose path it is telemetry only
         wrist_q3 = self.wrist.step(c[3:])
         a_op, a_op_inv, a_rob, a_rob_R = self.anchor
-        tgt_pos = a_rob + self.position_scale * (c[:3] - a_op)
+        # a_op is the corrected (lever-removed) operator wrist position from
+        # engage(); the same correction here makes a pure controller rotation
+        # about a stationary wrist produce ZERO translation target.
+        tgt_pos = self._compensated_target(c, a_op, a_rob)
+        tgt_pos = self._deadband(tgt_pos, a_rob)
         # v2's orientation target: the controller's rotation delta carried
         # into the robot frame by the anchor. Only the full-pose path feeds it
         # to the solver; the 4-DoF path drops it (the wrist mapping owns
@@ -363,6 +434,9 @@ class IncrementalTeleopTickerV3:
         rotation_weight: float = 1.0,
         full_pose_ik: bool = False,
         backend: str | None = None,
+        ctrl_lever: tuple | None = None,
+        position_deadband_m: float = 0.003,
+        posture_gain: float = 0.01,
     ) -> None:
         self.dt = float(dt)
         self.trigger_thresh = float(trigger_thresh)
@@ -370,6 +444,17 @@ class IncrementalTeleopTickerV3:
         self.stale_grip_close = bool(stale_grip_close)
         self.grip_tau = float(grip_tau)
         self.waist_stand = float(waist_stand)
+        self.ctrl_lever = (
+            np.zeros(3, np.float64)
+            if ctrl_lever is None
+            else np.asarray(ctrl_lever, np.float64).reshape(3)
+        )
+        self.full_pose_ik = bool(full_pose_ik)
+        # The deadband and posture term ship on the 4-DoF default path; the
+        # opt-in full-pose path keeps its pre-A/B/C behavior (see
+        # ClutchArmV3.__init__ for the A/B measurement that forced this).
+        self.position_deadband_m = 0.0 if self.full_pose_ik else float(position_deadband_m)
+        self.posture_gain = 0.0 if self.full_pose_ik else float(posture_gain)
         signs = wrist_signs if wrist_signs is not None else DEFAULT_WRIST_SIGNS
         self.arms = {
             side: ClutchArmV3(
@@ -384,6 +469,9 @@ class IncrementalTeleopTickerV3:
                 rotation_weight=rotation_weight,
                 full_pose_ik=full_pose_ik,
                 backend=backend,
+                ctrl_lever=self.ctrl_lever,
+                position_deadband_m=self.position_deadband_m,
+                posture_gain=self.posture_gain,
             )
             for side in ("left", "right")
         }
@@ -806,11 +894,18 @@ def _twist_j24(deg: float) -> np.ndarray:
 def check_waist_fixed_and_smpl_ignored() -> None:
     """A 25-deg shoulder-line twist in smpl_joints must move NOTHING: the
     waist stays at stand and the arm commands are element-for-element
-    identical to a straight skeleton (the SMPL channel is closed)."""
-    tick = IncrementalTeleopTickerV3()
+    identical to a straight skeleton (the SMPL channel is closed).
+
+    Two independent tickers are driven in lockstep, one with each skeleton.
+    A single ticker stepped straight-then-twisted would also compare two
+    DIFFERENT tick indices: with the posture term enabled the mink solve
+    keeps settling its null space by ~1e-7 rad per tick even at a constant
+    target, so the comparison would be order-sensitive rather than
+    SMPL-sensitive.
+    """
     lcp = np.zeros(7)
     lcp[3] = 1.0
-    lcp[:3] = tick.arms["left"].solver.fk(tick.arms["left"].q)[0]
+    lcp[:3] = IncrementalTeleopTickerV3().arms["left"].solver.fk(ARM_NEUTRAL["left"])[0]
     base = {
         "trigger": np.array([0.0, 0.0]),
         "grip": np.array([0.9, 0.0]),  # the clutch is the GRIP (2026-10 swap)
@@ -818,15 +913,22 @@ def check_waist_fixed_and_smpl_ignored() -> None:
         "rctrl_pose": np.zeros(7),
         "t": 100.0,
     }
-    # the grip LPF needs several ticks to cross the 0.5 clutch threshold;
-    # one tick would leave grip_f at 0.12 and the SMPL comparison vacuous
-    for k in range(10):
-        tick.step(dict(base, smpl_joints=_pack_j24(_twist_j24(0.0))), now=100.01 + k * DT)
-    assert tick.arms["left"].engaged, "grip warm-up failed to engage the left arm"
+    ticks = {}
+    for tag, j24 in (("straight", _twist_j24(0.0)), ("twisted", _twist_j24(25.0))):
+        tick = IncrementalTeleopTickerV3()
+        # the grip LPF needs several ticks to cross the 0.5 clutch threshold;
+        # one tick would leave grip_f at 0.12 and the SMPL comparison vacuous
+        for k in range(10):
+            tick.step(
+                dict(base, smpl_joints=_pack_j24(j24)),
+                now=100.01 + k * DT,
+            )
+        assert tick.arms["left"].engaged, "grip warm-up failed to engage the left arm"
+        ticks[tag] = tick
     out = {}
     for tag, j24 in (("straight", _twist_j24(0.0)), ("twisted", _twist_j24(25.0))):
         f = dict(base, smpl_joints=_pack_j24(j24))
-        out[tag] = tick.step(f, now=100.21)
+        out[tag] = ticks[tag].step(f, now=100.21)
     assert out["straight"]["waist"] == out["twisted"]["waist"] == tick.waist_stand
     for side in ("left", "right"):
         np.testing.assert_array_equal(
@@ -1021,6 +1123,169 @@ def check_default_4dof_and_equal_full_pose_weights() -> None:
     assert full.solver.rotation_weight == 1.0, "full-pose path must weight position == rotation"
 
 
+def check_ctrl_lever_pure_wrist_rotation() -> None:
+    """A controller rotating about a stationary wrist must not move the target.
+
+    Synthetic physical controller: its origin rides a lever ``r_true`` from
+    the wrist centre, ``C = W + R @ r_true``. Sweeping ``R`` is exactly the
+    "human shoulder/elbow still, wrist rotates" motion from the live report.
+    With ``--ctrl-lever = r_true`` the compensated target is invariant; with
+    the legacy estimate (0,0,0) it sweeps by centimetres -- the non-vacuity
+    control that shows this check can fail.
+    """
+    r_true = np.array([0.0, 0.02, 0.09])
+    R0 = sRot.from_euler("ZYX", [0.4, -0.3, 0.2])
+    sweeps = (
+        sRot.from_euler("x", 0.25),
+        sRot.from_euler("y", -0.2),
+        sRot.from_euler("z", 0.3),
+        sRot.from_euler("y", 0.5) * sRot.from_euler("x", -0.35),
+    )
+
+    def run(lever_est: np.ndarray) -> tuple[float, float]:
+        arm = ClutchArmV3(
+            "left",
+            position_scale=1.0,
+            torso_keepout=None,
+            target_slew_m_s=0.0,
+            ctrl_lever=lever_est,
+        )
+        p0, _ = arm.solver.fk(arm.q)
+        c0 = np.concatenate([p0 + R0.apply(r_true), _rot_to_quat_wxyz(R0)])
+        assert arm.engage(c0), "engage refused a valid synthetic controller pose"
+        p_anchor = arm.solver.fk(arm.q)[0].copy()
+        q_anchor = arm.q.copy()
+        worst_tgt = 0.0
+        worst_up = 0.0
+        for dR in sweeps:
+            R = dR * R0
+            c = np.concatenate([p0 + R.apply(r_true), _rot_to_quat_wxyz(R)])
+            arm.step(True, c)
+            worst_tgt = max(worst_tgt, float(np.linalg.norm(arm._tgt_slewed - p_anchor)))
+            # upstream joints only: the reported symptom is shoulder/elbow
+            # being dragged by a wrist-only rotation
+            worst_up = max(worst_up, float(np.linalg.norm(arm.q[:4] - q_anchor[:4])))
+        return worst_tgt, worst_up
+
+    fixed, fixed_q = run(r_true)
+    legacy, legacy_q = run(np.zeros(3))
+    assert (
+        fixed < 1e-6
+    ), f"lever-corrected target moved {fixed * 1e3:.3f} mm under a wrist-only sweep"
+    assert legacy > 5e-3, (
+        "the legacy controller-origin target barely moved "
+        f"({legacy * 1e3:.3f} mm); the check would be vacuous"
+    )
+    assert fixed_q < 0.01, (
+        f"lever-corrected upstream joints moved {np.degrees(fixed_q):.2f} deg "
+        "under a wrist-only sweep"
+    )
+    assert legacy_q > 0.05, (
+        f"legacy upstream joints barely moved ({np.degrees(legacy_q):.1f} deg); "
+        "the drift assertion would be vacuous"
+    )
+
+
+def check_position_deadband() -> None:
+    """Soft radial deadband: inside r the target is the anchor; outside it
+    passes through with unit slope, offset by exactly r."""
+    r = 0.005
+    arm = ClutchArmV3(
+        "left",
+        position_scale=1.0,
+        torso_keepout=None,
+        target_slew_m_s=0.0,
+        position_deadband_m=r,
+    )
+    p0, _ = arm.solver.fk(arm.q)
+    c0 = np.concatenate([p0, [1.0, 0.0, 0.0, 0.0]])
+    assert arm.engage(c0)
+    p_anchor = arm.solver.fk(arm.q)[0].copy()
+
+    def target_after(dx: float) -> np.ndarray:
+        c = c0.copy()
+        c[:3] = p_anchor + np.array([dx, 0.0, 0.0])
+        arm.step(True, c)
+        return arm._tgt_slewed.copy()
+
+    for dx in (0.0, 0.001, 0.003, 0.0049):
+        got = target_after(dx)
+        assert (
+            np.linalg.norm(got - p_anchor) < 1e-9
+        ), f"deadband leaked {np.linalg.norm(got - p_anchor) * 1e3:.3f} mm at dx={dx * 1e3:.1f} mm"
+    for dx in (0.010, 0.020):
+        got = target_after(dx)
+        want = p_anchor + np.array([dx - r, 0.0, 0.0])
+        assert np.allclose(got, want, atol=1e-9), (
+            f"deadband pass-through wrong at dx={dx * 1e3:.1f} mm: "
+            f"{((got - p_anchor) * 1e3).round(4)} mm"
+        )
+
+
+def check_posture_gain_null_space() -> None:
+    """The optional posture term moves the redundant swivel, not the wrist.
+
+    Drive a seed displaced along the position Jacobian's null space with a
+    fixed target: gain 0 must leave the seed where it is; gain 0.05 must pull
+    it toward the preferred posture while holding the wrist point. Runs on
+    every importable backend (mink's PostureTask and DLS's exact-projector
+    null-space bias).
+    """
+    q_pref = ARM_NEUTRAL["left"].copy()
+    wrist = q_pref[4:].copy()
+
+    def fd_j4(solver, q: np.ndarray) -> np.ndarray:
+        J = np.zeros((3, 4), np.float64)
+        p0, _ = solver.fk(q)
+        eps = 1e-7
+        for i in range(4):
+            qp = q.copy()
+            qp[i] += eps
+            J[:, i] = (solver.fk(qp)[0] - p0) / eps
+        return J
+
+    for backend in ("dls", "mink"):
+        try:
+            probe, _ = make_arm_solver("left", backend=backend)
+        except RuntimeError:
+            if backend == "dls":
+                raise
+            continue  # mink not installed: nothing to test on this backend
+        J4 = fd_j4(probe, q_pref)
+        u = np.linalg.svd(J4)[2][-1]
+        seed = q_pref.copy()
+        seed[:4] += 0.15 * u
+        target, _ = probe.fk(seed)
+
+        def settle(gain: float):
+            solver, _ = make_arm_solver(
+                "left",
+                backend=backend,
+                posture_gain=gain,
+                q_preferred=q_pref,
+            )
+            q = seed.copy()
+            for _ in range(60):
+                q, _ik = solver.solve_position_free4(q, wrist, target, max_iters=1)
+            return q, float(np.linalg.norm(solver.fk(q)[0] - target))
+
+        q0, err0 = settle(0.0)
+        q1, err1 = settle(0.05)
+        d0 = float(np.linalg.norm(q0[:4] - q_pref[:4]))
+        d1 = float(np.linalg.norm(q1[:4] - q_pref[:4]))
+        assert d0 > 0.1, (
+            f"{backend}: null-space probe did not start far enough from the "
+            f"preferred posture ({d0:.4f} rad)"
+        )
+        assert d1 < 0.5 * d0, (
+            f"{backend}: posture gain barely moved the swivel " f"({d0:.4f} -> {d1:.4f} rad)"
+        )
+        assert err0 < 1e-6, f"{backend}: gain-0 solve drifted off the target ({err0 * 1e3:.4f} mm)"
+        assert err1 < 1e-3, (
+            f"{backend}: posture term traded away the wrist point " f"({err1 * 1e3:.4f} mm)"
+        )
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -1038,6 +1303,9 @@ CHECKS = [
     ("full_pose_ik_tracks_orientation", check_full_pose_ik_tracks_orientation),
     ("trigger_hand_grip_clutch", check_trigger_hand_grip_clutch),
     ("default_4dof_equal_full_pose_weights", check_default_4dof_and_equal_full_pose_weights),
+    ("ctrl_lever_pure_wrist_rotation", check_ctrl_lever_pure_wrist_rotation),
+    ("position_deadband", check_position_deadband),
+    ("posture_gain_null_space", check_posture_gain_null_space),
 ]
 
 

@@ -236,3 +236,45 @@ while time.monotonic() - t0 < 60:
 2. **默认值可能和验证过的值不一致。** `ROOT_TILT_RAMP_S` 曾发布为 `0.5`，而设计、A/B 验证
    （`/tmp/x2stack/stamp_run.sh` 显式传 0.6）和清单写的都是 `0.6`。已改为 0.6。
    理由写进了代码注释：**缩短 ramp 是朝 memoryless 那端走，而摔的就是那一端**——更狠的钳制才是危险方向。
+
+---
+
+## 9 只转手腕却拖肘/肩：Pico 控制器原点 ≠ 人腕心
+
+**症状**：人的肩、肘不动，只转手腕（控制器），机器人却抬肘、甚至动肩；把柄
+平移时反而正常。
+
+**根因**：Pico 的 controller pose 是**控制器跟踪原点** `C`，不是握持点/腕心 `W`。
+两者差一根固定在控制器坐标系里的杠杆 `r`：`C = W + R @ r`。腕心不动、只转
+控制器时，`C` 会沿半径 `|r|` 的弧线扫动；旧目标
+`tgt = a_rob + scale*(C - a_op)` 把这根弧当成平移，4-DoF IK 只能把位移摊给
+肩/肘。
+
+**修复**：v3 链的 `--ctrl-lever X Y Z`（米，控制器坐标系）做
+`W = C - R @ r`，锚点也扣同一项；纯腕转时补偿后的位置目标保持不变。
+默认 `0 0 0` 是旧行为——**必须标定**。
+
+**标定步骤**（v3 sim / live wire 模式）：
+
+1. 录一段「腕心尽量不动、只绕腕转控制器」的数据，覆盖两个以上转轴、总共
+   ≥ 60°；太慢可以，但单轴旋转只能辨识垂直于该轴的杠杆分量。
+   ```bash
+   .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire \
+     --record /tmp/lever_fit.npz --no-viewer --duration 30
+   ```
+2. 拟合（滑窗最小二乘，`C_i = W + R_i r`；打印残差）：
+   ```bash
+   .venv/bin/python tools/fit_pico_ctrl_lever.py --record /tmp/lever_fit.npz --side left
+   ```
+   `rms > 15 mm` 表示手在平移，杠杆不可信，重录。左右手柄各做一次。
+3. 用打印出的 `--ctrl-lever X Y Z` 重跑同一动作，确认 TUI 里
+   `q_left_cmd` 的肩 3 + 肘（record 列 35:39）基本不动，再上真机。
+
+**注意**：
+
+- 杠杆是**控制器坐标系**的常向量；左右手柄的握持方向通常不同，分别标定。
+- 旧 record / v4 tape 里的 controller pose 仍是原始控制器原点语义，没有变；
+  只有补偿后的目标变了，record 列 0:35 不需要重解释。
+- 补偿后残差（几 mm 的手抖/杠杆误差）再用 `--position-deadband-mm 3` 压掉；
+  零空间 `--posture-gain` 只负责在 4-DoF 的 1-D swivel 上把肘部姿态拉回
+  engage 时的构型，不改变腕点。

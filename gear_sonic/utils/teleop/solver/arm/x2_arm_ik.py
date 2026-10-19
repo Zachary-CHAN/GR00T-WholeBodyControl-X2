@@ -74,20 +74,20 @@ X2_ARM_JOINT_NAMES: tuple[str, ...] = (
 # repo. The shoulder-roll asymmetry between left/right is real (URDF
 # joint limits are mirrored, not symmetric).
 X2_ARM_JOINT_LIMITS_RAD: tuple[tuple[float, float], ...] = (
-    (-3.080,  2.040),  # left_shoulder_pitch
-    (-0.061,  2.993),  # left_shoulder_roll
-    (-2.556,  2.556),  # left_shoulder_yaw
+    (-3.080, 2.040),  # left_shoulder_pitch
+    (-0.061, 2.993),  # left_shoulder_roll
+    (-2.556, 2.556),  # left_shoulder_yaw
     (-2.3556, 0.000),  # left_elbow
-    (-2.556,  2.556),  # left_wrist_yaw
-    (-0.558,  0.558),  # left_wrist_pitch
-    (-1.571,  0.724),  # left_wrist_roll
-    (-3.080,  2.040),  # right_shoulder_pitch
-    (-2.993,  0.061),  # right_shoulder_roll
-    (-2.556,  2.556),  # right_shoulder_yaw
+    (-2.556, 2.556),  # left_wrist_yaw
+    (-0.558, 0.558),  # left_wrist_pitch
+    (-1.571, 0.724),  # left_wrist_roll
+    (-3.080, 2.040),  # right_shoulder_pitch
+    (-2.993, 0.061),  # right_shoulder_roll
+    (-2.556, 2.556),  # right_shoulder_yaw
     (-2.3556, 0.000),  # right_elbow
-    (-2.556,  2.556),  # right_wrist_yaw
-    (-0.558,  0.558),  # right_wrist_pitch
-    (-0.724,  1.571),  # right_wrist_roll
+    (-2.556, 2.556),  # right_wrist_yaw
+    (-0.558, 0.558),  # right_wrist_pitch
+    (-0.724, 1.571),  # right_wrist_roll
 )
 
 
@@ -137,7 +137,7 @@ def _rotation_error_axis_angle(R_current: np.ndarray, R_target: np.ndarray) -> n
     if n < 1e-12:
         diag = np.array([R[0, 0], R[1, 1], R[2, 2]])
         i = int(np.argmax(diag))
-        col = (R[:, i] + np.eye(3)[:, i])
+        col = R[:, i] + np.eye(3)[:, i]
         n = np.linalg.norm(col)
         if n < 1e-12:
             return np.zeros(3, dtype=np.float64)
@@ -252,6 +252,7 @@ class ArmIKSolver:
         q_preferred: np.ndarray | None = None,
         uniform_step_clip: bool = False,
         max_rotation_err_rad: float = 0.0,
+        posture_gain: float | None = None,
     ):
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
@@ -285,14 +286,18 @@ class ArmIKSolver:
         # default) disables it for backward compatibility with the
         # legacy engage-anchor solver path; the calibrated v2 solver
         # opts in with ~0.1.
+        # ``posture_gain`` is the backend-agnostic spelling used by the v3
+        # chain (MinkArmIK maps it to a PostureTask cost). Here it is exactly
+        # the legacy null-space gain; ``null_space_gain`` stays accepted so
+        # existing call sites do not change.
+        if posture_gain is not None:
+            null_space_gain = posture_gain
         self.null_space_gain = float(null_space_gain)
         if q_preferred is None:
             q_preferred = np.zeros(7, dtype=np.float64)
         self.q_preferred = np.asarray(q_preferred, dtype=np.float64).copy()
         if self.q_preferred.shape != (7,):
-            raise ValueError(
-                f"q_preferred must be (7,); got {self.q_preferred.shape}"
-            )
+            raise ValueError(f"q_preferred must be (7,); got {self.q_preferred.shape}")
 
     def fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Forward kinematics. Returns (xyz, R_3x3) of the wrist."""
@@ -317,6 +322,13 @@ class ArmIKSolver:
         """Kept for API compatibility: the rotation-error limiting is now
         a stateless saturation, so there is no per-anchor state to
         reset (live round 8.1)."""
+
+    def set_posture_target(self, q: np.ndarray) -> None:
+        """Move the null-space posture target (used by ClutchArm at engage)."""
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        if q.shape != (7,):
+            raise ValueError(f"posture target must be (7,); got {q.shape}")
+        self.q_preferred = q.copy()
 
     def solve(
         self,
@@ -370,7 +382,7 @@ class ArmIKSolver:
 
             n_rows = J.shape[0]
             JJt = J @ J.T
-            damp = (self.damping ** 2) * np.eye(n_rows)
+            damp = (self.damping**2) * np.eye(n_rows)
             try:
                 inv = np.linalg.solve(JJt + damp, err)
             except np.linalg.LinAlgError:
@@ -400,8 +412,7 @@ class ArmIKSolver:
                 if mx > self.max_per_tick_step_rad:
                     dq *= self.max_per_tick_step_rad / mx
             else:
-                np.clip(dq, -self.max_per_tick_step_rad,
-                        self.max_per_tick_step_rad, out=dq)
+                np.clip(dq, -self.max_per_tick_step_rad, self.max_per_tick_step_rad, out=dq)
 
             q_new = q + dq
 
@@ -415,9 +426,7 @@ class ArmIKSolver:
             p_e_check, R_e_check = self.fk(q)
             pos_err = float(np.linalg.norm(target_pos - p_e_check))
             if R_target is not None:
-                rot_err = float(np.linalg.norm(
-                    _rotation_error_axis_angle(R_e_check, R_target)
-                ))
+                rot_err = float(np.linalg.norm(_rotation_error_axis_angle(R_e_check, R_target)))
             else:
                 rot_err = 0.0
 
@@ -449,6 +458,17 @@ class ArmIKSolver:
         turn -- but that is the same order as the teleop's sub-mm
         residual budget, so the caller re-solves every tick with the
         CURRENT wrist command instead of letting the residual go stale.
+        Optional null-space posture: when ``null_space_gain`` (or the
+        backend-agnostic ``posture_gain``) is non-zero, a bias toward
+        ``q_preferred`` is projected with the UNDAMPED pseudo-inverse,
+        ``N = I - pinv(J) @ J``, and added to the primary step. The damped
+        inverse used by the primary task must not be reused for the
+        projection: its leakage into the task was measured at 17 mm in the
+        7-DoF path (see ``incremental_chain.ClutchArm``). With the exact
+        projector the bias is first-order invisible to the wrist point and
+        only selects the swivel. ``0`` (the default) is bit-for-bit the
+        legacy loop.
+
         Kept a separate method (not a flag on ``solve``) so the v2 6-DoF
         path stays byte-identical; the loop body below mirrors
         ``solve``'s position-only branch over the first 4 columns of J.
@@ -475,6 +495,14 @@ class ArmIKSolver:
             except np.linalg.LinAlgError:
                 inv = np.linalg.lstsq(JJt + damp, err, rcond=None)[0]
             dq = J.T @ inv
+
+            if self.null_space_gain != 0.0:
+                # Exact null-space projector (NO damping): the primary DLS
+                # step above stays damped, but projecting the posture bias
+                # through that same damped inverse leaks it into the task.
+                J_pinv = np.linalg.pinv(J)
+                N = np.eye(J.shape[1]) - J_pinv @ J
+                dq = dq + N @ (self.null_space_gain * (self.q_preferred[:4] - q[:4]))
 
             if self.uniform_step_clip:
                 mx = float(np.max(np.abs(dq)))

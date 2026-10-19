@@ -285,6 +285,16 @@ class MinkArmIK:
             ``VelocityLimit``. Joint ranges are clipped after the step instead
             of constrained in the QP (see the module docstring).
         max_rotation_err_rad: saturation cap on the angular residual (0 = off).
+        posture_gain: cost of the optional null-space ``PostureTask`` (0 =
+            off). The task has no position/orientation Jacobian rows of its
+            own: on the 4-DoF position path it can only move the arm's
+            one-dimensional swivel, so it regularises *which* upstream
+            configuration tracks the target without moving the wrist point
+            (to first order). It is a soft task, so a tiny position trade is
+            possible; keep the cost low (1e-3 .. 1e-2) and verify with
+            ``check_posture_gain_null_space``.
+        q_preferred: posture the ``PostureTask`` pulls toward. Shape (7,);
+            ``ClutchArm`` re-targets it to the engage configuration.
         solver: QP backend name handed to :func:`mink.solve_ik`.
         model_path: MJCF to build the arm-only model from; defaults to the
             X2 description in this repo.
@@ -300,6 +310,8 @@ class MinkArmIK:
         rotation_weight: float = 0.5,
         max_per_tick_step_rad: float = 0.30,
         max_rotation_err_rad: float = 0.0,
+        posture_gain: float = 0.0,
+        q_preferred: np.ndarray | None = None,
         solver: str = "daqp",
         model_path: str | Path | None = None,
     ):
@@ -311,6 +323,7 @@ class MinkArmIK:
         self.rotation_weight = float(rotation_weight)
         self.max_per_tick_step_rad = float(max_per_tick_step_rad)
         self.max_rotation_err_rad = float(max_rotation_err_rad)
+        self.posture_gain = float(posture_gain)
         self.solver_name = str(solver)
         self._chain = left_arm_chain() if side == "left" else right_arm_chain()
 
@@ -358,6 +371,35 @@ class MinkArmIK:
             for name in _ARM_JOINTS[4:]
         ]
         self._freeze_wrist = mink.DofFreezingTask(model=self.model, dof_indices=wrist_dofs)
+
+        # Optional null-space posture. On a 3-D position task over the
+        # shoulder-3 + elbow, the null space is the single elbow-swivel
+        # direction; a low-cost PostureTask picks the swivel nearest the
+        # preferred configuration instead of letting numerical drift (or a
+        # moving operator wrist) choose it. The three wrist DOFs are frozen
+        # by ``_freeze_wrist``, so the task is inert there.
+        if q_preferred is None:
+            q_preferred = np.zeros(7, dtype=np.float64)
+        q_preferred = np.asarray(q_preferred, dtype=np.float64).reshape(-1)
+        if q_preferred.shape != (self.model.nq,):
+            raise ValueError(f"q_preferred must be ({self.model.nq},); got {q_preferred.shape}")
+        self.q_preferred = q_preferred.copy()
+        self._posture_task = None
+        if self.posture_gain > 0.0:
+            self._posture_task = mink.PostureTask(
+                model=self.model, cost=self.posture_gain, gain=1.0, lm_damping=0.0
+            )
+            self._posture_task.set_target(self.q_preferred)
+
+    def set_posture_target(self, q: np.ndarray) -> None:
+        """Move the null-space posture target (no-op when posture is off)."""
+        if self._posture_task is None:
+            return
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        if q.shape != (self.model.nq,):
+            raise ValueError(f"posture target must be ({self.model.nq},); got {q.shape}")
+        self.q_preferred = q.copy()
+        self._posture_task.set_target(self.q_preferred)
 
     def _check_model(self) -> None:
         """Fail at build time if the MJCF stops agreeing with the catalog.
@@ -528,16 +570,25 @@ class MinkArmIK:
         pos_err = float(np.linalg.norm(target_pos - self.fk(q)[0]))
         clamped_count = 0
         iters = 0
+        tasks = [self._position_task]
+        if self._posture_task is not None:
+            # The posture task has no end-effector rows: it lives entirely in
+            # the position task's null space. Keeping it in the task list is
+            # what lets it act on a tick whose position error is already
+            # converged, so the pre-step break below must not fire then.
+            tasks.append(self._posture_task)
         for _ in range(max(1, max_iters)):
             # Same pre-step convergence test as solve(); see the note there.
-            if pos_err < 5e-4:
+            # With posture ON we keep iterating: position error 0 does not
+            # mean the null-space task has converged.
+            if pos_err < 5e-4 and self._posture_task is None:
                 break
             iters += 1
             self._configuration.update(q)
             try:
                 v = mink.solve_ik(
                     self._configuration,
-                    [self._position_task],
+                    tasks,
                     dt=DT,
                     solver=self.solver_name,
                     damping=self.damping**2,

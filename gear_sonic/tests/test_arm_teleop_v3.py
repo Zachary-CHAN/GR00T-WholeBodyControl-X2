@@ -69,6 +69,18 @@ def test_default_4dof_and_equal_full_pose_weights():
     a3.CHAIN_V3_CHECKS[13][1]()
 
 
+def test_ctrl_lever_pure_wrist_rotation():
+    a3.CHAIN_V3_CHECKS[14][1]()
+
+
+def test_position_deadband():
+    a3.CHAIN_V3_CHECKS[15][1]()
+
+
+def test_posture_gain_null_space():
+    a3.CHAIN_V3_CHECKS[16][1]()
+
+
 def test_wire_roundtrip():
     a3.check_wire_roundtrip()
 

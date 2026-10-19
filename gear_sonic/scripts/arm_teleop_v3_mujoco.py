@@ -167,6 +167,33 @@ def main() -> int:
     ap.add_argument("--stale-s", type=float, default=0.5)
     ap.add_argument("--position-scale", type=float, default=1.0)
     ap.add_argument(
+        "--ctrl-lever",
+        nargs=3,
+        type=float,
+        default=(0.0, 0.0, 0.0),
+        metavar=("X", "Y", "Z"),
+        help="Pico controller origin -> operator wrist centre, metres in the "
+        "controller body frame (W = C - R @ r). Default 0 keeps the raw "
+        "controller origin. A pure wrist rotation with a stationary hand "
+        "should leave the robot target still; if it sweeps, fit this vector "
+        "(docs/x2/PICO_LIVE_TELEOP_PITFALLS.md)",
+    )
+    ap.add_argument(
+        "--position-deadband-mm",
+        type=float,
+        default=3.0,
+        help="soft radial deadband on the compensated translation (mm); "
+        "0 = off (default 3 mm: suppresses hand tremor / re-anchor creep)",
+    )
+    ap.add_argument(
+        "--posture-gain",
+        type=float,
+        default=0.01,
+        help="null-space posture bias toward the engage configuration; "
+        "0 = off (default 0.01). MinkArmIK: PostureTask cost (1e-3..1e-2); "
+        "ArmIKSolver: exact-projector null-space gain per tick (0.02..0.1)",
+    )
+    ap.add_argument(
         "--input-tau",
         type=float,
         default=0.12,
@@ -291,6 +318,9 @@ def main() -> int:
         wrist_pi_guard_rad=args.wrist_pi_guard,
         waist_stand=args.waist_stand,
         full_pose_ik=args.full_pose_ik,
+        ctrl_lever=tuple(args.ctrl_lever),
+        position_deadband_m=args.position_deadband_mm * 1e-3,
+        posture_gain=args.posture_gain,
     )
     # trunk keep-out from the REAL model silhouette (d is still at the
     # neutral pose build_model + mj_forward left it in)
@@ -304,6 +334,9 @@ def main() -> int:
         f"{args.trigger_thresh} engages, trigger drives the hands, "
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
+        f"ctrl lever {tuple(np.round(ticker.ctrl_lever, 4))}m, "
+        f"deadband {ticker.position_deadband_m * 1e3:.1f}mm, "
+        f"posture {ticker.posture_gain:g}, "
         f"waist fixed {args.waist_stand}rad, stale->hands {'closed' if args.stale_grip_close else 'OPEN'}, "
         # which solver + which DoF split produced this run (--full-pose-ik
         # opts into 7-DoF; the shipped default is the 4-DoF split)

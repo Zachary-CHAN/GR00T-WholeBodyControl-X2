@@ -108,8 +108,10 @@ _ARM_SOLVER_BACKENDS = ("mink", "dls")
 # of the design arguing it away.
 _LEGACY_ONLY_SOLVER_KWARGS = {
     "uniform_step_clip": "superseded by the mink VelocityLimit step cap",
-    "null_space_gain": "a null-space bias leaks through the damped pseudo-inverse; never enabled",
-    "q_preferred": "only used with null_space_gain; never enabled",
+    # The v3 chain uses the backend-agnostic ``posture_gain`` instead:
+    # MinkArmIK turns it into a PostureTask cost, ArmIKSolver into the
+    # exact-projector null-space gain. The legacy spellings stay dropped.
+    "null_space_gain": "use posture_gain; the mink backend has no such kwarg",
 }
 
 
@@ -369,9 +371,16 @@ class ClutchArm:
         torso_keepout: tuple | None = None,
         rot_err_clip_rad: float = 0.08,
         backend: str | None = None,
+        posture_gain: float = 0.0,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
+        # Backend-agnostic null-space posture strength (0 = off). On the
+        # 4-DoF v3 path the position task leaves one swivel DOF; a small
+        # bias toward the engage posture keeps that swivel from drifting
+        # without moving the wrist point. MinkArmIK: PostureTask cost;
+        # ArmIKSolver: exact-projector null-space gain per tick.
+        self.posture_gain = float(posture_gain)
         # TORSO KEEP-OUT (live round 7: crossing toward the other arm drove
         # the wrist INTO the trunk/hip shells -- PD against contact forces =
         # shaking; the freeze guard only locked an already-colliding
@@ -444,6 +453,8 @@ class ClutchArm:
             rotation_weight=rotation_weight,
             uniform_step_clip=True,
             max_rotation_err_rad=rot_err_clip_rad,
+            posture_gain=posture_gain,
+            q_preferred=ARM_NEUTRAL[side],
         )
         self.q = ARM_NEUTRAL[side].copy()
         self.anchor = None  # (op_pos, op_rot_inv, rob_pos, rob_rot)
@@ -493,6 +504,11 @@ class ClutchArm:
             sRot.from_matrix(rob_R),
         )
         self._tgt_slewed = rob_pos.copy()  # zero delta at engage
+        # Null-space posture is re-anchored with the clutch: the arm should
+        # hold the configuration the operator engaged from, not a stale one
+        # from a previous grab. No-op when posture is disabled.
+        if self.posture_gain != 0.0:
+            self.solver.set_posture_target(self.q)
         self.solver.reset_rotation_err_state()
         return True
 
