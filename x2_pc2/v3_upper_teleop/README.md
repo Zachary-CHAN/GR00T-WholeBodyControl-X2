@@ -230,8 +230,11 @@ cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
 ```
 
 - **不要加 `--no-locomotion`**：它会关掉 sender 的控制器层（`dual_mode=False`），
-  握把/扳机字段恒 0、**手部 socket 也不会创建** → v3 永远无法咬合、手指也
-  不会动（v2 文档踩过同一个坑）。
+  **`hand_sock` 不会创建** → 真机 v3 的手指永远不会动（v2 文档踩过同一个坑）。
+  2026-10-20 修复后，非 dual 的 **live** 路径仍会把原始 trigger 写进 wire
+  （`_read_trigger_pair`；此前恒 0，sim record 列 2/3 全 0），所以 **sim
+  harness** 的手能由 wire trigger 闭合；但 sender 自己不发布
+  `hand_finger_cmd`，真机手指仍必须走下面的 dual 模式。
 - `--hand-source trigger`：v3 的角色是「扳机→手」。默认值 `grip` 是旧语义，
   会把**握把**（现在是离合）同时送去驱动手指。
 - `--hand-close-on-grip`：去掉 sender 默认的 `ratio = 1 - ratio` 反相，得到
@@ -367,7 +370,9 @@ PY
    走 sender 的 `hand_finger_cmd` 独立线。必须
    `--hand-source trigger --hand-close-on-grip` **且** PC2 的 msgpack CLAW
    手桥在 `:5572` BIND（§4.2 / §4.2.1）。`--hand-source off` 或
-   `--no-locomotion` 都会让手部 socket 不创建，手指完全不动。
+   `--no-locomotion` 都会让手部 socket 不创建，真机手指完全不动。
+   （2026-10-20 修复后，`--no-locomotion` 的 live wire trigger 不再恒 0，
+   但那只救 sim harness；真机仍必须用 dual 模式。）
 4. **`x2_arm_fk.py` 右臂修正**：见 §2；会影响 v2。备份已做。
 5. **lever 取决于握持**：换握法、换人、隔天重戴都要重标
    （`tools/fit_pico_ctrl_lever.py`，方法见

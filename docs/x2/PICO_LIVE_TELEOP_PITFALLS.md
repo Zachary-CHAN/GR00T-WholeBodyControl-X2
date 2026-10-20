@@ -220,6 +220,13 @@ while time.monotonic() - t0 < 60:
   把 **grip 当 clutch、trigger 当手指**；PC2 平铺副本未同步，仍是旧的 trigger clutch /
   grip 手指。读 record 列 2/3（原始 trigger）与 4/5（滤波 grip），或看节点横幅（仍写
   `trigger>... clutches`）时，先确认是 sim 还是真机。
+- **live `--no-locomotion` 下 trigger 恒 0（2026-10-20 已修）**：sender 以前只在
+  `dual_mode` 块里调用 `_poll_controllers`，非 dual 路径把 `lt=rt=0` 直接写进 wire；
+  sim record 列 2/3 全 0，手永远不闭合。现在非 dual 的 **live** 源会在主循环里直接读
+  `get_left_trigger()/get_right_trigger()`（`_read_trigger_pair`），tape 源仍用
+  `replay_ctrl`。注意这不等于真机手能动：`--no-locomotion` 下 sender 仍不创建
+  `hand_sock`，真机手指必须走 §4.2 的 `--hand-source trigger --hand-close-on-grip`
+  （不加 `--no-locomotion`）。
 
 ---
 
@@ -411,3 +418,34 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
    x 轴转。若两个命令都产生耦合运动，停止使用当前映射，需要向厂商确认
    关节角语义后再改（本仓库的 URDF/厂商 RL 模型都按输出角建模）。
 6. 若上游肩/肘仍随纯腕动作周期性动，那是 §9 的 lever 问题，不是本节。
+
+### 10.5 live 记录复盘：腕映射本身是准的，误差来自限位和 sim 力矩
+
+2026-10-20 live 记录（`/tmp/v3_live.npz`，230 s，11372 tick）的离线结论：
+
+| 指标 | 左臂 | 右臂 |
+|---|---|---|
+| engaged tick | 999 | 2289 |
+| pitch 命令钉在 ±32° | **39.6%** | **35.3%** |
+| roll 命令钉在限位 | 1.6% | 4.7% |
+| yaw 命令钉在 ±146° | 0.0% | 0.9% |
+| 未截断 tick 的工具姿态误差 | max **0.50°** | max **0.00°** |
+| 全部 engaged tick 的工具误差 | mean 14.0°，max 92.2° | mean 4.0–11.7°，max 66.5° |
+
+- **命令侧**：`exact-vs-record` 在所有窗口都是 `0.0000°`——record 里的腕命令
+  逐位等于精确腕链解；未截断 tick 的工具误差 ≤0.5°，说明映射/符号/轴序没有
+  系统性错误。误差全部出现在目标超出关节限位的 tick。
+- **物理范围**：pitch 只有 ±32°，而操作者在这段会话里要求的 pitch 达
+  `-90°…+69°`；roll 左 `[-90°, +41.5°]`、右 `[-41.5°, +90°]`，也远小于
+  要求的扫幅。yaw 有 ±146°，所以显得「只有 yaw 跟得好」。这是硬件行程，
+  软件无法把工具朝向变到不可达姿态；需要大幅腕姿时用「离合棘轮」——转
+  一段、松开 grip、把手柄转回中性、再咬合继续转。
+- **sim 执行侧**：MJCF 里 wrist_pitch/roll 的 `ctrlrange` 是 ±2.2 N·m，
+  wrist_yaw 是 ±24 N·m；而 `upper_body_teleop.ARM_KP` 三个腕关节都是
+  kp=20、kd=1。命令以 6 rad/s 斜率变化时小电机力矩先饱和，record 的
+  qpos-vs-command 实测：yaw max 4.2–4.6°、pitch max 8.3–8.7°、
+  roll max **15.2–15.3°**，且误差随单 tick 命令步长单调增大
+  （6–20°/tick 档最大 15°）。所以即使命令完全正确，viewer 里看到的
+  实际 roll/pitch 也会明显滞后于手柄。真机 vendor 配置的腕 pitch/roll
+  力矩上限是 6 N·m（plant yaml），仍只有 yaw 的 1/4，需要按真机实测
+  再判断滞后量；sim 的 2.2 N·m 是更保守的下界。

@@ -496,6 +496,21 @@ class _ButtonDebounce:
         return tuple(out)
 
 
+def _read_trigger_pair(src) -> tuple[float, float]:
+    """Raw (left, right) trigger for the wire when the dual-mode controller
+    layer is off (live ``--no-locomotion``).
+
+    Kept separate from ``_poll_controllers`` so the non-dual path does not
+    touch sticks/buttons (and cannot accidentally feed the e-stop / recorder
+    state machines). Missing SDK or a dead link -> (0, 0), the same neutral
+    the incremental chain treats as released.
+    """
+    xrt = getattr(src, "xrt", None)
+    if xrt is None:
+        return 0.0, 0.0
+    return float(xrt.get_left_trigger()), float(xrt.get_right_trigger())
+
+
 def _poll_controllers(xrt):
     """One tick of stick/button/trigger state from the XRoboToolkit SDK.
     Returns (lx, ly, rx, ry, a, b, x, y, lt, rt) or None when the SDK
@@ -1115,13 +1130,28 @@ def main() -> int:
                 time.sleep(min(next_t - now, 0.005))
                 continue
             next_t += CONTROL_DT
-            # triggers must survive the non-dual path (intent-tape replay):
-            # the incremental teleop reads them from the wire regardless of
-            # mode, so initialise outside the dual_mode block.
+            # triggers must survive the non-dual path (live --no-locomotion
+            # AND intent-tape replay): the incremental teleop reads them from
+            # the wire regardless of mode, so initialise outside the
+            # dual_mode block (live values are polled in the branch below,
+            # tape values come from src.replay_ctrl).
             lt = rt = 0.0
             if not dual_mode:
+                # LIVE --no-locomotion sessions still need the raw triggers on
+                # the wire: the incremental teleop reads them as its HAND input
+                # even though the controller/locomotion layer is off. Polling
+                # only inside the dual_mode block left them at 0 and the sim
+                # hand never closed (2026-10-20 live record: cols 2/3 == 0).
+                # Tape replay keeps its own path (replay_ctrl / streamed
+                # frames): reading the tape's stored trigger here would
+                # change the semantics of the old x2_pico_chores tapes.
+                if not args.tape_replay:
+                    try:
+                        lt, rt = _read_trigger_pair(src)
+                    except Exception:
+                        lt = rt = 0.0
                 # stick-less tape replay (single engage-window clip): the
-                # tape's grips still drive the hands (triggers are zero)
+                # tape's own frames carry the hands (triggers/grips as stored)
                 _publish_hands(now, 0.0, 0.0)
 
             # ---- dual-mode controller layer (live sessions only) ----
