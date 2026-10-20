@@ -10,13 +10,15 @@ Consumes the SAME wire as the v2 node (:5573 "pico_intent", packed binary,
       wrist joints LOCKED at the WristClutch command and re-fed into the FK
       every tick; ``--full-pose-ik`` opts into the 7-DoF pose solve instead.
     * the wrist is filled directly from the anchored controller-quaternion
-      differential, taken in the CONTROLLER anchor frame (ZYX split, so one
-      controller axis moves exactly one wrist joint even when the wrist is
-      anchored off-neutral; slew + near-pi guard + joint limits), NOT
-      solved by the arm IK.  ``--wrist-axis-order-l/-r`` permutes the
-      controller axes onto yaw/pitch/roll if the grip puts an anatomical DOF
-      on another axis.  This is the v3 fix for "rotate only the wrist,
-      the robot drags its elbow/shoulder".
+      differential by solving the X2 wrist chain exactly:
+      ``W(q_tgt) = W(q_wa) @ C delta C^T`` with ``W = Rz(yaw)Ry(pitch)Rx(roll)``
+      (slew + near-pi guard + joint limits), NOT solved by the arm IK.
+      The wrist is yaw-proximal with pitch/roll crossing at one point, so a
+      tool pitch/yaw rotation legitimately coordinates pitch+roll (or all
+      three) off neutral; tool roll stays a pure roll-joint motion.
+      ``--wrist-axis-order-l/-r`` and the per-axis signs define C (controller
+      -> wrist axis correspondence).  This is the v3 fix for "rotate only
+      the wrist, the robot drags its elbow/shoulder".
     * SMPL is CLOSED: the waist holds a fixed ``--waist-stand``.
     * 2026-10 role swap: the GRIP is the per-arm clutch; the TRIGGER drives
       the (internal) hand channel.  This node does not publish a hand -- the
@@ -156,13 +158,14 @@ def _record_row(st, arms, frame, t_wall: float) -> np.ndarray:
 
 
 def _parse_axis_order(text: str) -> tuple[int, int, int]:
-    """Parse '0,1,2' / '0 1 2' into the wrist-axis permutation.
+    """Parse '0,1,2' / '0 1 2' into the wrist-axis correspondence.
 
     Wrist joints are [yaw, pitch, roll]; the controller differential's
     Euler ZYX components are [about z, about y, about x]. The default
     (0,1,2) means controller z -> yaw, y -> pitch, x -> roll. A
-    permutation such as 2,1,0 swaps the controller x/z assignment (use it
-    when a single anatomical DOF visibly lands on the wrong wrist joint).
+    permutation such as 2,1,0 swaps the controller x/z assignment. It is
+    applied to the controller differential BEFORE the exact wrist-chain
+    solve, together with the per-axis signs.
     """
     try:
         return chain_v3.parse_wrist_axis_order(text)
@@ -688,7 +691,8 @@ def main() -> int:
         "--wrist-scale",
         type=float,
         default=1.0,
-        help="gain on the controller-quaternion differential -> wrist command",
+        help="gain on the controller differential (scales the rotation angle) "
+        "before the exact wrist-chain solve",
     )
     for axis in ("yaw", "pitch", "roll"):
         ap.add_argument(
@@ -709,11 +713,12 @@ def main() -> int:
             type=_parse_axis_order,
             default=_axis_order_default(f"WRIST3_AXIS_ORDER_{suffix.upper()}"),
             help=(
-                f"{side} controller-axis -> wrist-joint permutation "
+                f"{side} controller-axis -> wrist-joint correspondence "
                 f"(env WRIST3_AXIS_ORDER_{suffix.upper()}); wrist joints are "
                 "[yaw,pitch,roll], default 0,1,2 = controller z->yaw, y->pitch, "
                 "x->roll. Use e.g. 2,1,0 if a single anatomical DOF lands on the "
-                "wrong wrist joint"
+                "wrong wrist joint. Applied to the differential before the exact "
+                "wrist solve; not a per-joint scale"
             ),
         )
     ap.add_argument(

@@ -325,36 +325,89 @@ while time.monotonic() - t0 < 60:
 **症状**：操作者只做一个解剖方向的腕动作（例如屈伸），机器人响应的却是另一个
 腕关节，或者 yaw/pitch/roll 同时动；松手重新咬合后方向又变。
 
-**根因（v3 链 `WristClutch.step` 的旧实现）**：控制器差分
-`delta = R_a⁻¹ R_now` 已经是在**控制器 anchor 坐标系**里的旋转（控制器 body
-轴与手刚性固连），旧代码却又做了一次
-`d = W_a⁻¹ delta W_a`，其中 `W_a = Rz(q_a)Ry(p_a)Rx(r_a)` 是**腕关节角**
-的旋转矩阵。这个共轭只有在腕 anchor `q_a ≈ 0` 时才是恒等映射；它既不是
-controller→wrist 的安装对齐，也不是世界→腕帧的变换。非零 anchor 时，单个
-控制器轴的旋转会被拆到三个关节上：
+### 10.1 先认清机构：yaw 在前，pitch/roll 是十字轴对
 
-| 控制器输入 | 旧输出 dq（anchor `[0.5, 0.2, -0.3]` rad） |
+X2 腕链（URDF `x2_ultra.urdf`、MJCF `x2_ultra.xml`、厂商 RL deploy 的
+x2.xml 三处一致，HAL 限位表也按这组角定义）：
+
+```
+elbow -> wrist_yaw (axis z, 近端) -> wrist_pitch (axis y) -> wrist_roll (axis x, 远端)
+```
+
+pitch 关节原点距 yaw 关节 82 mm，**roll 关节与 pitch 关节原点重合**，即
+pitch/roll 两轴交于一点——这是十字轴（Cardan/万向节）对，电机在 forearm 里
+并联驱动，HAL 下发/反馈的是这组 **Cardan 输出角**（厂商 RL deploy 用同一
+MJCF 做 sim2real，厂商 teleop 示例也把 `wrist_pr`/`wrist_yaw` 直接写进
+这三个关节槽）。
+
+由此得到两条硬事实，决定了「一个输入 DOF 应该动几个关节」：
+
+- **tool roll（绕工具自身 x 轴）**：`W_a·Rx(θ) = Rz Ry Rx(r+θ)`，任何 anchor
+  下都只动 roll 关节。
+- **tool pitch/yaw（绕工具自身 y/z）**：近端/中段轴与工具当前轴不重合，
+  anchor 非零时**必须** pitch+roll（或三个关节）协同，否则工具朝向就不对。
+  这不是映射 bug，是机构自由度排布决定的。
+
+因此验收判据是**手（工具）的朝向**是否跟手柄一致，而不是「是否只有一个
+关节在动」。
+
+### 10.2 两版错误映射（历史）
+
+控制器差分 `delta = R_a⁻¹ R_now` 是**控制器 anchor body 系**里的旋转
+（控制器 body 轴与手刚性固连）。第一次实现用 `W_a⁻¹ delta W_a` 共轭
+（`W_a = Rz(q_a)Ry(p_a)Rx(r_a)` 是腕关节角），只有 `q_a ≈ 0` 时才等于
+恒等映射，非零 anchor 下单个控制器轴被拆到三个关节：
+
+| 控制器输入 | 共轭输出 dq（anchor `[0.5, 0.2, -0.3]` rad） |
 |---|---|
 | 绕 x +30° | `[-2.7, -14.9, +26.3]°` |
 | 绕 y +30° | `[+14.2, +20.5, +17.2]°` |
 | 绕 z +30° | `[+28.6, -6.9, -7.9]°` |
 
-**修复**：直接在控制器 anchor 帧取 ZYX 差分，不做共轭：
-`q_tgt = q_wa + scale * signs * delta.as_euler("ZYX")[axis_order]`。
-单轴输入严格只驱动一个腕关节，与腕 anchor 无关。自检
-`wrist_nonzero_anchor_decoupled`（v3 链 + 真机节点 `--self-test`）覆盖
-非零腕 anchor + 非零控制器 anchor 的六种单轴输入。
+第二次实现改成「关节镜像」`q_tgt = q_wa + scale*signs*euler_ZYX(delta)`，
+去掉了共轭，但它在非零 anchor 下仍然不是腕链的逆：只有零 anchor 和
+tool-roll 精确。20° 单轴输入的工具姿态误差（数值实验）：
 
-**真机标定/排查**：
+| anchor `(yaw,pitch,roll)` | 工具绕 x | 绕 y | 绕 z |
+|---|---|---|---|
+| `(17°, 14°, -34°)` | 0.00° | 11.8° | 12.6° |
+| `(0°, 30°, -30°)` | 0.00° | 10.3° | 14.1° |
 
-1. 先分别做腕 yaw / pitch / roll 各 20–30°（不要同时转），看 record 列
-   49:52（左）/ 52:55（右）的 `wrist cmd` 是否只有一个分量动。列 55:61
-   是控制器原始差分 `(yaw,pitch,roll)`，可用于对照输入轴。
-2. **方向反了**：`--wrist-{yaw,pitch,roll}-sign-l/-r` 翻 ±1。
-3. **落到了错误的腕关节**：`--wrist-axis-order-l/-r` 是 permutation，默认
-   `0,1,2` = 控制器 z→yaw、y→pitch、x→roll。交换 x/z 用 `2,1,0`；另外两对
-   用 `0,2,1` / `1,0,2`。这是「把控制器 body 轴映射到腕关节轴」的标定，
-   与握持方式有关，换握法/换人后要复查。
+共轭版同一组 anchor 下是 18–26°。
+
+### 10.3 正确映射（现行）
+
+精确求腕链的逆：
+
+```
+Δ        = R_a⁻¹ R_now                   # 控制器 anchor body 系
+Δ_robot  = C · Δ · Cᵀ                   # C: 每侧 signs + axis_order
+W(q_tgt) = W(q_wa) · Δ_robot            # W = Rz(yaw)Ry(pitch)Rx(roll)
+q_tgt    = euler_ZYX(W(q_wa) · Δ_robot)
+```
+
+`scale` 作用在旋转角（rotvec）上。`C` 是控制器 body 轴到腕关节轴的常量
+有符号置换（默认 `0,1,2` + 每侧默认符号 = 控制器 z→yaw、y→pitch、
+x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真机
+节点 `--self-test`）在非零腕/控制器 anchor 下覆盖三轴、两种轴序和默认
+符号，要求工具姿态误差 < 1e-6 rad；另钉住「tool roll 只动 roll 关节」。
+
+### 10.4 真机标定/排查
+
+1. 先分别做 tool yaw / pitch / roll 各 20–30°（不要同时转），**看手的
+   朝向**。列 55:61 是控制器原始差分 `(yaw,pitch,roll)`，列 49:55 是腕
+   cmd，可用于离线对照。
+2. **tool roll 却动了 pitch/yaw，或工具朝向整体偏到别的轴**：先查
+   `--wrist-axis-order-l/-r`（默认 `0,1,2`，交换 x/z 用 `2,1,0`，另两对
+   用 `0,2,1` / `1,0,2`），再查 `--wrist-{yaw,pitch,roll}-sign-l/-r`。
+   换握法/换人后要复查。
+3. **tool pitch/yaw 动了 2–3 个关节是正常的**：只要工具朝向跟手一致就
+   不要“修”。若工具朝向斜向另一个轴，才回到第 2 步。
 4. 腕 pitch 只有 ±32°、roll 左右不对称（左 `[-90°, +41.5°]`、右
    `[-41.5°, +90°]`），大幅动作会先顶到限位；先小幅度确认轴和方向，再加大。
-5. 若上游肩/肘仍随纯腕动作周期性动，那是 §9 的 lever 问题，不是本节。
+5. 若怀疑真机的 pitch/roll 关节语义不是 Cardan 输出角（而是差动电机角），
+   做一次静态检查：在腕零位分别只发 `wrist_pitch=+0.3` 和
+   `wrist_roll=+0.3`，pitch 应绕 pitch 铰轴转、hand 不滚转，roll 应绕工具
+   x 轴转。若两个命令都产生耦合运动，停止使用当前映射，需要向厂商确认
+   关节角语义后再改（本仓库的 URDF/厂商 RL 模型都按输出角建模）。
+6. 若上游肩/肘仍随纯腕动作周期性动，那是 §9 的 lever 问题，不是本节。

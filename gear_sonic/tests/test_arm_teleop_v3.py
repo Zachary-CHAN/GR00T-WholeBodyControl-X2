@@ -81,7 +81,7 @@ def test_posture_gain_null_space():
     a3.CHAIN_V3_CHECKS[16][1]()
 
 
-def test_wrist_nonzero_anchor_decoupled():
+def test_wrist_nonzero_anchor_tracks_tool_rotation():
     a3.CHAIN_V3_CHECKS[17][1]()
 
 

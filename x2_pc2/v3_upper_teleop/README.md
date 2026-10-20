@@ -212,12 +212,14 @@ ros2 run czq_examples incremental_upper_teleop_v3 \
 - `--backend dls`：默认；PC2 只能 dls。
 - 腕轴方向反了：`--wrist-yaw-sign-l/-r`、`--wrist-pitch-sign-l/-r`、
   `--wrist-roll-sign-l/-r` 各翻 ±1（先跑 §1.1 的 wrist tape 确认方向）。
-- **单个腕 DOF 落到了错误的关节**：`--wrist-axis-order-l/-r` 是一个
+- **单个控制器轴落到了错误的腕关节**：`--wrist-axis-order-l/-r` 是一个
   permutation（默认 `0,1,2`）。腕关节顺序是 `[yaw, pitch, roll]`，控制器
   差分 Euler ZYX 的顺序是 `[绕 z, 绕 y, 绕 x]`；默认即
   `控制器 z→yaw、y→pitch、x→roll`。若转动一个解剖 DOF 时响应的却是另一个
   腕关节，先试 `2,1,0`（交换 x/z），也可用 `0,2,1` / `1,0,2` 交换另外两对。
-  这是 2026-10-20 真机「单 DOF 输入、多关节联动」修复后的标定旋钮（根因见 §6.2）。
+  注意：在精确腕链解下，tool pitch/yaw 在腕非零时协同多个关节是**机构
+  决定的正确行为**；只有「转 tool roll 却动了 pitch/yaw」或「工具朝向整体
+  偏到别的轴」才需要换轴序。判据与根因见 §6.2。
 
 ### 4.2 laptop sender（W-C）
 
@@ -337,17 +339,30 @@ PY
 1. **后端不同**：MuJoCo v3 harness 默认 `mink`，PC2 只有 `dls`。两者跑的是
    同一条 v3 tick 链、同一组守卫，但求解器实现不同（QP vs DLS）。PC2 的
    `--self-test --backend dls` 必须全绿；首跑仍按新模型上吊架。
-2. **腕部映射（2026-10-20 真机问题已修）**：旧代码把控制器差分
-   `R_a⁻¹ R_now` 用 `Rz(q_a)Ry(p_a)Rx(r_a)` 做共轭再取 Euler。该共轭只在
-   **腕 anchor 为零**时是恒等映射；一旦咬合时腕已经弯曲，单个控制器轴
-   的旋转会泄漏到另外两个关节（数值实验：anchor `[0.5,0.2,-0.3]`、绕 y
-   转 30° → 三个关节同时动 14–20°），这正是「一个 DOF 映射到另一个 DOF /
-   两个 DOF 联动」的根因。现已改为直接在**控制器 anchor 坐标系**取 ZYX
-   差分：控制器绕 x/y/z 的单轴旋转严格只驱动腕 roll/pitch/yaw 之一，
-   与腕 anchor 无关（新增自检 `wrist_nonzero_anchor_decoupled` 覆盖）。
-   `DEFAULT_WRIST_SIGNS` 仍来自 v1 + 镜像推导、未在真机验证；若单轴方向
-   反了用 `--wrist-*-sign-*` 翻符号，若轴落错关节用
-   `--wrist-axis-order-l/-r`（§4.1）。
+2. **腕部映射（2026-10-20 真机问题，第二次修正）**：X2 腕部模型是
+   yaw 在前（近端 z 轴），pitch/roll 两轴交于一点（十字轴并联对），roll
+   在最远端（x 轴）——见 URDF `x2_ultra.urdf` 与厂商 RL deploy 的 MJCF；
+   HAL 的限位表也按这组 Cardan 输出角定义。因此「人体一个 DOF → 机器人
+   一个关节」不是正确的跟踪目标：腕 anchor 非零时，绕**工具** y/z 的旋转
+   本来就需要 pitch+roll（或三个关节）协同，只有 tool roll 始终只动 roll
+   关节。正确映射是精确解腕链：
+
+   ```
+   Δ        = R_a⁻¹ R_now                 # 控制器 anchor body 系
+   Δ_robot  = C · Δ · Cᵀ                 # C = signs + axis_order
+   W(q_tgt) = W(q_wa) · Δ_robot          # W = Rz(yaw)Ry(pitch)Rx(roll)
+   q_tgt    = euler_ZYX(W(q_wa) · Δ_robot)
+   ```
+
+   历史错误：旧版 `W_a⁻¹ Δ W_a` 共轭在非零 anchor 下有 18–26° 的**工具**
+   姿态误差；上一版「关节镜像」`q_wa + euler(Δ)` 仍有 10–14°（只有零
+   anchor 和 tool roll 精确）。精确解后误差 < 1e-6 rad，自检
+   `wrist_nonzero_anchor_tracks_tool_rotation` 用非零腕/控制器 anchor
+   覆盖三个轴、两种轴序和默认符号。`DEFAULT_WRIST_SIGNS` 仍未在真机
+   验证：方向反了用 `--wrist-*-sign-*`，轴落错关节用
+   `--wrist-axis-order-l/-r`（§4.1）。真机判据看**手（工具）的朝向**，
+   不要用「是否只有一个关节在动」判断——pitch/yaw 输入下多关节协同
+   是十字轴腕机构本身决定的；若观察到工具朝向与手柄不一致才是问题。
 3. **节点不发布手指**：v3 的 `hand`（trigger）只在 record 里可诊断；真机手
    走 sender 的 `hand_finger_cmd` 独立线。必须
    `--hand-source trigger --hand-close-on-grip` **且** PC2 的 msgpack CLAW

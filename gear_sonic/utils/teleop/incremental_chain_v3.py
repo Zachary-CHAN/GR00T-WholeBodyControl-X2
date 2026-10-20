@@ -14,22 +14,27 @@ guard, pose LPF. Deliberate changes:
    along in the FK (they move the solved point -- the spherical wrist
    centre -- by at most 0.98 mm, so the 4-DoF solve re-runs against the
    CURRENT wrist command every tick to keep its sub-mm residual honest).
-   The wrist itself follows the v1 recipe: per-axis mapping of the
-   controller quaternion differential, anchored at engage. The diff is
-   already expressed in the CONTROLLER anchor frame (the controller body
-   axes are rigid with the hand), so its ZYX split IS the joint-space
-   differential:
-       delta       = a_op_inv * R_now              (body-frame diff)
-       q_wrist_tgt = q_wa + scale * signs * delta.as_euler("ZYX")[axis_order]
-   One controller axis moves exactly one wrist joint, independent of the
-   wrist anchor. Do NOT conjugate by W_a = Rz(q_a)Ry(p_a)Rx(r_a): that is
-   only the identity map at a zero anchor, and off-neutral it leaked a
-   single-axis input into all three joints (2026-10-20 robot report:
-   "one wrist DOF maps to another DOF, or two move together"). The ZYX
-   decomposition matches the wrist chain Rz->Ry->Rx exactly; constant
-   grasp offsets cancel at the anchor, leaving only per-axis mirror signs
-   and an optional axis permutation (env/CLI knobs, tape-verified before
-   robot).
+   The wrist is filled from the controller quaternion differential,
+   anchored at engage, by solving the wrist chain exactly:
+       delta       = a_op_inv * R_now              (controller body frame)
+       delta_robot = C * delta * C^T               (C: signs + axis_order)
+       W(q_wrist)  = W(q_wa) * delta_robot         (W = Rz(yaw)Ry(pitch)Rx(roll))
+       q_wrist_tgt = euler_ZYX(W(q_wa) * delta_robot)
+   C is the constant signed-permutation correspondence between the
+   controller body axes and the wrist joint axes (the historical
+   --wrist-*-sign-* / --wrist-axis-order-* knobs). The X2 wrist as
+   modeled by the vendor URDF/MJCF (and used by the vendor RL deploy and
+   HAL limit tables) is yaw proximal (z), then pitch (y) and roll (x,
+   distal) whose axes intersect at one point -- a cross-axis pair driven
+   in parallel through the forearm. With that chain a rotation about the
+   tool's own x axis is always the roll joint alone, but a rotation about
+   the tool's y or z axis is NOT a single-joint motion once the distal
+   joints are off neutral: exact hand-orientation tracking coordinates
+   pitch+roll (or all three). Do not replace the solve with the
+   joint-space mirroring q_wa + euler(delta): it is exact only at a zero
+   anchor / tool roll, and at a bent wrist it left 10-14 deg of tool
+   error on a 20 deg input (2026-10-20 robot report: track still poor).
+   The older W_a^-1 delta W_a conjugation was worse (18-26 deg).
 
    ``full_pose_ik=True`` is an explicit opt-in alternative: the FULL
    7-DoF pose IK (position AND orientation tasks, both gains 1.0 -- equal
@@ -134,12 +139,15 @@ DEFAULT_WRIST_SIGNS = {
 
 
 def parse_wrist_axis_order(text) -> tuple[int, int, int]:
-    """Parse '0,1,2' into a wrist-joint <- controller-axis permutation.
+    """Parse '0,1,2' into a wrist-joint <- controller-axis correspondence.
 
-    Wrist joints are [yaw, pitch, roll]; the differential's Euler ZYX
-    components are [about z, about y, about x]. The default (0,1,2) maps
-    controller z->yaw, y->pitch, x->roll. Use 2,1,0 to swap the x/z
+    Wrist joints are [yaw, pitch, roll]; the controller differential's
+    ZYX components are [about z, about y, about x]. The default (0,1,2)
+    maps controller z->yaw, y->pitch, x->roll. Use 2,1,0 to swap the x/z
     assignment when a single anatomical DOF lands on the wrong joint.
+    The permutation feeds the constant frame correspondence C applied to
+    the differential BEFORE the exact wrist solve (see WristClutch); it is
+    not a per-joint scaling of Euler components.
     """
     try:
         order = tuple(int(v) for v in str(text).replace(",", " ").split())
@@ -151,26 +159,35 @@ def parse_wrist_axis_order(text) -> tuple[int, int, int]:
 
 
 class WristClutch:
-    """Per-axis differential wrist mapping, anchored at engage.
+    """Exact X2 wrist-chain solve from the controller differential, anchored
+    at engage.
 
     engage() snapshots the wrist q AND the controller orientation; every
     held tick recomputes the FULL differential from the anchor (not a
     per-tick increment -- no integration drift, and a constant controller
     pose yields a bit-exact constant command).
 
-    The differential ``R_a^-1 R_now`` is already expressed in the
-    CONTROLLER's anchor frame, and the controller body axes are rigid with
-    the hand. Its ZYX split is therefore the joint-space differential:
-    a rotation about the controller's x/y/z axis lands on wrist
-    roll/pitch/yaw alone, for ANY wrist anchor. Do NOT conjugate it by the
-    wrist anchor ``Rz(qy)Ry(qp)Rx(qr)``: that was a frame error (the
-    wrist-anchor orientation is not the controller-to-wrist alignment),
-    and away from a zero anchor it turned a pure controller-axis rotation
-    into multi-joint motion (2026-10-20 robot report: "one wrist DOF maps
-    to another DOF or two DOFs move together"). ``axis_order`` permutes
-    the three controller axes onto the three wrist joints if the physical
-    grip puts an anatomical DOF on a different controller axis; the
-    default is identity (controller z->yaw, y->pitch, x->roll).
+    The differential ``R_a^-1 R_now`` is expressed in the CONTROLLER's
+    anchor frame, and the controller body axes are rigid with the hand.
+    The robot wrist must realize that same body-frame rotation in its tool
+    frame, so the joint target is the ZYX decomposition of
+    ``W(q_wa) @ delta_robot`` with ``W = Rz(yaw)Ry(pitch)Rx(roll)`` --
+    the exact inverse of the X2 wrist chain (yaw proximal, pitch/roll
+    cross-axis, roll distal).
+
+    Consequences: a controller rotation about x (tool roll) stays a pure
+    roll-joint motion at any anchor; a rotation about y/z (tool pitch/yaw)
+    moves pitch+roll (or all three) once the distal joints are off
+    neutral. That coordination is the mechanism, not a mapping bug -- the
+    TOOL orientation is what must track. The old joint-space mirroring
+    ``q_wa + euler(delta)`` (2026-10-20 first fix) is exact only at a zero
+    anchor / tool roll and leaves 10-14 deg of tool error at a bent wrist;
+    the older ``W_a^-1 delta W_a`` conjugation was worse (18-26 deg).
+
+    ``signs`` and ``axis_order`` define the constant signed-permutation
+    correspondence C between controller body axes and wrist joint axes
+    (default: controller z->yaw, y->pitch, x->roll, all +). It is applied
+    as ``C delta C^T`` BEFORE the solve.
     """
 
     def __init__(
@@ -195,6 +212,17 @@ class WristClutch:
         if sorted(order.tolist()) != [0, 1, 2]:
             raise ValueError(f"axis_order must be a permutation of 0,1,2; got {order.tolist()}")
         self.axis_order = order
+        # Constant controller-axis -> wrist-axis correspondence C (signed
+        # permutation): C maps a controller-frame rotation vector to the
+        # wrist-frame one, delta_robot = C delta C^T. Wrist joint i is the
+        # xyz axis (z, y, x) = (2, 1, 0); Euler component k is that same
+        # xyz axis. Signs flip the direction of the corresponding
+        # controller axis.
+        self._corr = np.zeros((3, 3), np.float64)
+        for i in range(3):
+            robot_axis = (2, 1, 0)[i]  # yaw->z, pitch->y, roll->x
+            ctrl_axis = (2, 1, 0)[order[i]]
+            self._corr[robot_axis, ctrl_axis] = self.signs[i]
         # slew: bounds the commanded step per tick so the freeze guard's
         # jump threshold (0.22 rad) can never fire on wrist motion alone
         self.slew = float(slew_rad_s) * DT
@@ -242,13 +270,23 @@ class WristClutch:
         if np.linalg.norm(q) < 1e-6:
             return self.cmd.copy()
         delta = self._a_op_inv * _rot_from_quat_wxyz(q)
-        if delta.magnitude() > self.pi_guard:
+        delta_mag = delta.magnitude()
+        if delta_mag > self.pi_guard:
             self.dropped_ticks += 1
             self.last_delta_ypr = np.zeros(3)
             return self.cmd.copy()
         self.last_delta_ypr = delta.as_euler("ZYX")  # (yaw, pitch, roll)
-        dq = self.last_delta_ypr[self.axis_order]
-        tgt = self._q_wa + self.scale * self.signs * dq
+        if delta_mag < 1e-12:
+            # bit-exact hold for a constant controller pose: skip the
+            # euler -> matrix -> euler round trip (it perturbs the last
+            # bits and would defeat the anchored no-drift guarantee)
+            return self.cmd.copy()
+        # controller body-frame rotation -> wrist-frame rotation, then the
+        # exact wrist chain solve W(q_tgt) = W(q_wa) * delta_robot.
+        rotvec = self._corr @ delta.as_rotvec()
+        delta_robot = sRot.from_rotvec(self.scale * rotvec)
+        w_anchor = sRot.from_euler("ZYX", self._q_wa)
+        tgt = (w_anchor * delta_robot).as_euler("ZYX")
         tgt = np.clip(tgt, self.limits[:, 0], self.limits[:, 1])
         self.cmd = self.cmd + np.clip(tgt - self.cmd, -self.slew, self.slew)
         return self.cmd.copy()
@@ -706,9 +744,10 @@ def check_wrist_zero_delta_noop() -> None:
 
 
 def check_wrist_single_axis_direction() -> None:
-    """A pure controller rotation about one world axis must map to exactly
-    the corresponding wrist joint (ZYX split), on both sides, and a sign
-    flip must flip the output.
+    """At a ZERO wrist anchor a pure controller rotation about one world
+    axis must map to exactly the corresponding wrist joint (the exact
+    solve reduces to the ZYX split there), on both sides, and a sign flip
+    must flip the output.
 
     ``full_pose_ik=False`` on purpose: this pins the WristClutch mapping,
     which only IS the wrist on the 4-DoF path. On the opt-in full-pose
@@ -741,59 +780,77 @@ def check_wrist_single_axis_direction() -> None:
                 assert np.isfinite(got).all()
 
 
-def check_wrist_nonzero_anchor_decoupled() -> None:
-    """A pure controller-axis rotation must move EXACTLY one wrist joint
-    even when both the wrist and the controller are anchored off-neutral.
+def check_wrist_nonzero_anchor_tracks_tool_rotation() -> None:
+    """A controller body-frame rotation must be realized as the SAME tool
+    rotation, even when wrist and controller anchor off-neutral:
+    ``W(q_cmd) == W(q_wa) @ C delta C^T`` with ``W = Rz Ry Rx``.
 
-    This is the 2026-10-20 robot regression: the old code conjugated the
-    differential by ``Rz(q_a)Ry(p_a)Rx(r_a)``, which is only the identity
-    map at a zero wrist anchor. With a bent wrist at engage, a pure
-    controller rotation leaked into the other two joints (a 30 deg input
-    produced up to ~15 deg on an unintended joint), which the operator saw
-    as "one wrist DOF maps to another DOF, or two move together".
+    This is the 2026-10-20 robot regression. The old code conjugated by
+    ``W(q_wa)`` (``W_a^-1 delta W_a``), and the first fix replaced it with
+    joint-space mirroring ``q_wa + euler(delta)``. Both are exact only at
+    a zero wrist anchor (the mirroring is also exact for tool roll, the
+    distal x axis). At a bent anchor a 20 deg pitch/yaw input left 10-14
+    deg (mirroring) or 18-26 deg (conjugation) of TOOL orientation error,
+    which the operator saw as the wrist not tracking.
 
-    Also pins the ``axis_order`` permutation: (2, 1, 0) must route the
-    controller x rotation to yaw instead of roll, still with zero leak.
+    Why a single input axis legitimately moves >1 joint here: the X2
+    wrist is yaw (proximal, z) -> pitch (y) -> roll (distal, x), with the
+    pitch/roll crossing at one point (cross-axis pair). Rotating the tool
+    about its own y or z axis is not a single-joint motion once pitch/roll
+    are off neutral; the exact solve coordinates them. What must be
+    one-DOF-in/one-DOF-out is the TOOL motion, which this check pins.
     """
     wrist_anchor = np.array([0.35, 0.15, -0.30])  # in range on BOTH sides
     rot_anchor = sRot.from_euler("ZYX", [0.6, -0.4, 0.8])  # non-identity grip
-    axes = (("z", 0), ("y", 1), ("x", 2))
+    anchor_quat = _rot_to_quat_wxyz(rot_anchor)
+    cases = (
+        ((0, 1, 2), (1.0, 1.0, 1.0)),
+        ((2, 1, 0), (1.0, 1.0, 1.0)),
+        ((0, 1, 2), (-1.0, 1.0, -1.0)),
+    )
+    checked = 0
     for side in ("left", "right"):
-        for axis, idx in axes:
-            for order, out_idx in (((0, 1, 2), idx), ((2, 1, 0), {0: 2, 1: 1, 2: 0}[idx])):
-                arm = ClutchArmV3(
-                    side,
-                    full_pose_ik=False,
-                    wrist_signs={"left": (1, 1, 1), "right": (1, 1, 1)},
-                    wrist_axis_order=order,
-                )
-                arm.q[4:7] = wrist_anchor
-                pos0, _ = arm.solver.fk(arm.q)
-                pose = np.zeros(7)
-                pose[:3] = pos0
-                pose[3:] = rot_anchor.as_quat(scalar_first=True)
-                assert arm.engage(pose), f"{side}: engage refused a valid pose"
-                # rotation about the controller's OWN axis at the anchor
-                moved = pose.copy()
-                moved[3:] = (rot_anchor * sRot.from_euler(axis, np.radians(20.0))).as_quat(
-                    scalar_first=True
-                )
-                for _ in range(300):  # past the 6 rad/s slew
-                    arm.step(True, moved)
-                got = arm.wrist.cmd
-                # 20 deg keeps pitch inside its narrow +-0.558 rad range
-                want = wrist_anchor[out_idx] + np.radians(20.0)
-                assert abs(got[out_idx] - want) < np.radians(1.0), (
-                    f"{side} axis {axis} order {order}: wrist[{out_idx}] "
-                    f"{np.degrees(got[out_idx]):.2f} deg, want {np.degrees(want):.2f}"
-                )
-                for i in range(3):
-                    if i == out_idx:
+        for order, signs in cases:
+            for axis in ("x", "y", "z"):
+                for deg in (20.0, -20.0):
+                    w = WristClutch(side, signs=signs, axis_order=order)
+                    assert w.engage(wrist_anchor, anchor_quat)
+                    delta = sRot.from_euler(axis, np.radians(deg))
+                    moved = _rot_to_quat_wxyz(rot_anchor * delta)
+                    cmd = w.cmd.copy()
+                    for _ in range(300):  # past the 6 rad/s slew
+                        cmd = w.step(moved)
+                    expected = w._corr @ delta.as_rotvec()
+                    desired = sRot.from_euler("ZYX", wrist_anchor) * sRot.from_rotvec(expected)
+                    q_exact = desired.as_euler("ZYX")
+                    # skip inputs that legitimately clamp at a joint limit
+                    if np.any(q_exact < w.limits[:, 0]) or np.any(q_exact > w.limits[:, 1]):
                         continue
-                    assert abs(got[i] - wrist_anchor[i]) < np.radians(1.0), (
-                        f"{side} axis {axis} order {order}: cross-axis leak "
-                        f"wrist[{i}] {np.degrees(got[i] - wrist_anchor[i]):.2f} deg"
+                    got = sRot.from_euler("ZYX", cmd)
+                    err = (got.inv() * desired).magnitude()
+                    assert err < 1e-6, (
+                        f"{side} axis {axis} {deg:+.0f} order {order} signs {signs}: "
+                        f"tool error {np.degrees(err):.3f} deg"
                     )
+                    np.testing.assert_allclose(
+                        cmd,
+                        q_exact,
+                        atol=1e-6,
+                        err_msg=f"{side} axis {axis} {deg:+.0f} order {order} signs {signs}",
+                    )
+                    checked += 1
+    assert checked >= 18, f"only {checked} unclipped cases exercised"
+
+    # Pure tool roll (controller x, identity correspondence) must remain a
+    # pure roll-joint motion at ANY anchor: W_a Rx(t) = Rz Ry Rx(r+t).
+    for side in ("left", "right"):
+        w = WristClutch(side, signs=(1.0, 1.0, 1.0), axis_order=(0, 1, 2))
+        assert w.engage(wrist_anchor, anchor_quat)
+        moved = _rot_to_quat_wxyz(rot_anchor * sRot.from_euler("x", np.radians(20.0)))
+        for _ in range(300):
+            cmd = w.step(moved)
+        np.testing.assert_allclose(cmd[:2], wrist_anchor[:2], atol=1e-6)
+        assert abs(cmd[2] - (wrist_anchor[2] + np.radians(20.0))) < 1e-6
 
 
 def check_wrist_limit_clamp() -> None:
@@ -1489,7 +1546,7 @@ CHECKS = [
     ("ctrl_lever_pure_wrist_rotation", check_ctrl_lever_pure_wrist_rotation),
     ("position_deadband", check_position_deadband),
     ("posture_gain_null_space", check_posture_gain_null_space),
-    ("wrist_nonzero_anchor_decoupled", check_wrist_nonzero_anchor_decoupled),
+    ("wrist_nonzero_anchor_tracks_tool_rotation", check_wrist_nonzero_anchor_tracks_tool_rotation),
 ]
 
 

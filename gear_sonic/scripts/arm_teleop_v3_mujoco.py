@@ -13,10 +13,13 @@ rotation spreading over the whole arm). v3 changes three things
 * arm IK defaults to the v1-style 4-DoF split: position-only solve over
   shoulder-3 + elbow, the three wrist joints LOCKED at the wrist command
   (re-fed into the FK every tick -- wrist_yaw has an ~82 mm EE lever) and
-  driven by a v1-style per-axis differential mapping of the controller
-  quaternion (anchored conjugation + ZYX split, slew + near-pi guard +
-  joint limits). ``--full-pose-ik`` opts into the 7-DoF pose solve
-  instead (position and orientation task gains both 1.0);
+  driven by the controller quaternion differential through the EXACT wrist
+  chain solve ``W(q_tgt) = W(q_wa) @ C delta C^T``
+  (``W = Rz(yaw)Ry(pitch)Rx(roll)``; slew + near-pi guard + joint
+  limits). The wrist is yaw-proximal with pitch/roll cross-coupled, so a
+  tool pitch/yaw rotation coordinates pitch+roll off neutral; tool roll is
+  always the roll joint alone. ``--full-pose-ik`` opts into the 7-DoF pose
+  solve instead (position and orientation task gains both 1.0);
 * HAND INVERTED: the hand is OPEN at rest and CLOSES when the TRIGGER is
   pressed (the LPF'd trigger is the hand channel); the GRIP is the per-arm
   clutch (2026-10 role swap; the constant / flag names are historical).
@@ -237,7 +240,8 @@ def main() -> int:
         "--wrist-scale",
         type=float,
         default=1.0,
-        help="gain on the controller-quaternion differential -> wrist command",
+        help="gain on the controller differential (scales the rotation angle) "
+        "before the exact wrist-chain solve",
     )
     for axis in ("yaw", "pitch", "roll"):
         ap.add_argument(
@@ -260,10 +264,11 @@ def main() -> int:
                 os.environ.get(f"WRIST3_AXIS_ORDER_{suffix.upper()}", "0,1,2")
             ),
             help=(
-                f"{side} controller-axis -> wrist-joint permutation "
+                f"{side} controller-axis -> wrist-joint correspondence "
                 f"(env WRIST3_AXIS_ORDER_{suffix.upper()}); wrist joints are "
                 "[yaw,pitch,roll], default 0,1,2 = controller z->yaw, y->pitch, "
-                "x->roll"
+                "x->roll. Applied to the differential before the exact wrist "
+                "solve; not a per-joint scale"
             ),
         )
     ap.add_argument(
