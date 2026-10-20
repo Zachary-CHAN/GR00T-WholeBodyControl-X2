@@ -81,6 +81,10 @@ def test_posture_gain_null_space():
     a3.CHAIN_V3_CHECKS[16][1]()
 
 
+def test_wrist_nonzero_anchor_decoupled():
+    a3.CHAIN_V3_CHECKS[17][1]()
+
+
 def test_wire_roundtrip():
     a3.check_wire_roundtrip()
 

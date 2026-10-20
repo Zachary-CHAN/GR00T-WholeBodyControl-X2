@@ -14,7 +14,7 @@
 | | v2 节点 | **v3 节点** |
 |---|---|---|
 | 离合 | 扳机（trigger） | **握把（grip）** |
-| 手指通道 | 握把 | 扳机（节点**不发布手**，故真机上无效） |
+| 手指通道 | 握把 | **扳机**（sender 独立 `hand_finger_cmd` 线；节点本身不发布手） |
 | 手臂 IK | 7-DoF pose IK | **4-DoF 位置 IK（肩 3 + 肘）+ 腕部 WristClutch 直填** |
 | 腰 | 跟随操作者躯干扭转 | **固定 `--waist-stand`（默认 0）** |
 | SMPL | waist 使用 | **完全忽略** |
@@ -22,8 +22,10 @@
 | record | 82 列 | **85 列（与 v3 sim harness 完全一致；qpos 70:85 为 NaN）** |
 
 操作员口令：**捏握把 = 该臂咬合；松开 = 保持；扳机不控制手臂。**
-第一次真机测试建议同时停掉 CLAW 手桥（或 sender 加 `--hand-source off`），
-避免旧的「握把→手」通路和新的「握把→离合」同时动作。
+扳机 = 手指（v3 极性：**按下闭合、静息张开**）。手指不走本节点，而是
+sender 的 `hand_finger_cmd` PUB 到 PC2 `:5572`，由 CLAW 手桥驱动；真机
+必须同时满足「sender 带 `--hand-source trigger --hand-close-on-grip`」
+和「PC2 上 msgpack 模式的 CLAW 手桥在 `:5572` BIND」两个条件（§4.2）。
 
 ---
 
@@ -210,19 +212,65 @@ ros2 run czq_examples incremental_upper_teleop_v3 \
 - `--backend dls`：默认；PC2 只能 dls。
 - 腕轴方向反了：`--wrist-yaw-sign-l/-r`、`--wrist-pitch-sign-l/-r`、
   `--wrist-roll-sign-l/-r` 各翻 ±1（先跑 §1.1 的 wrist tape 确认方向）。
+- **单个腕 DOF 落到了错误的关节**：`--wrist-axis-order-l/-r` 是一个
+  permutation（默认 `0,1,2`）。腕关节顺序是 `[yaw, pitch, roll]`，控制器
+  差分 Euler ZYX 的顺序是 `[绕 z, 绕 y, 绕 x]`；默认即
+  `控制器 z→yaw、y→pitch、x→roll`。若转动一个解剖 DOF 时响应的却是另一个
+  腕关节，先试 `2,1,0`（交换 x/z），也可用 `0,2,1` / `1,0,2` 交换另外两对。
+  这是 2026-10-20 真机「单 DOF 输入、多关节联动」修复后的标定旋钮（根因见 §6.2）。
 
 ### 4.2 laptop sender（W-C）
 
 ```bash
 cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
-./gear_sonic/scripts/run_pico_teleop.sh --pc2-host 10.0.1.41 --hand-source off
+./gear_sonic/scripts/run_pico_teleop.sh --pc2-host 10.0.1.41 \
+  --hand-source trigger --hand-close-on-grip
 ```
 
-- **不要加 `--no-locomotion`**：它会关掉 sender 的控制器层，握把/扳机字段
-  恒 0 → v3 永远无法咬合（v2 文档踩过同一个坑）。
-- `--hand-source off`：不建 sender 的手部通道，避免 CLAW 桥用旧的
-  「握把→手」语义和新的「握把→离合」打架。本节点本来也不发布手。
+- **不要加 `--no-locomotion`**：它会关掉 sender 的控制器层（`dual_mode=False`），
+  握把/扳机字段恒 0、**手部 socket 也不会创建** → v3 永远无法咬合、手指也
+  不会动（v2 文档踩过同一个坑）。
+- `--hand-source trigger`：v3 的角色是「扳机→手」。默认值 `grip` 是旧语义，
+  会把**握把**（现在是离合）同时送去驱动手指。
+- `--hand-close-on-grip`：去掉 sender 默认的 `ratio = 1 - ratio` 反相，得到
+  v3 极性「**按下扳机 = 闭合、松开 = 张开**」。不加这个旗标会变成
+  「静息闭、按下张开」。
+- `--hand-source off` 是**手指不动的直接原因**：它让 sender 根本不创建
+  `hand_sock`，PC2 收不到任何 `hand_finger_cmd`。排查时先看 sender 启动横幅
+  有没有 `hand_finger_cmd PUB -> tcp://10.0.1.41:5572` 和 `[hand] grasp L ... R ...`。
 - 同一目标 host 只允许一个 sender；重复起会被脚本拒绝。
+
+#### 4.2.1 PC2 CLAW 手桥（v3 直连 HAL 时必须有）
+
+v3 节点直接发 `/aima/hal/joint/{arm,waist}/command`，不经过 kplanner 的
+pose 链路；因此 **pose 模式（`:5558`）的手桥收不到 sender 的 msgpack 手部
+帧**。要让 OmniHand 动，必须在 PC2 上另起一个 **msgpack 模式、自己 BIND
+`:5572`** 的手桥（`x2_hand_zmq_to_aimdk_bridge.py`）：
+
+```bash
+# PC2，环境与 x2_pc2/start_x2_hand_bridge.sh 相同
+source /opt/ros/humble/setup.bash
+export AMENT_PREFIX_PATH=/agibot/software/housekeeper/bin/aimdk_msgs:$AMENT_PREFIX_PATH
+export LD_LIBRARY_PATH=/agibot/software/housekeeper/bin/aimdk_msgs/lib:$LD_LIBRARY_PATH
+source /home/run/gear-sonic/ws/install/setup.bash
+export LD_LIBRARY_PATH=/home/run/gear-sonic/onnxruntime/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=/agibot/software/housekeeper/bin/aimdk_msgs/local/lib/python3.10/dist-packages:/home/run/gear-sonic/ws/src:${PYTHONPATH:-}
+
+/home/run/gear-sonic/venv/bin/python3 \
+  /home/run/gear-sonic/ws/src/x2/agi_x2_deploy_onnx_ref/scripts/x2_hand_zmq_to_aimdk_bridge.py \
+  --wire-format msgpack --zmq-host '*' --zmq-port 5572 \
+  --zmq-topic hand_finger_cmd --hand-mode claw --sides auto
+```
+
+- `--hand-mode claw`：本机 OmniHand 是两指 CLAW（位置 1 = 全开，0 = 全闭）；
+  桥会把 sender 的 10-DOF 向量折回 grasp ratio，再转成单标量位置。
+- `--zmq-host '*'`：msgpack 模式下桥是 **BIND** 方（sender PUB-connect 到
+  `10.0.1.41:5572`）；不要沿用 pose 模式的 `--zmq-host localhost`。
+- 起 sender 前在 PC2 上确认端口归属：`ss -ltnp | grep 5572`。如果
+  `pc2_kplanner_onnx.py --arm-connect` 已经占着 5572，二选一：停掉 kplanner
+  （v3 直连 HAL 不需要它），或让 kplanner 继续转发手部帧到 pose 桥
+  （此时用默认 pose 模式手桥，sender 端参数不变）。
+- 手桥没起时，v3 的手臂/腕部仍正常，只是手指保持 HAL 的最后位置。
 
 ### 4.3 当天顺序（与 v2 相同）
 
@@ -231,9 +279,11 @@ cd /home/nvidia/Documents/czq/GR00T-WholeBodyControl-X2
 3. `ros2 run py_examples migrate_system_state Develop_MC` 瘫软（确认吊架吊住）。
 4. W-A：先 `--dry-run` 20 s，再正式起节点。
 5. W-B：`ss -tlnp | grep :5573`；`ros2 topic echo /aima/hal/joint/arm/command --once`。
-6. W-C：起 sender；**捏握把**咬合左/右臂。
-7. 先做「肩肘不动、只转腕」的圆锥/圆圈 20–30 s，看机器人上游关节是否稳定。
-8. Ctrl-C sender → 0.5 s stale → 双臂保持；Ctrl-C 节点 → 停发 hal；迁回 `Ready`。
+6. 起 CLAW 手桥（§4.2.1）；`ss -ltnp | grep 5572` 应看到桥在 BIND。
+7. W-C：起 sender；**捏握把**咬合左/右臂；**按扳机**看手指闭合、松开张开。
+8. 先做「肩肘不动、只转腕」的圆锥/圆圈 20–30 s，看机器人上游关节是否稳定；
+   再单独做腕 yaw / pitch / roll 各 20–30°，确认「一个 DOF 只动一个腕关节」。
+9. Ctrl-C sender → 0.5 s stale → 双臂保持；Ctrl-C 节点 → 停发 hal；迁回 `Ready`。
 
 ---
 
@@ -287,10 +337,22 @@ PY
 1. **后端不同**：MuJoCo v3 harness 默认 `mink`，PC2 只有 `dls`。两者跑的是
    同一条 v3 tick 链、同一组守卫，但求解器实现不同（QP vs DLS）。PC2 的
    `--self-test --backend dls` 必须全绿；首跑仍按新模型上吊架。
-2. **腕轴符号未在真机验证**：`DEFAULT_WRIST_SIGNS` 来自 v1 + 镜像推导。
-   先用 §1.1 的 wrist tape（零 lever）看方向，再自由操作。
+2. **腕部映射（2026-10-20 真机问题已修）**：旧代码把控制器差分
+   `R_a⁻¹ R_now` 用 `Rz(q_a)Ry(p_a)Rx(r_a)` 做共轭再取 Euler。该共轭只在
+   **腕 anchor 为零**时是恒等映射；一旦咬合时腕已经弯曲，单个控制器轴
+   的旋转会泄漏到另外两个关节（数值实验：anchor `[0.5,0.2,-0.3]`、绕 y
+   转 30° → 三个关节同时动 14–20°），这正是「一个 DOF 映射到另一个 DOF /
+   两个 DOF 联动」的根因。现已改为直接在**控制器 anchor 坐标系**取 ZYX
+   差分：控制器绕 x/y/z 的单轴旋转严格只驱动腕 roll/pitch/yaw 之一，
+   与腕 anchor 无关（新增自检 `wrist_nonzero_anchor_decoupled` 覆盖）。
+   `DEFAULT_WRIST_SIGNS` 仍来自 v1 + 镜像推导、未在真机验证；若单轴方向
+   反了用 `--wrist-*-sign-*` 翻符号，若轴落错关节用
+   `--wrist-axis-order-l/-r`（§4.1）。
 3. **节点不发布手指**：v3 的 `hand`（trigger）只在 record 里可诊断；真机手
-   仍走 PC2 的 CLAW 桥，与节点无关。本测试建议 `--hand-source off`。
+   走 sender 的 `hand_finger_cmd` 独立线。必须
+   `--hand-source trigger --hand-close-on-grip` **且** PC2 的 msgpack CLAW
+   手桥在 `:5572` BIND（§4.2 / §4.2.1）。`--hand-source off` 或
+   `--no-locomotion` 都会让手部 socket 不创建，手指完全不动。
 4. **`x2_arm_fk.py` 右臂修正**：见 §2；会影响 v2。备份已做。
 5. **lever 取决于握持**：换握法、换人、隔天重戴都要重标
    （`tools/fit_pico_ctrl_lever.py`，方法见

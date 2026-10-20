@@ -62,6 +62,7 @@ from gear_sonic.utils.teleop.incremental_chain_v3 import (  # noqa: E402
     CHECKS as CHAIN_V3_CHECKS,
     DEFAULT_WRIST_SIGNS,
     IncrementalTeleopTickerV3,
+    parse_wrist_axis_order,
     run_self_test as _chain_v3_run_self_test,
 )
 from gear_sonic.utils.teleop.x2_hand_retarget import (  # noqa: E402
@@ -251,6 +252,20 @@ def main() -> int:
             default=signs_env["right"][axis],
             help=f"right wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_R)",
         )
+    for side, suffix in (("left", "l"), ("right", "r")):
+        ap.add_argument(
+            f"--wrist-axis-order-{suffix}",
+            type=parse_wrist_axis_order,
+            default=parse_wrist_axis_order(
+                os.environ.get(f"WRIST3_AXIS_ORDER_{suffix.upper()}", "0,1,2")
+            ),
+            help=(
+                f"{side} controller-axis -> wrist-joint permutation "
+                f"(env WRIST3_AXIS_ORDER_{suffix.upper()}); wrist joints are "
+                "[yaw,pitch,roll], default 0,1,2 = controller z->yaw, y->pitch, "
+                "x->roll"
+            ),
+        )
     ap.add_argument(
         "--wrist-slew",
         type=float,
@@ -336,6 +351,10 @@ def main() -> int:
         stale_grip_close=args.stale_grip_close,
         wrist_scale=args.wrist_scale,
         wrist_signs=wrist_signs,
+        wrist_axis_order={
+            "left": tuple(args.wrist_axis_order_l),
+            "right": tuple(args.wrist_axis_order_r),
+        },
         wrist_slew_rad_s=args.wrist_slew,
         wrist_pi_guard_rad=args.wrist_pi_guard,
         waist_stand=args.waist_stand,
@@ -355,7 +374,8 @@ def main() -> int:
         f"[sim] v3 wire mode: SUB :{args.intent_port}; grip (LPF'd)>"
         f"{args.trigger_thresh} engages, trigger drives the hands, "
         f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
-        f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']}, "
+        f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']} "
+        f"axes L{tuple(args.wrist_axis_order_l)} R{tuple(args.wrist_axis_order_r)}, "
         f"ctrl lever L{tuple(np.round(ticker.ctrl_levers['left'], 4))} "
         f"R{tuple(np.round(ticker.ctrl_levers['right'], 4))}m, "
         f"deadband {ticker.position_deadband_m * 1e3:.1f}mm, "

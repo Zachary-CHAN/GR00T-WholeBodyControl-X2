@@ -10,8 +10,12 @@ Consumes the SAME wire as the v2 node (:5573 "pico_intent", packed binary,
       wrist joints LOCKED at the WristClutch command and re-fed into the FK
       every tick; ``--full-pose-ik`` opts into the 7-DoF pose solve instead.
     * the wrist is filled directly from the anchored controller-quaternion
-      differential (ZYX split, slew + near-pi guard + joint limits), NOT
-      solved by the arm IK.  This is the v3 fix for "rotate only the wrist,
+      differential, taken in the CONTROLLER anchor frame (ZYX split, so one
+      controller axis moves exactly one wrist joint even when the wrist is
+      anchored off-neutral; slew + near-pi guard + joint limits), NOT
+      solved by the arm IK.  ``--wrist-axis-order-l/-r`` permutes the
+      controller axes onto yaw/pitch/roll if the grip puts an anatomical DOF
+      on another axis.  This is the v3 fix for "rotate only the wrist,
       the robot drags its elbow/shoulder".
     * SMPL is CLOSED: the waist holds a fixed ``--waist-stand``.
     * 2026-10 role swap: the GRIP is the per-arm clutch; the TRIGGER drives
@@ -151,6 +155,28 @@ def _record_row(st, arms, frame, t_wall: float) -> np.ndarray:
     )
 
 
+def _parse_axis_order(text: str) -> tuple[int, int, int]:
+    """Parse '0,1,2' / '0 1 2' into the wrist-axis permutation.
+
+    Wrist joints are [yaw, pitch, roll]; the controller differential's
+    Euler ZYX components are [about z, about y, about x]. The default
+    (0,1,2) means controller z -> yaw, y -> pitch, x -> roll. A
+    permutation such as 2,1,0 swaps the controller x/z assignment (use it
+    when a single anatomical DOF visibly lands on the wrong wrist joint).
+    """
+    try:
+        return chain_v3.parse_wrist_axis_order(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _axis_order_default(env_name: str) -> tuple[int, int, int]:
+    try:
+        return _parse_axis_order(os.environ.get(env_name, "0,1,2"))
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"{env_name}: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Plant-free per-tick core -- the ONE thing the live node and --dry-run share
 # ---------------------------------------------------------------------------
@@ -175,6 +201,10 @@ class TeleopCore:
                 args.wrist_roll_sign_r,
             ),
         }
+        wrist_axis_order = {
+            "left": tuple(args.wrist_axis_order_l),
+            "right": tuple(args.wrist_axis_order_r),
+        }
         ctrl_levers = {
             side: (
                 getattr(args, f"ctrl_lever_{side}")
@@ -192,6 +222,7 @@ class TeleopCore:
             stale_grip_close=args.stale_grip_close,
             wrist_scale=args.wrist_scale,
             wrist_signs=wrist_signs,
+            wrist_axis_order=wrist_axis_order,
             wrist_slew_rad_s=args.wrist_slew,
             wrist_pi_guard_rad=args.wrist_pi_guard,
             waist_stand=args.waist_stand,
@@ -671,6 +702,19 @@ def main() -> int:
             type=float,
             default=signs_env["right"][axis],
             help=f"right wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_R)",
+        )
+    for side, suffix in (("left", "l"), ("right", "r")):
+        ap.add_argument(
+            f"--wrist-axis-order-{suffix}",
+            type=_parse_axis_order,
+            default=_axis_order_default(f"WRIST3_AXIS_ORDER_{suffix.upper()}"),
+            help=(
+                f"{side} controller-axis -> wrist-joint permutation "
+                f"(env WRIST3_AXIS_ORDER_{suffix.upper()}); wrist joints are "
+                "[yaw,pitch,roll], default 0,1,2 = controller z->yaw, y->pitch, "
+                "x->roll. Use e.g. 2,1,0 if a single anatomical DOF lands on the "
+                "wrong wrist joint"
+            ),
         )
     ap.add_argument(
         "--wrist-slew",
