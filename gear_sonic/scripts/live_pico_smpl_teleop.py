@@ -370,6 +370,7 @@ class ThreePointSource:
         self._last_append_t = 0.0
         self._last_dev_stamp = None  # diagnostic only; never gates
         self._stamp_t0 = None
+        self._diag_t = 0.0  # throttles the "why is calibration stuck" print
         self._same_streak = 0
         self._prev_sample = None
         self._M = None  # (3, 3) rows [fwd, lat, up], frozen at calibration
@@ -386,17 +387,27 @@ class ThreePointSource:
         self._thread.start()
 
     @staticmethod
-    def _pose_ok(pose, allow_zero_pos: bool) -> bool:
-        """A 7-vector xrt pose is usable: finite, plausible norm, unit-ish quat."""
+    def _pose_reason(pose, allow_zero_pos: bool) -> str:
+        """Why a 7-vector xrt pose is or is not usable ("ok" when usable)."""
         if pose is None or pose.size < 7:
-            return False
+            return "missing"
         p = pose[:7]
         if not np.isfinite(p).all():
-            return False
+            return "non-finite"
         n_pos = float(np.linalg.norm(p[:3]))
-        if n_pos >= 10.0 or (not allow_zero_pos and n_pos < 1e-6):
-            return False
-        return float(np.linalg.norm(p[3:])) >= 0.5
+        if n_pos >= 10.0:
+            return f"|p|={n_pos:.1f}m"
+        if not allow_zero_pos and n_pos < 1e-6:
+            return "zero-position"
+        n_q = float(np.linalg.norm(p[3:]))
+        if n_q < 0.5:
+            return f"|q|={n_q:.2f}"
+        return "ok"
+
+    @classmethod
+    def _pose_ok(cls, pose, allow_zero_pos: bool) -> bool:
+        """A 7-vector xrt pose is usable: finite, plausible norm, unit-ish quat."""
+        return cls._pose_reason(pose, allow_zero_pos) == "ok"
 
     def _update_same_streak(self, head, left, right, head_ok, left_ok, right_ok) -> None:
         parts = [pose[:7] if ok else np.zeros(7)
@@ -421,22 +432,39 @@ class ThreePointSource:
                 head = np.asarray(self.xrt.get_headset_pose(), np.float64).reshape(-1)
                 left = np.asarray(self.xrt.get_left_controller_pose(), np.float64).reshape(-1)
                 right = np.asarray(self.xrt.get_right_controller_pose(), np.float64).reshape(-1)
-                stamp = int(self.xrt.get_time_stamp_ns())
-            except Exception:
+            except Exception as exc:
                 # No sample this tick. Keep the ring stale: wire_fields
                 # age-gates each side and forces grip/trigger to 0, so
                 # nothing jumps while the read path recovers.
+                if now - self._diag_t >= 2.0:
+                    self._diag_t = now
+                    print(f"[3pt] SDK pose read failed: {exc!r}", flush=True)
                 continue
+            try:
+                stamp = int(self.xrt.get_time_stamp_ns())
+            except Exception:
+                stamp = None  # diagnostic only; must never drop the sample
             now = time.monotonic()
             # The headset is diagnostic only; a zero head position is legal
             # (the SDK world origin is wherever the headset started).
             head_ok = self._pose_ok(head, allow_zero_pos=True)
             left_ok = self._pose_ok(left, allow_zero_pos=False)
             right_ok = self._pose_ok(right, allow_zero_pos=False)
+            if self._M is None and now - self._diag_t >= 2.0:
+                self._diag_t = now
+                print(
+                    "[3pt] waiting for valid poses: "
+                    f"head={self._pose_reason(head, True)}, "
+                    f"left={self._pose_reason(left, False)}, "
+                    f"right={self._pose_reason(right, False)}, "
+                    f"samples={len(self._calib_samples)}/10, "
+                    f"stamp={'n/a' if stamp is None else stamp}",
+                    flush=True,
+                )
             with self._lock:
                 self._last_append_t = now
                 self._last_dev_stamp = stamp
-                if self._stamp_t0 is None:
+                if stamp is not None and self._stamp_t0 is None:
                     self._stamp_t0 = stamp
                 if head_ok:
                     self._head_t = now
