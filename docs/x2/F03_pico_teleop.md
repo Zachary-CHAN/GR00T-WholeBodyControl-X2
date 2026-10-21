@@ -173,6 +173,54 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 > （`gear_sonic[teleop]` 里没有 mink，`gear_sonic[sim]` 里才有）。所以
 > **sim 里的手臂行为与真机不同是预期内的**，直到另一次单独的迁移把这条链搬上去。
 
+### v4：无 body tracker 的 3-point 上肢遥操（`--tracking 3point`，仅 sim，2026-10）
+
+**不用任何 Pico body tracker**：只戴头显、双手柄。v3 链的 frame 契约只消费
+`t / lctrl_pose / rctrl_pose / trigger / grip`（`smpl_joints` 完全被忽略），所以 v4
+是**换数据源**，不是改控制律：`ThreePointSource` 用两个 controller 的 pose 填满这 5 个
+字段，`--tracking 3point` 打开这条路，IK / 腕映射 / 手指极性 / LPF / 阈值全部不变。
+
+- **一次性固定 operator frame**：标定时取 `lat = p_left - p_right`（去掉世界竖直分量）
+  与 `fwd = cross(lat, up)`，origin = 双手柄中点；标定后**冻结**，绝不逐 tick 更新。
+  头显不参与帧朝向、不参与任何门控（只做状态打印）。wire 数学与 live full 模式
+  （`_torso_M` / `_ctrl_wire_fields`）同构，`--ctrl-lever-*` 继续有效。
+- **标定姿势**：双手各握手柄，自然举在胸前、**左右分开 ≥ 20 cm、保持约 1 秒**。
+  sender 打印 `[3pt] operator frame calibrated ...` 后进入 `stream live.`。失败时每
+  3 s 打印 `hold both controllers apart at chest height (>= 15 cm)` 并自动重试。
+- **逐侧失效安全**：某侧 controller 无效或超过 `max_age_s`（0.2 s）时，该侧 wire
+  `grip=0`、`trigger=0`，pose 保持最后一帧有效值（不会出现零 pose + live grip）。
+- **wire `engaged` 强制 0**：3point 的 `smpl_joints`/`human_quat` 是占位零值，强制
+  `engaged=0` 让同 topic 的 SMPL tokenizer 不接管；v3 链不读 `engaged`，**grip 就是离合**。
+- 3point 强制 `--no-locomotion`，且与 `--tape-replay` / `--tape-once` 互斥（live-only）。
+
+仿真命令（终端 A 先起 harness，终端 B 起 sender；wrapper 会拉起 PC Service）：
+
+```bash
+# A
+.venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py \
+  --wire --intent-port 15573 \
+  --ctrl-lever-left  0.0410 0.0090 -0.0912 \
+  --ctrl-lever-right -0.0393 0.0115 -0.0791 \
+  --record /tmp/v4_3pt.npz
+# B
+./gear_sonic/scripts/run_pico_teleop.sh \
+  --pc2-host 127.0.0.1 --intent-port 15573 \
+  --tracking 3point --no-locomotion --hand-source off
+```
+
+验收要点（完整清单见 `PICO_LIVE_TELEOP_PITFALLS.md` §11）：
+
+1. 平移符号：双手同时朝操作员前方平移，record 列 7:14 的 x 应增大；
+2. **头部隔离**：手柄不动、只转头 5 s，列 7:35 应平坦（< 2 mm / < 0.5°），
+   手臂指令不随头动；
+3. 单侧丢跟踪：失效侧列 4/5 → 0、65/66 → 0，该侧手臂冻结、无跳变；
+4. 扣 trigger：列 2/3 上升，viewer 里 OmniHand 闭合（v3 极性）。
+
+> **已知限制**：没有躯干/腿跟踪。固定帧只标定一次，engage 期间转体会给前伸方向带来
+> 同样角度的偏航偏差——保持髋/脚不动；转身后松开 grip、恢复朝向、重启 sender 重新
+> 标定。控制器的单侧静默冻结无法检测（SDK 无 per-controller 可用性 API），此时手臂
+> 只是保持（delta=0），不会跳变。
+
 ## Robot
 
 Ritual up ([`F10_real_robot_colcon.md`](F10_real_robot_colcon.md)) with

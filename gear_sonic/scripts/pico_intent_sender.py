@@ -56,7 +56,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS.parents[1]))
 
 from scipy.spatial.transform import Rotation as Rot  # noqa: E402
-from live_pico_smpl_teleop import LiveSmplSource, _audio_cue  # noqa: E402
+from live_pico_smpl_teleop import LiveSmplSource, ThreePointSource, _audio_cue  # noqa: E402
 from gear_sonic.utils.teleop.root_tilt_guard import (  # noqa: E402
     ROOT_TILT_CAP_DEG, ROOT_TILT_RAMP_S, set_root_tilt_cap, set_root_tilt_ramp,
 )
@@ -644,6 +644,26 @@ def _ctrl_wire_fields(xrt, lt, rt):
     return fields
 
 
+def _ctrl_wire_fields_3pt(src, lt, rt):
+    """Trackerless wire fields: `ThreePointSource.wire_fields` behind a guard.
+
+    The source owns per-side validity, the wire pose cache, and the
+    lost-side grip/trigger zeroing. On any source failure return a fully
+    inert field set (trigger=0, grip=0, zero poses) -- never a live grip
+    with a zero pose: once engaged, a zero pose would jump the target to
+    the origin (`_compensated_target`).
+    """
+    try:
+        return src.wire_fields(lt, rt)
+    except Exception:
+        return {
+            "trigger": np.zeros(2, np.float32),
+            "grip": np.zeros(2, np.float32),
+            "lctrl_pose": _ZERO_POSE7.copy(),
+            "rctrl_pose": _ZERO_POSE7.copy(),
+        }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pc2-host", required=True,
@@ -699,6 +719,12 @@ def main() -> int:
     ap.add_argument("--invert-rx", action="store_true")
     ap.add_argument("--invert-ry", action="store_true")
     ap.add_argument("--tape-replay", default=None)
+    ap.add_argument("--tracking", choices=("full", "3point"), default="full",
+                    help="'full' (default): Pico body stream (headset + waist/ankle "
+                         "trackers) exactly as today. '3point': trackerless arm-only "
+                         "mode; the two controllers supply lctrl_pose/rctrl_pose/"
+                         "trigger/grip and the headset is diagnostic only. Forces "
+                         "--no-locomotion; live only (not with --tape-replay).")
     ap.add_argument("--auto-engage", action="store_true")
     ap.add_argument("--wb-toggle-gate", choices=["right-trigger", "none"], default="right-trigger",
                     help="deadman for the B mode switch (LOCOMOTION <-> WHOLE_BODY): 'right-trigger' "
@@ -795,6 +821,21 @@ def main() -> int:
                          "consumes. --no-record disables both.")
     args = ap.parse_args()
 
+    tracking_3pt = args.tracking == "3point"
+    if tracking_3pt and args.tape_replay:
+        ap.error("--tracking 3point is live-only; intent tapes already carry lctrl/rctrl")
+    if tracking_3pt and args.tape_once:
+        ap.error("--tracking 3point cannot be combined with --tape-once")
+    if tracking_3pt:
+        args.no_locomotion = True   # arm-only: no planner/clip/hand sockets
+        print("[3pt] trackerless arm-only mode: --no-locomotion forced; "
+              "wire engaged is forced 0 (SMPL consumer stays out).", flush=True)
+        print("[3pt] hand_finger_cmd disabled in arm-only mode "
+              "(sim harness drives OmniHand from trigger).", flush=True)
+        if args.auto_engage:
+            print("[3pt] --auto-engage has no effect on the wire: engaged is "
+                  "forced 0; grip is the clutch.", flush=True)
+
     _tilt = set_root_tilt_cap(args.root_tilt_limit_deg)
     _ramp = set_root_tilt_ramp(args.root_tilt_ramp_s)
     print("[tiltcap] operator root tilt cap: "
@@ -830,7 +871,8 @@ def main() -> int:
     # dual mode like a live session; the other two are stick-less.
     _tape_files = set(np.load(args.tape_replay).files) if args.tape_replay else set()
     full_tape = "full_session" in _tape_files
-    dual_mode = not args.no_locomotion and (not args.tape_replay or full_tape)
+    dual_mode = (not tracking_3pt) and not args.no_locomotion and (
+        not args.tape_replay or full_tape)
     # --tape-once on a RAW body clip = a scripted B-in / B-out on a robot that
     # sits in LOCOMOTION: the planner_cmd and hand sockets the B path uses
     # stay open (tape mode otherwise runs stick-less, so dual_mode is off).
@@ -885,15 +927,26 @@ def main() -> int:
     # session (sim2real plan phase 1). Session npz tapes keep the old path.
     if args.tape_replay and "smpl_joints" in np.load(args.tape_replay):
         src = _IntentTapeSource(args.tape_replay, loop=not args.tape_once)
+    elif tracking_3pt:
+        # Trackerless: headset + two controllers only. No body stream to wait
+        # for; window() turns non-None once the operator frame is calibrated.
+        src = ThreePointSource()
     else:
         src = LiveSmplSource(args.tape_replay, loop=not args.tape_once)
         if args.tape_once:
             print(f"[tape] ONCE mode: {args.tape_replay} plays a single pass "
                   f"({src.xrt._span:.1f} s), then whole-body is released and the "
                   f"sender idles. Pad e-stop stays the safety (no controller chords on a tape).", flush=True)
-    print("Waiting for body stream ...", flush=True)
+    _wait_msg = ("Waiting for 3point calibration: headset + both controllers "
+                 "(hold them apart at chest height) ..." if tracking_3pt
+                 else "Waiting for body stream ...")
+    print(_wait_msg, flush=True)
     try:
+        wait_t0 = time.monotonic()
         while src.window(time.monotonic()) is None:
+            if tracking_3pt and time.monotonic() - wait_t0 >= 5.0:
+                wait_t0 = time.monotonic()
+                print(_wait_msg, flush=True)
             time.sleep(0.2)
     except KeyboardInterrupt:
         # Ctrl-C before the stream is live: same linger-free teardown as the main loop's finally,
@@ -911,7 +964,10 @@ def main() -> int:
     engaged = bool(args.auto_engage)
     tape_done = False; tape_done_t = 0.0
     dbg_watch = None
-    if not args.tape_replay and not args.no_record and args.x2_debug_port > 0:
+    if ((not tracking_3pt) and not args.tape_replay and not args.no_record
+            and args.x2_debug_port > 0):
+        # 3point skips this: the sim harness does not publish :5557, so the
+        # watch could only print "unavailable" every startup.
         try:
             dbg_watch = _X2DebugWatch(args.pc2_host, args.x2_debug_port)
             print(f"[session] x2_debug watch on tcp://{args.pc2_host}:{args.x2_debug_port} (arms0 snapshot at record start)", flush=True)
@@ -1074,7 +1130,9 @@ def main() -> int:
     if raw_rec:
         print(f"[clip] RECORDING raw body clips per engage -> "
               f"{args.session_dir}", flush=True)
-    if engaged:
+    if tracking_3pt:
+        print("3pt: engaged forced 0 (arm-only); grip is the clutch.", flush=True)
+    elif engaged:
         print("ENGAGED (auto).", flush=True)
     elif dual_mode:
         print("mode OFF — A+B+X+Y chord to enter LOCOMOTION; B toggles "
@@ -1430,7 +1488,10 @@ def main() -> int:
             # genuinely alive again; the token service then auto-releases
             # and the robot holds pad authority instead of falling.
             body_ok = True
-            if not isinstance(src, _IntentTapeSource) and not args.tape_replay:
+            # 3point has no body stream: its liveness safety is the per-side
+            # grip=0 inside wire_fields, not this 1 s-hysteresis body gate.
+            if ((not tracking_3pt) and not isinstance(src, _IntentTapeSource)
+                    and not args.tape_replay):
                 raw_ok = src.body_fresh(now)
                 # HYSTERESIS (2026-09-01): going DEAD is immediate, coming
                 # back LIVE needs 1.0 s of sustained health -- Wi-Fi flaps
@@ -1622,13 +1683,18 @@ def main() -> int:
             # all-zero placeholder (legacy) -- never from a live xrt.
             if isinstance(src, _IntentTapeSource):
                 ctrl_fields = src.replay_ctrl(now)
+            elif tracking_3pt:
+                ctrl_fields = _ctrl_wire_fields_3pt(src, lt, rt)
             else:
                 ctrl_fields = _ctrl_wire_fields(getattr(src, "xrt", None), lt, rt)
+            # 3point sends PLACEHOLDER smpl_joints/human_quat: force engaged 0
+            # so a SMPL tokenizer on the same topic never treats them as live
+            # body. The v3 chain does not read `engaged`; grip is its clutch.
+            wire_engaged = 1.0 if (engaged and body_ok and not tracking_3pt) else 0.0
             msg = pack_pose_message({
                 "smpl_joints": joints[-1].reshape(72).astype(np.float32),
                 "human_quat": quats[-1].astype(np.float32),
-                "engaged": np.array([1.0 if (engaged and body_ok) else 0.0],
-                                    np.float32),
+                "engaged": np.array([wire_engaged], np.float32),
                 "wrist_pr": wr,
                 "wrist_yaw": wy,
                 "frame_index": np.array([frame_idx], np.int64),
@@ -1641,7 +1707,7 @@ def main() -> int:
                 rec["t"].append(now)
                 rec["smpl_joints"].append(joints[-1].reshape(72).copy())
                 rec["human_quat"].append(quats[-1].copy())
-                rec["engaged"].append(1.0 if (engaged and body_ok) else 0.0)
+                rec["engaged"].append(wire_engaged)
                 rec["wrist_pr"].append(wr.copy())
                 # v4 controller fields: the exact values that went on the
                 # wire, so an intent-tape replay reproduces the session
@@ -1663,7 +1729,9 @@ def main() -> int:
             frame_idx += 1
             n_sent += 1
             if now - t_rep >= args.rate_report_s:
-                if isinstance(src, _IntentTapeSource) or args.tape_replay:
+                if tracking_3pt:
+                    body_rep = src.tracking_status(now)
+                elif isinstance(src, _IntentTapeSource) or args.tape_replay:
                     body_rep = "tape"
                 else:
                     # Verdict up front (2026-09-02: a 26k-frame frozen

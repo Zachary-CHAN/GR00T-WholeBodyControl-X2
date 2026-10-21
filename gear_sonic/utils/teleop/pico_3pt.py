@@ -70,6 +70,114 @@ def _compute_rel_transform(pose, world_frame, scalar_first=True):
     return rel_pos, rel_rot.as_quat(scalar_first=True)
 
 
+def fixed_operator_frame_from_controllers(
+    left_ctrl_pose, right_ctrl_pose, up=(0.0, 1.0, 0.0), min_sep_m=0.15
+):
+    """One-shot trackerless operator frame: rows ``[fwd, lat, up]``.
+
+    The frame is built exactly like the live body-tracking operator torso
+    frame (``pico_intent_sender._torso_M``): ``lat = left - right`` (the
+    operator's left, SMPL shoulders 16/17), projected off ``up`` and
+    normalised, then ``fwd = cross(lat, up)``.  The origin is the midpoint
+    of the two controllers.  It is captured ONCE and must be frozen by the
+    caller: a per-tick headset/root frame would couple head motion into the
+    arm deltas (the v3 wire contract is delta-based, so the origin cancels;
+    a constant frame left-multiply cancels in the wrist delta
+    ``R_anchor^-1 R_now`` and keeps the existing ``--ctrl-lever`` valid).
+
+    Only positions are read (``[:3]``).  Quaternions are deliberately not
+    validated or averaged here: calibration samples average positions and
+    the per-tick quaternion validity lives in the source.
+
+    Args:
+        left_ctrl_pose / right_ctrl_pose: xrt pose ``[x, y, z, qx, qy, qz,
+            qw]`` or any array whose first three entries are the position
+            (a mean position vector is accepted).
+        up: world up axis (the SDK world is validated Y-up by the probe).
+        min_sep_m: minimum horizontal controller separation for calibration.
+
+    Returns:
+        ``(M, origin)``: ``M`` is ``(3, 3)`` with rows ``[fwd, lat, up]``,
+        ``origin`` is ``(3,)``.  Both are ``float64``.
+
+    Raises:
+        ValueError: non-finite position/up, or the controllers are closer
+            than ``min_sep_m`` horizontally.  A degenerate frame is never
+            silently repaired.
+    """
+    up = np.asarray(up, dtype=np.float64).reshape(-1)
+    if up.size != 3 or not np.isfinite(up).all():
+        raise ValueError("fixed_operator_frame: `up` must be a finite 3-vector")
+    n_up = float(np.linalg.norm(up))
+    if n_up < 1e-9:
+        raise ValueError("fixed_operator_frame: `up` must be non-zero")
+    up = up / n_up
+
+    p_left = np.asarray(left_ctrl_pose, dtype=np.float64).reshape(-1)
+    p_right = np.asarray(right_ctrl_pose, dtype=np.float64).reshape(-1)
+    if p_left.size < 3 or p_right.size < 3:
+        raise ValueError("fixed_operator_frame: controller poses need >= 3 entries")
+    p_left, p_right = p_left[:3], p_right[:3]
+    if not (np.isfinite(p_left).all() and np.isfinite(p_right).all()):
+        raise ValueError("fixed_operator_frame: controller position is not finite")
+
+    lat = p_left - p_right
+    lat = lat - float(lat @ up) * up
+    n_lat = float(np.linalg.norm(lat))
+    if n_lat < float(min_sep_m):
+        raise ValueError(
+            f"fixed_operator_frame: controllers are only {n_lat:.3f} m apart "
+            f"horizontally (need >= {min_sep_m:.2f} m)"
+        )
+    lat = lat / n_lat
+    fwd = np.cross(lat, up)
+    fwd = fwd / float(np.linalg.norm(fwd))
+    M = np.stack([fwd, lat, up])
+    if not np.allclose(M @ M.T, np.eye(3), atol=1e-9):
+        raise ValueError("fixed_operator_frame: frame is not orthonormal")
+    if not np.isclose(np.linalg.det(M), 1.0, atol=1e-6):
+        raise ValueError("fixed_operator_frame: frame is not a proper rotation")
+    origin = 0.5 * (p_left + p_right)
+    return M, origin
+
+
+def controller_pose_to_operator_frame(pose, M, origin):
+    """xrt controller pose -> v3 wire pose ``[x, y, z, qw, qx, qy, qz]`` f32.
+
+    This is the per-controller math of
+    ``pico_intent_sender._ctrl_wire_fields`` with the body-derived torso
+    frame replaced by a fixed ``M`` and ``origin``::
+
+        pos = M @ (c[:3] - origin)
+        q   = Rot.from_matrix(M) * Rot.from_quat(c[3:])   # xyzw in
+        out = [pos, q.as_quat(scalar_first=True)]
+
+    The controller's own body axes are preserved (no Unity ``Q``, no ``Q``
+    conjugation).  Do NOT substitute ``_compute_rel_transform`` here: its
+    ``Q`` left-multiply / conjugation would both rotate the controller axes
+    and invalidate the existing ``--ctrl-lever`` calibration for the v3
+    chain.
+
+    Args:
+        pose: xrt pose ``[x, y, z, qx, qy, qz, qw]``.
+        M: (3, 3) rows ``[fwd, lat, up]`` from
+            :func:`fixed_operator_frame_from_controllers`.
+        origin: (3,) frame origin.
+
+    Returns:
+        ``float32`` array of shape ``(7,)``.
+    """
+    c = np.asarray(pose, dtype=np.float64).reshape(-1)
+    if c.size < 7:
+        raise ValueError("controller_pose_to_operator_frame: pose needs 7 entries")
+    c = c[:7]
+    M = np.asarray(M, dtype=np.float64).reshape(3, 3)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    pos = M @ (c[:3] - origin)
+    q = sRot.from_matrix(M) * sRot.from_quat(c[3:])  # xyzw in
+    return np.concatenate([pos, q.as_quat(scalar_first=True)]).astype(np.float32)
+
+
 def _process_3pt_pose(smpl_pose_np):
     """
     Extract 3-point VR pose (L-Wrist, R-Wrist, Neck) from full SMPL body joint poses.

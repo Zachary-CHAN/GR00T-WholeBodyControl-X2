@@ -1526,6 +1526,86 @@ def check_posture_gain_null_space() -> None:
         )
 
 
+def check_3pt_controller_frame() -> None:
+    """v4 trackerless wire contract (Pico headset + two controllers, no body).
+
+    A 3point sender fills ONLY ``t/lctrl_pose/rctrl_pose/trigger/grip``,
+    forces wire ``engaged=0``, and sends placeholder ``smpl_joints`` /
+    ``human_quat``. Pin: (A) grip still engages the clutch and trigger still
+    drives the hand; (B) the SMPL placeholders never influence the arms (two
+    tickers in lockstep, identical wires, different placeholders -> identical
+    q); (C) moving the controller wire moves the commanded arm.
+    """
+
+    def make_ticker():
+        return IncrementalTeleopTickerV3(
+            torso_keepout=None,
+            position_deadband_m=0.0,
+            posture_gain=0.0,
+            target_slew_m_s=0.0,
+        )
+
+    a, b = make_ticker(), make_ticker()
+    now = 100.0
+
+    def pose(x, y, z):
+        out = np.zeros(7, np.float32)
+        out[:3] = (x, y, z)
+        out[3] = 1.0  # unit quat (wxyz): engage() refuses zero placeholders
+        return out
+
+    def frame(lx, ly, lz, rx, ry, rz, smpl, hq):
+        return {
+            "t": now,
+            "trigger": np.array([1.0, 1.0], np.float32),
+            "grip": np.array([1.0, 1.0], np.float32),
+            "lctrl_pose": pose(lx, ly, lz),
+            "rctrl_pose": pose(rx, ry, rz),
+            "engaged": np.array([0.0]),  # 3point forces this on the wire
+            "smpl_joints": smpl,
+            "human_quat": hq,
+        }
+
+    zeros72 = np.zeros(72)
+    identity_wxyz = np.array([1.0, 0.0, 0.0, 0.0])
+
+    # A+B. Lockstep: same trackerless wires, different SMPL placeholders.
+    for k in range(20):  # 0.4 s: past the grip/trigger LPFs, inside stale_s
+        st = a.step(frame(0.20, 0.0, 0.0, -0.20, 0.0, 0.0, zeros72, identity_wxyz), now)
+        st_b = b.step(
+            frame(
+                0.20,
+                0.0,
+                0.0,
+                -0.20,
+                0.0,
+                0.0,
+                np.full(72, 0.7 + 0.001 * k),
+                np.array([0.0, 0.0, 0.0, 1.0]),
+            ),
+            now,
+        )
+        now += DT
+    assert st["fresh"]
+    assert st["held"]["left"] and st["held"]["right"]
+    assert a.arms["left"].engaged and a.arms["right"].engaged
+    assert st["hand"]["l"] > 0.5 and st["hand"]["r"] > 0.5
+    for side in st["q"]:
+        assert np.allclose(
+            st["q"][side], st_b["q"][side], rtol=0.0, atol=1e-9
+        ), f"{side}: placeholder SMPL fields leaked into the arm command"
+    base = {side: q.copy() for side, q in st["q"].items()}
+
+    # C. A controller-wire translation must move the commanded arm.
+    for _ in range(40):  # 0.8 s
+        st = a.step(frame(0.32, 0.10, 0.02, -0.20, 0.0, 0.0, zeros72, identity_wxyz), now)
+        now += DT
+    moved = float(np.abs(st["q"]["left"] - base["left"]).max())
+    assert moved > 0.05, f"left arm ignored the wire delta ({moved:.4f} rad)"
+    for q in st["q"].values():
+        assert np.all(np.isfinite(q))
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -1547,6 +1627,7 @@ CHECKS = [
     ("position_deadband", check_position_deadband),
     ("posture_gain_null_space", check_posture_gain_null_space),
     ("wrist_nonzero_anchor_tracks_tool_rotation", check_wrist_nonzero_anchor_tracks_tool_rotation),
+    ("3pt_controller_frame", check_3pt_controller_frame),
 ]
 
 

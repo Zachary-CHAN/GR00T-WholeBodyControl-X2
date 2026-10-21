@@ -73,6 +73,9 @@ from gear_sonic.scripts.pico_manager_thread_server import (  # noqa: E402
     compute_from_body_poses,
 )
 from gear_sonic.scripts.pico_tape_to_smpl_obs import SMPL_PARENTS  # noqa: E402
+from gear_sonic.utils.teleop.pico_3pt import (  # noqa: E402
+    controller_pose_to_operator_frame, fixed_operator_frame_from_controllers,
+)
 from gear_sonic.utils.teleop.root_tilt_guard import (  # noqa: E402
     ROOT_TILT_CAP_DEG, ROOT_TILT_RAMP_S, guard_window_pose, set_root_tilt_cap,
     set_root_tilt_ramp,
@@ -83,6 +86,7 @@ SMPL_DT = 0.02
 DELAY_S = (SMPL_WINDOW - 1) * SMPL_DT  # 0.18 s design latency
 X2_WRIST_IL = slice(25, 31)
 ACTION_CLIP = 20.0
+_ZERO7 = np.zeros(7, np.float32)  # ThreePointSource inert wire pose
 
 
 class LiveSmplSource:
@@ -329,6 +333,270 @@ class LiveSmplSource:
         # window slides at.  The 10 frames overlap the previous call's by 9,
         # so anything counted per frame would be counted ten times.
         return guard_window_pose(joints, quats, now)
+
+
+class ThreePointSource:
+    """Trackerless Pico source: headset + both controllers, no body tracker.
+
+    Serves the v3 incremental wire contract. ``window()`` only signals
+    liveness (the v3 chain ignores ``smpl_joints``); ``wire_fields(lt, rt)``
+    returns ``trigger/grip/lctrl_pose/rctrl_pose`` in the same shape as
+    ``pico_intent_sender._ctrl_wire_fields``. The operator frame is
+    calibrated ONCE from the controller lateral axis and then frozen, so
+    headset motion cannot leak into the arms. Per-side tracking staleness
+    forces that side's grip and trigger to 0 while holding the last valid
+    wire pose -- never a zero pose with a live grip (an engaged chain would
+    jump its target to the origin).
+
+    Pacing is local ``time.monotonic()``. ``get_time_stamp_ns()`` is kept
+    for the status line only and must never gate appends
+    (PICO_LIVE_TELEOP_PITFALLS.md §5.3: a zero/frozen stamp once wedged the
+    live source behind a permanent append gate).
+    """
+
+    def __init__(self, max_age_s: float = 0.2):
+        import xrobotoolkit_sdk as xrt
+
+        self.xrt = xrt
+        self.max_age_s = float(max_age_s)
+        self.xrt.init()
+        self.record = False
+        self.rec_gate = False
+        self.full_on = False  # defensive: raw/dual paths stay disabled
+        self._grips = (0.0, 0.0)
+        self._ring: deque = deque(maxlen=128)  # 50 Hz liveness ring (neutral frames)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._last_append_t = 0.0
+        self._last_dev_stamp = None  # diagnostic only; never gates
+        self._stamp_t0 = None
+        self._same_streak = 0
+        self._prev_sample = None
+        self._M = None  # (3, 3) rows [fwd, lat, up], frozen at calibration
+        self._o = None  # (3,) controller midpoint at calibration
+        self._sep_m = 0.0  # calibrated horizontal controller separation
+        self._calib_samples: list = []  # 10 valid (left_xyz, right_xyz) positions
+        self._calib_err = None
+        self._head_t = 0.0  # diagnostic only; the headset never gates
+        self._ctrl = {"left": None, "right": None}
+        self._ctrl_t = {"left": 0.0, "right": 0.0}
+        self._ctrl_valid = {"left": False, "right": False}
+        self._wire_cache = {"left": _ZERO7.copy(), "right": _ZERO7.copy()}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _pose_ok(pose, allow_zero_pos: bool) -> bool:
+        """A 7-vector xrt pose is usable: finite, plausible norm, unit-ish quat."""
+        if pose is None or pose.size < 7:
+            return False
+        p = pose[:7]
+        if not np.isfinite(p).all():
+            return False
+        n_pos = float(np.linalg.norm(p[:3]))
+        if n_pos >= 10.0 or (not allow_zero_pos and n_pos < 1e-6):
+            return False
+        return float(np.linalg.norm(p[3:])) >= 0.5
+
+    def _update_same_streak(self, head, left, right, head_ok, left_ok, right_ok) -> None:
+        parts = [pose[:7] if ok else np.zeros(7)
+                 for pose, ok in ((head, head_ok), (left, left_ok), (right, right_ok))]
+        sample = np.concatenate(parts)
+        if self._prev_sample is not None and np.array_equal(sample, self._prev_sample):
+            self._same_streak += 1
+        else:
+            self._same_streak = 0
+        self._prev_sample = sample
+
+    def _run(self) -> None:
+        next_t = time.monotonic()
+        hint_t = 0.0
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(min(next_t - now, 0.004))
+                continue
+            next_t += CONTROL_DT
+            try:
+                head = np.asarray(self.xrt.get_headset_pose(), np.float64).reshape(-1)
+                left = np.asarray(self.xrt.get_left_controller_pose(), np.float64).reshape(-1)
+                right = np.asarray(self.xrt.get_right_controller_pose(), np.float64).reshape(-1)
+                stamp = int(self.xrt.get_time_stamp_ns())
+            except Exception:
+                # No sample this tick. Keep the ring stale: wire_fields
+                # age-gates each side and forces grip/trigger to 0, so
+                # nothing jumps while the read path recovers.
+                continue
+            now = time.monotonic()
+            # The headset is diagnostic only; a zero head position is legal
+            # (the SDK world origin is wherever the headset started).
+            head_ok = self._pose_ok(head, allow_zero_pos=True)
+            left_ok = self._pose_ok(left, allow_zero_pos=False)
+            right_ok = self._pose_ok(right, allow_zero_pos=False)
+            with self._lock:
+                self._last_append_t = now
+                self._last_dev_stamp = stamp
+                if self._stamp_t0 is None:
+                    self._stamp_t0 = stamp
+                if head_ok:
+                    self._head_t = now
+                for side, pose, ok in (("left", left, left_ok),
+                                       ("right", right, right_ok)):
+                    if ok:
+                        self._ctrl[side] = pose[:7].copy()
+                        self._ctrl_t[side] = now
+                        self._ctrl_valid[side] = True
+                self._ring.append((now, None, None))
+                self._update_same_streak(head, left, right, head_ok, left_ok, right_ok)
+
+            if self._M is not None:
+                self._calib_samples.clear()
+                continue
+            if not (head_ok and left_ok and right_ok):
+                self._calib_samples.clear()
+                continue
+            self._calib_samples.append((left[:3].copy(), right[:3].copy()))
+            if len(self._calib_samples) < 10:
+                continue
+            samples, self._calib_samples = self._calib_samples, []
+            mean_left = np.mean([s[0] for s in samples], axis=0)
+            mean_right = np.mean([s[1] for s in samples], axis=0)
+            try:
+                M, origin = fixed_operator_frame_from_controllers(mean_left, mean_right)
+            except ValueError as exc:
+                self._calib_err = str(exc)
+                if now - hint_t > 3.0:
+                    hint_t = now
+                    print(f"[3pt] {exc} — hold both controllers apart at chest "
+                          "height (>= 15 cm) ...", flush=True)
+                continue
+            sep = float(abs((M @ (mean_left - mean_right))[1]))  # lat . d
+            with self._lock:
+                self._M, self._o, self._sep_m = M, origin, sep
+                self._calib_err = None
+            print(f"[3pt] operator frame calibrated: |d|={sep:.3f} m, "
+                  f"fwd={np.round(M[0], 3).tolist()}, "
+                  f"lat={np.round(M[1], 3).tolist()}, "
+                  f"up={np.round(M[2], 3).tolist()}", flush=True)
+
+    def wire_fields(self, lt: float, rt: float) -> dict:
+        """v3 wire fields for one tick (same shape as `_ctrl_wire_fields`).
+
+        Per-side validity, the wire pose cache, and the lost-side
+        grip/trigger zeroing all live here. Only ``wire_fields`` (sender
+        main thread) touches ``_wire_cache``.
+        """
+        fields = {
+            "trigger": np.zeros(2, np.float32),
+            "grip": np.zeros(2, np.float32),
+            "lctrl_pose": _ZERO7.copy(),
+            "rctrl_pose": _ZERO7.copy(),
+        }
+        with self._lock:
+            M, o = self._M, self._o
+            snap = {s: (self._ctrl[s], self._ctrl_t[s], self._ctrl_valid[s])
+                    for s in ("left", "right")}
+        if M is None:  # calibration not done yet: inert frame, grip stays 0
+            return fields
+        try:
+            grip = {"left": float(self.xrt.get_left_grip()),
+                    "right": float(self.xrt.get_right_grip())}
+        except Exception:
+            grip = {"left": 0.0, "right": 0.0}
+        now = time.monotonic()
+        for side, i in (("left", 0), ("right", 1)):
+            c, t, ok = snap[side]
+            live = ok and c is not None and (now - t) <= self.max_age_s
+            if live:
+                self._wire_cache[side] = controller_pose_to_operator_frame(c, M, o)
+            key = "lctrl_pose" if side == "left" else "rctrl_pose"
+            fields[key] = self._wire_cache[side].copy()
+            fields["grip"][i] = grip[side] if live else 0.0
+            fields["trigger"][i] = (lt if side == "left" else rt) if live else 0.0
+        return fields
+
+    def window(self, now: float) -> tuple[np.ndarray, np.ndarray] | None:
+        """Neutral liveness window; the v3 chain ignores smpl_joints.
+
+        Deliberately NOT `guard_window_pose`: neutral joints are not a
+        body pose, and the v3 frame contract never reads them.
+        """
+        with self._lock:
+            ready = self._M is not None and len(self._ring) >= 4
+        if not ready:
+            return None
+        joints = np.zeros((SMPL_WINDOW, 24, 3), np.float32)
+        quats = np.tile(np.array([1.0, 0.0, 0.0, 0.0], np.float32), (SMPL_WINDOW, 1))
+        return joints, quats
+
+    def body_fresh(self, now: float, max_age_s: float = 1.2) -> bool:
+        with self._lock:
+            ready = self._M is not None
+            last = self._last_append_t
+        return bool(ready and last > 0.0 and (now - last) < max_age_s)
+
+    def tracking_status(self, now: float) -> str:
+        """One status line; stamp/same-streak are diagnostic only."""
+        with self._lock:
+            M = self._M
+            ctrl_t = dict(self._ctrl_t)
+            valid = dict(self._ctrl_valid)
+            sep = self._sep_m
+            stamp = self._last_dev_stamp
+            stamp_t0 = self._stamp_t0
+            same = self._same_streak
+            calib_err = self._calib_err
+        if M is None:
+            return "3pt CALIBRATING" + (f" ({calib_err})" if calib_err else "")
+        live = {s: bool(valid[s]) and (now - ctrl_t[s]) <= self.max_age_s
+                for s in ("left", "right")}
+        parts = []
+        for side in ("left", "right"):
+            if live[side]:
+                parts.append(f"{side[0].upper()} live")
+            else:
+                age = now - ctrl_t[side] if valid[side] else float("inf")
+                parts.append(f"{side[0].upper()} HOLD {age:.1f}s")
+        stamp_s = "n/a" if (stamp is None or stamp_t0 is None) else (
+            f"{(stamp - stamp_t0) / 1e9:.2f}s")
+        state = "OK" if all(live.values()) else "DEGRADED (lost-side grip forced 0)"
+        return (f"3pt {state} ({'/'.join(parts)}, |d|={sep:.2f}m, "
+                f"stamp {stamp_s}, same-streak {same})")
+
+    def grips(self) -> tuple[float, float]:
+        try:
+            with self._lock:
+                ready = self._M is not None
+            if not ready:
+                return (0.0, 0.0)
+            return (float(self.xrt.get_left_grip()), float(self.xrt.get_right_grip()))
+        except Exception:
+            return (0.0, 0.0)
+
+    def age_s(self) -> float:
+        with self._lock:
+            last = self._last_append_t
+        return float("inf") if last <= 0.0 else time.monotonic() - last
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+    # -- defensive no-ops: raw/dual paths are unreachable in 3point mode ----
+    def save_session(self, *args, **kwargs) -> int:
+        return 0
+
+    def start_full(self) -> None:
+        pass
+
+    def stop_full(self, *args, **kwargs) -> int:
+        return 0
+
+    def full_frames(self) -> int:
+        return 0
 
 
 class SmplFileSource:

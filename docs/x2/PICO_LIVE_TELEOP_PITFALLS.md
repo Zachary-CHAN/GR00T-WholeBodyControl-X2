@@ -449,3 +449,30 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
   实际 roll/pitch 也会明显滞后于手柄。真机 vendor 配置的腕 pitch/roll
   力矩上限是 6 N·m（plant yaml），仍只有 yaw 的 1/4，需要按真机实测
   再判断滞后量；sim 的 2.2 N·m 是更保守的下界。
+
+## 11 v4 无 tracker 3-point（`--tracking 3point`，2026-10）
+
+先读 F03 的 v4 小节。这里只列会咬人的点：
+
+1. **不用 body tracker，但仍要戴头显**。controller pose 与头显来自同一个 SDK；
+   头显位姿只做状态诊断，**不参与固定帧、不参与任何门控**——掉头显不应冻结手臂。
+2. **固定 operator frame 只标定一次**。engage 期间保持髋/脚不动；转体 / 转身后
+   前伸方向会带同样角度的偏航偏差（无躯干跟踪的已知限制，不是回归）。要恢复：
+   松开 grip → 转回中性朝向 → **重启 sender 重新标定**，再 engage。
+3. **标定姿势**：双手柄在胸前左右分开 ≥ 20 cm，保持约 1 s；`|d|` 会打印出来。
+   双手前后明显不对称会带一点帧偏航，重启重标。
+4. **单侧丢跟踪**：该侧 `grip=0`、`trigger=0`，pose 保持最后一帧（绝不发零 pose
+   + live grip）。不要用 `--stale-grip-close` 去“修”；失效侧手臂会保持，恢复后
+   重新握 grip 才重新 engage（anchor 在新位置，不跳变）。
+5. **单侧静默冻结无法检测**：SDK 没有 per-controller 可用性 API。若 PC Service 在
+   丢跟踪时继续发旧 pose，sender 无法区分“静止”与“冻结”；后果只是手臂保持
+   （delta=0），不跳变。这是已知限制，用第 0 步探针记录 PC Service 的实际行为。
+6. **wire `engaged` 强制 0**：`smpl_joints`/`human_quat` 是占位零值，强制 0 让同
+   topic 的 SMPL tokenizer 不接管；v3 链不读 `engaged`，**grip 才是离合**。
+   `--auto-engage` 在 3point 下对 wire 无效。
+7. **`--tracking 3point` 是 live-only**：不能和 `--tape-replay` / `--tape-once`
+   组合。3point 会话照常录 intent tape，回放时不传 `--tracking 3point`
+   （走 `_IntentTapeSource`），可作确定性回归。
+8. **`get_time_stamp_ns()` 仍然不可靠**（见 §5.3）：3point 的 50 Hz 节奏完全用本地
+   `time.monotonic()`，stamp 只出现在状态行里。单侧时效由 `_ctrl_t` + `max_age_s`
+   承担，与 stamp 无关。
