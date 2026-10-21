@@ -399,6 +399,17 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
 节点 `--self-test`）在非零腕/控制器 anchor 下覆盖三轴、两种轴序和默认
 符号，要求工具姿态误差 < 1e-6 rad；另钉住「tool roll 只动 roll 关节」。
 
+**默认符号左右相同（2026-10-21 更新）**：`DEFAULT_WRIST_SIGNS` 两侧均为
+`(yaw,pitch,roll) = (+1,-1,+1)`。旧值左侧 `(-1,+1,-1)` 是右侧的**全局取反**
+（当时假定左右工具系镜像）；v4 3-point sim 中表现为**左手 yaw 与 pitch 与
+真人转向相反**、右手正常。X2 的腕工具系并不镜像：零位时两侧 `wrist_roll`
+铰轴都是世界 +x、yaw/pitch 轴为世界 +z/+y（`x2_ultra.xml`），同一 controller
+body 对应关系适用两侧。`CHAIN_V3_CHECKS[19]`
+`wrist_default_signs_side_parallel` 钉住这一点；若单侧确需不同符号，用
+`WRIST3_*_SIGN*` / `--wrist-{yaw,pitch,roll}-sign-l/-r` 覆盖并记录原因，
+**不要恢复“左右镜像”**。旧版下 roll 同样是取反的，随这次统一一并修正，
+真机侧建议下轮复核。
+
 ### 10.4 真机标定/排查
 
 1. 先分别做 tool yaw / pitch / roll 各 20–30°（不要同时转），**看手的
@@ -476,3 +487,8 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
 8. **`get_time_stamp_ns()` 仍然不可靠**（见 §5.3）：3point 的 50 Hz 节奏完全用本地
    `time.monotonic()`，stamp 只出现在状态行里。单侧时效由 `_ctrl_t` + `max_age_s`
    承担，与 stamp 无关。
+9. **默认腕符号两侧相同**（2026-10-21 sim 验证）：`DEFAULT_WRIST_SIGNS` 两侧
+   `(+1,-1,+1)`。旧版左侧是右侧的全局取反，3point sim 里左腕 yaw/pitch 与手
+   相反、右侧正常；X2 两侧腕工具系平行（零位 roll 轴均为世界 +x），不镜像。
+   若单侧仍偏，用 `--wrist-{yaw,pitch,roll}-sign-l/-r` 显式覆盖，**不要**恢复
+   左右镜像。详见 §10.3。

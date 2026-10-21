@@ -127,13 +127,21 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         IKResult,
     )
 
-# Default per-axis wrist signs (yaw, pitch, roll) per side. UNVERIFIED on
-# the robot: derived from v1's _YAW_SIGN / live ROLL_SIGN=-1 plus the
-# left/right mirror. The tape-replay direction assertions must confirm
-# them before any robot run; flipping is one flag (WRIST3_*_SIGN env /
-# --wrist-{yaw,pitch,roll}-sign CLI).
+# Default per-axis wrist signs (yaw, pitch, roll) per side, applied to the
+# controller body-frame axes (z -> yaw, y -> pitch, x -> roll).
+#
+# VALIDATED in the v4 trackerless 3-point MuJoCo session (2026-10-21): the
+# right mapping followed the operator's hand; the left was its exact
+# negation (operator saw left yaw AND left pitch reversed). The old values
+# were a left/right MIRROR of the right signs, which assumed mirrored tool
+# frames -- the X2 wrist chain is not mirrored: at the zero pose both
+# wrist_roll axes are world +x and the yaw/pitch axes are world +z/+y
+# (`x2_ultra.xml`), so the SAME controller-body correspondence applies to
+# both sides. Do not reintroduce a per-side mirror; if one side ever needs
+# a different sign after a grip/robot change, override it with
+# WRIST3_*_SIGN / --wrist-{yaw,pitch,roll}-sign and document why.
 DEFAULT_WRIST_SIGNS = {
-    "left": (-1.0, 1.0, -1.0),
+    "left": (1.0, -1.0, 1.0),
     "right": (1.0, -1.0, 1.0),
 }
 
@@ -1606,6 +1614,47 @@ def check_3pt_controller_frame() -> None:
         assert np.all(np.isfinite(q))
 
 
+def check_wrist_default_signs_side_parallel() -> None:
+    """Default wrist correspondence is the SAME on both sides (live-validated).
+
+    2026-10-21 v4 3-point MuJoCo session: the shipped left signs were the
+    exact negation of the right (the old "left/right mirror"), and the
+    operator saw the left yaw and pitch reversed while the right followed
+    the hand.  The X2 wrist tool frames are NOT mirrored: at the zero pose
+    both ``wrist_roll`` axes are world +x and the yaw/pitch axes are world
+    +z/+y (``x2_ultra.xml``), so the same controller-body correspondence
+    must apply to both sides.
+
+    Pin (zero wrist anchor, so the ZYX decomposition is single-axis): the
+    same controller body-frame rotation commands the same wrist joints on
+    the left and the right, and +z -> +yaw, +y -> -pitch, +x -> +roll.
+    """
+    theta = 0.1  # rad; below the 0.12 rad/tick slew so the sign is readable
+    axes = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+    # axis -> (wrist joint index, expected sign): controller z->yaw +,
+    # y->pitch -, x->roll +
+    specs = {"x": (2, 1.0), "y": (1, -1.0), "z": (0, 1.0)}
+    cmds = {}
+    for side in ("left", "right"):
+        wc = WristClutch(side)
+        assert wc.engage(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]))
+        for name, axis in axes.items():
+            dq = sRot.from_rotvec(theta * np.asarray(axis)).as_quat(scalar_first=True)
+            cmd = wc.step(dq)
+            col, sign = specs[name]
+            assert cmd[col] * sign > 0.5 * theta, (
+                f"{side} {name}: wrist delta {np.round(cmd, 4)} has the wrong "
+                f"sign on joint {col} (expected {sign:+.0f})"
+            )
+            cmds[(side, name)] = cmd
+            wc.cmd[:] = 0.0  # back to the zero anchor for the next axis
+            wc.last_delta_ypr[:] = 0.0
+    for name in axes:
+        assert np.allclose(
+            cmds[("left", name)], cmds[("right", name)], rtol=0.0, atol=1e-12
+        ), f"{name}: default wrist signs differ between sides (old mirror bug)"
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -1628,6 +1677,7 @@ CHECKS = [
     ("posture_gain_null_space", check_posture_gain_null_space),
     ("wrist_nonzero_anchor_tracks_tool_rotation", check_wrist_nonzero_anchor_tracks_tool_rotation),
     ("3pt_controller_frame", check_3pt_controller_frame),
+    ("wrist_default_signs_side_parallel", check_wrist_default_signs_side_parallel),
 ]
 
 

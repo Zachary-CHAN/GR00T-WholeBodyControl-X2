@@ -178,7 +178,8 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 **不用任何 Pico body tracker**：只戴头显、双手柄。v3 链的 frame 契约只消费
 `t / lctrl_pose / rctrl_pose / trigger / grip`（`smpl_joints` 完全被忽略），所以 v4
 是**换数据源**，不是改控制律：`ThreePointSource` 用两个 controller 的 pose 填满这 5 个
-字段，`--tracking 3point` 打开这条路，IK / 腕映射 / 手指极性 / LPF / 阈值全部不变。
+字段，`--tracking 3point` 打开这条路，IK / 手指极性 / LPF / 阈值全部不变（腕映射
+数学不变；默认腕符号的修正见本节末）。
 
 - **一次性固定 operator frame**：标定时取 `lat = p_left - p_right`（去掉世界竖直分量）
   与 `fwd = cross(lat, up)`，origin = 双手柄中点；标定后**冻结**，绝不逐 tick 更新。
@@ -192,6 +193,13 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 - **wire `engaged` 强制 0**：3point 的 `smpl_joints`/`human_quat` 是占位零值，强制
   `engaged=0` 让同 topic 的 SMPL tokenizer 不接管；v3 链不读 `engaged`，**grip 就是离合**。
 - 3point 强制 `--no-locomotion`，且与 `--tape-replay` / `--tape-once` 互斥（live-only）。
+- **默认腕符号两侧相同**（2026-10-21 live sim 验证）：`DEFAULT_WRIST_SIGNS` 两侧
+  `(+1,-1,+1)`（控制器 z→+yaw、y→-pitch、x→+roll）。旧版左侧是右侧的全局取反
+  （镜像假设），实测左手 yaw/pitch 与真人转向相反、右手正常；X2 两侧腕工具系
+  平行而非镜像（零位 roll 轴均为世界 +x）。`CHAIN_V3_CHECKS[19]`
+  `wrist_default_signs_side_parallel` 钉住该契约；单侧确需不同符号时用
+  `--wrist-{yaw,pitch,roll}-sign-l/-r` 覆盖。旧版下 roll 同样被取反，已随这次
+  统一修正，真机侧下轮复核。
 
 仿真命令（终端 A 先起 harness，终端 B 起 sender；wrapper 会拉起 PC Service）：
 
