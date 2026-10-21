@@ -130,19 +130,20 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
 # Default per-axis wrist signs (yaw, pitch, roll) per side, applied to the
 # controller body-frame axes (z -> yaw, y -> pitch, x -> roll).
 #
-# VALIDATED in the v4 trackerless 3-point MuJoCo session (2026-10-21): the
-# right mapping followed the operator's hand; the left was its exact
-# negation (operator saw left yaw AND left pitch reversed). The old values
-# were a left/right MIRROR of the right signs, which assumed mirrored tool
-# frames -- the X2 wrist chain is not mirrored: at the zero pose both
-# wrist_roll axes are world +x and the yaw/pitch axes are world +z/+y
-# (`x2_ultra.xml`), so the SAME controller-body correspondence applies to
-# both sides. Do not reintroduce a per-side mirror; if one side ever needs
-# a different sign after a grip/robot change, override it with
-# WRIST3_*_SIGN / --wrist-{yaw,pitch,roll}-sign and document why.
+# LIVE A/B IN PROGRESS (2026-10-21, second v4 trackerless 3-point session).
+# History: the original constants were a hand-derived guess -- v1's
+# x2_wrist_map signs plus an assumed left/right MIRROR -- and were marked
+# UNVERIFIED.  Session 1 with the mirror (left == -right) showed the left
+# yaw AND pitch reversed while the right yaw was fine.  Session 2 with the
+# sides made parallel at (1, -1, 1) fixed the left hand but left the RIGHT
+# pitch wrong.  The current experiment is (1, 1, 1) on both sides (::
+# controller +y -> +pitch), run WITHOUT --ctrl-lever calibration, to settle
+# the pitch sign empirically.  Do not treat these as validated until the
+# live result is in; override per axis with WRIST3_*_SIGN /
+# --wrist-{yaw,pitch,roll}-sign if only one axis is off.
 DEFAULT_WRIST_SIGNS = {
-    "left": (1.0, -1.0, 1.0),
-    "right": (1.0, -1.0, 1.0),
+    "left": (1.0, 1.0, 1.0),
+    "right": (1.0, 1.0, 1.0),
 }
 
 
@@ -553,6 +554,7 @@ class IncrementalTeleopTickerV3:
         ctrl_lever: tuple | dict | None = None,
         position_deadband_m: float = 0.003,
         posture_gain: float = 0.01,
+        home_speed_rad_s: float = 0.5,
     ) -> None:
         self.dt = float(dt)
         self.trigger_thresh = float(trigger_thresh)
@@ -560,6 +562,18 @@ class IncrementalTeleopTickerV3:
         self.stale_grip_close = bool(stale_grip_close)
         self.grip_tau = float(grip_tau)
         self.waist_stand = float(waist_stand)
+        # ARM HOME (X/A long-press, v4 3-point): return one arm to
+        # ARM_NEUTRAL at a bounded JOINT rate. 0.5 rad/s (~29 deg/s) keeps
+        # the PD target human-plausible; refuse <=0 rather than silently
+        # freezing the arm forever.
+        self.home_speed_rad_s = float(home_speed_rad_s)
+        if self.home_speed_rad_s <= 0.0:
+            raise ValueError("home_speed_rad_s must be > 0")
+        # Active homing per side, and the previous wire request level (edge
+        # detection: the sender latches a short pulse per long press, so a
+        # level held high across completion must not restart the motion).
+        self.home = {"left": False, "right": False}
+        self._home_prev = {"left": False, "right": False}
         # A single 3-vector applies to both arms; a {"left": v, "right": v}
         # mapping calibrates them separately. The two controllers are held at
         # different orientations in the body frame, so a real fit differs by
@@ -638,6 +652,32 @@ class IncrementalTeleopTickerV3:
         v = np.asarray(ctrl_lever, np.float64).reshape(3)
         return {"left": v.copy(), "right": v.copy()}
 
+    def _home_slew(self, side: str, arm) -> np.ndarray:
+        """One tick of the bounded arm-home return; returns the commanded q.
+
+        Every joint moves toward ARM_NEUTRAL by at most
+        ``home_speed_rad_s * dt`` (all joints in parallel, so a 0.5 rad/s
+        bound is the per-joint speed, not a norm). The wrist clutch command
+        follows the moving wrist so the record and a later re-engage stay
+        consistent; the arm's IK telemetry is zeroed. Completion snaps to
+        the exact neutral and clears ``self.home[side]``; if the grip is
+        still held, the normal engage path re-anchors at the neutral pose
+        on the next tick.
+        """
+        target = np.asarray(ARM_NEUTRAL[side], np.float64)
+        dq = target - arm.q
+        step = self.home_speed_rad_s * self.dt
+        if np.max(np.abs(dq)) <= step:
+            arm.q = target.copy()
+            self.home[side] = False
+        else:
+            arm.q = arm.q + np.clip(dq, -step, step)
+        arm.wrist.cmd[:] = arm.q[4:7]
+        arm.wrist.last_delta_ypr[:] = 0.0
+        arm.last_ik = IKResult(0.0, 0.0, 0, 0)
+        arm.holding = False
+        return arm.q.copy()
+
     def step(self, frame, now: float | None = None) -> dict:
         now = time.monotonic() if now is None else now
         dt = self.dt
@@ -675,15 +715,36 @@ class IncrementalTeleopTickerV3:
             "left": fresh and self.grip_f["l"] > self.trigger_thresh,
             "right": fresh and self.grip_f["r"] > self.trigger_thresh,
         }
+        # ARM HOME request (X/A long-press, v4 3-point): the frame may carry
+        # a 2-vector of request levels. A rising edge starts that side's
+        # bounded return to ARM_NEUTRAL and releases its clutch; the sender
+        # turns one long press into a short pulse, so an unbroken level does
+        # not restart the motion after completion.
+        home_req = {"left": False, "right": False}
+        if fresh:
+            hv = np.asarray(frame.get("home", (0.0, 0.0)), np.float64).reshape(-1)
+            if hv.size >= 2:
+                home_req = {"left": bool(hv[0] > 0.5), "right": bool(hv[1] > 0.5)}
+        for side in ("left", "right"):
+            if home_req[side] and not self._home_prev[side]:
+                self.home[side] = True
+                self.arms[side].disengage()
+                self.arms[side].holding = False
+            self._home_prev[side] = home_req[side]
         ctrl = {"left": lcp, "right": rcp}
         for side, arm in self.arms.items():
+            if self.home[side]:
+                continue  # homing owns this arm; no clutch work this tick
             if held[side] and not arm.engaged:
                 arm.engage(ctrl[side])  # refuses zero placeholders
             elif not held[side] and arm.engaged:
                 arm.disengage()
         q = {}
         for side, arm in self.arms.items():
-            q[side], _ = arm.step(held[side], ctrl[side])
+            if self.home[side]:
+                q[side] = self._home_slew(side, arm) if fresh else arm.q.copy()
+            else:
+                q[side], _ = arm.step(held[side], ctrl[side])
         return {
             "fresh": fresh,
             "lt": lt,
@@ -1615,25 +1676,28 @@ def check_3pt_controller_frame() -> None:
 
 
 def check_wrist_default_signs_side_parallel() -> None:
-    """Default wrist correspondence is the SAME on both sides (live-validated).
+    """Default wrist correspondence is the SAME on both sides (live under test).
 
-    2026-10-21 v4 3-point MuJoCo session: the shipped left signs were the
-    exact negation of the right (the old "left/right mirror"), and the
-    operator saw the left yaw and pitch reversed while the right followed
-    the hand.  The X2 wrist tool frames are NOT mirrored: at the zero pose
+    2026-10-21 v4 3-point MuJoCo sessions.  Session 1 (left signs the exact
+    negation of the right, the old "left/right mirror") showed the left yaw
+    and pitch reversed while the right followed the hand.  Session 2 with
+    both sides at (1, -1, 1) fixed the left but left the RIGHT pitch wrong,
+    so the current experiment is (1, 1, 1) on both sides: controller +y ->
+    +pitch.  The X2 wrist tool frames are NOT mirrored (at the zero pose
     both ``wrist_roll`` axes are world +x and the yaw/pitch axes are world
-    +z/+y (``x2_ultra.xml``), so the same controller-body correspondence
-    must apply to both sides.
+    +z/+y, ``x2_ultra.xml``), so whatever the final triple is, it must be
+    the SAME on both sides.
 
     Pin (zero wrist anchor, so the ZYX decomposition is single-axis): the
     same controller body-frame rotation commands the same wrist joints on
-    the left and the right, and +z -> +yaw, +y -> -pitch, +x -> +roll.
+    the left and the right, and +z -> +yaw, +y -> +pitch (A/B under test),
+    +x -> +roll.
     """
     theta = 0.1  # rad; below the 0.12 rad/tick slew so the sign is readable
     axes = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
     # axis -> (wrist joint index, expected sign): controller z->yaw +,
-    # y->pitch -, x->roll +
-    specs = {"x": (2, 1.0), "y": (1, -1.0), "z": (0, 1.0)}
+    # y->pitch + (current A/B), x->roll +
+    specs = {"x": (2, 1.0), "y": (1, 1.0), "z": (0, 1.0)}
     cmds = {}
     for side in ("left", "right"):
         wc = WristClutch(side)
@@ -1653,6 +1717,88 @@ def check_wrist_default_signs_side_parallel() -> None:
         assert np.allclose(
             cmds[("left", name)], cmds[("right", name)], rtol=0.0, atol=1e-12
         ), f"{name}: default wrist signs differ between sides (old mirror bug)"
+
+
+def check_arm_home_long_press() -> None:
+    """X/A long-press -> bounded arm home (v4 3-point contract).
+
+    The wire carries a 2-vector ``home`` request; the sender turns one
+    >=3 s face-button hold into a short pulse. Pin: a rising edge starts
+    homing for that side ONLY, releases its clutch, and moves every joint
+    toward ARM_NEUTRAL by at most ``home_speed_rad_s * dt`` per tick; on
+    completion the pose is exactly neutral, a still-held grip re-anchors
+    there without a jump, and a request level that stays high does not
+    restart the motion.
+    """
+
+    def pose(x, y, z):
+        out = np.zeros(7, np.float64)
+        out[:3] = (x, y, z)
+        out[3] = 1.0  # unit quat (wxyz): engage() refuses zero placeholders
+        return out
+
+    def frame(now, home, grip):
+        return {
+            "t": now,
+            "trigger": np.array([0.0, 0.0]),
+            "grip": np.asarray(grip, np.float64),
+            "lctrl_pose": pose(0.20, 0.0, 0.10),
+            "rctrl_pose": pose(-0.20, 0.0, 0.10),
+            "home": np.asarray(home, np.float64),
+        }
+
+    ticker = IncrementalTeleopTickerV3(
+        torso_keepout=None, position_deadband_m=0.0, posture_gain=0.0
+    )
+    neutral = {s: np.asarray(ARM_NEUTRAL[s], np.float64).copy() for s in ("left", "right")}
+    right0 = ticker.arms["right"].q.copy()
+
+    # Deflect the left arm and engage it, so the request must both release
+    # the clutch and slew a non-neutral pose home.
+    q_deflected = neutral["left"] + np.array([0.40, -0.30, 0.20, 0.10, 0.20, -0.15, 0.10])
+    ticker.arms["left"].q = q_deflected.copy()
+    ticker.arms["left"].wrist.cmd[:] = q_deflected[4:7]
+    assert ticker.arms["left"].engage(pose(0.20, 0.0, 0.10))
+    assert ticker.arms["left"].engaged
+
+    now = 100.0
+    max_step = ticker.home_speed_rad_s * ticker.dt
+    # Rising edge: home starts, the clutch releases, the OTHER arm holds.
+    st = ticker.step(frame(now, home=(1.0, 0.0), grip=(0.0, 0.0)), now)
+    assert ticker.home["left"] and not ticker.home["right"]
+    assert not ticker.arms["left"].engaged
+    assert np.allclose(st["q"]["right"], right0, rtol=0.0, atol=0.0)
+    q_prev = st["q"]["left"].copy()
+    assert np.max(np.abs(q_prev - neutral["left"])) > 0.1  # still far from home
+
+    # Bounded slew: every joint step <= home_speed * dt, monotone progress.
+    ticks = 0
+    while ticker.home["left"]:
+        now += ticker.dt
+        st = ticker.step(frame(now, home=(1.0, 0.0), grip=(0.0, 0.0)), now)
+        q_now = st["q"]["left"]
+        assert np.max(np.abs(q_now - q_prev)) <= max_step + 1e-9, (
+            f"home joint step {np.max(np.abs(q_now - q_prev)):.4f} rad/tick "
+            f"exceeds {max_step:.4f}"
+        )
+        assert np.max(np.abs(q_now - neutral["left"])) <= np.max(
+            np.abs(q_prev - neutral["left"])
+        ), "home moved away from ARM_NEUTRAL"
+        q_prev = q_now.copy()
+        ticks += 1
+        assert ticks < 1000
+    assert np.array_equal(st["q"]["left"], neutral["left"])  # exact snap
+    assert np.allclose(st["q"]["right"], right0, rtol=0.0, atol=0.0)
+
+    # Still-held grip re-anchors at the neutral pose; the request level is
+    # still high, which must NOT restart homing or disengage again.
+    for _ in range(40):  # 0.8 s: past the grip LPF
+        now += ticker.dt
+        st = ticker.step(frame(now, home=(1.0, 0.0), grip=(1.0, 0.0)), now)
+    assert not ticker.home["left"]
+    assert ticker.arms["left"].engaged
+    assert np.max(np.abs(st["q"]["left"] - neutral["left"])) < 1e-6
+    assert np.allclose(st["q"]["right"], right0, rtol=0.0, atol=0.0)
 
 
 CHECKS = [
@@ -1678,6 +1824,7 @@ CHECKS = [
     ("wrist_nonzero_anchor_tracks_tool_rotation", check_wrist_nonzero_anchor_tracks_tool_rotation),
     ("3pt_controller_frame", check_3pt_controller_frame),
     ("wrist_default_signs_side_parallel", check_wrist_default_signs_side_parallel),
+    ("arm_home_long_press", check_arm_home_long_press),
 ]
 
 

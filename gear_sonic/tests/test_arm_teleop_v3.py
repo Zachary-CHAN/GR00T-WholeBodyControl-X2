@@ -101,6 +101,10 @@ def test_wrist_default_signs_side_parallel():
     a3.CHAIN_V3_CHECKS[19][1]()
 
 
+def test_arm_home_long_press():
+    a3.CHAIN_V3_CHECKS[20][1]()
+
+
 def test_fixed_operator_frame_position_only():
     """The operator frame reads positions only: arbitrary (even zero)
     quaternions on the same pair of positions must give the same M/origin."""

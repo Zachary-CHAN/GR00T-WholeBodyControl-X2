@@ -193,13 +193,16 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 - **wire `engaged` 强制 0**：3point 的 `smpl_joints`/`human_quat` 是占位零值，强制
   `engaged=0` 让同 topic 的 SMPL tokenizer 不接管；v3 链不读 `engaged`，**grip 就是离合**。
 - 3point 强制 `--no-locomotion`，且与 `--tape-replay` / `--tape-once` 互斥（live-only）。
-- **默认腕符号两侧相同**（2026-10-21 live sim 验证）：`DEFAULT_WRIST_SIGNS` 两侧
-  `(+1,-1,+1)`（控制器 z→+yaw、y→-pitch、x→+roll）。旧版左侧是右侧的全局取反
-  （镜像假设），实测左手 yaw/pitch 与真人转向相反、右手正常；X2 两侧腕工具系
-  平行而非镜像（零位 roll 轴均为世界 +x）。`CHAIN_V3_CHECKS[19]`
-  `wrist_default_signs_side_parallel` 钉住该契约；单侧确需不同符号时用
-  `--wrist-{yaw,pitch,roll}-sign-l/-r` 覆盖。旧版下 roll 同样被取反，已随这次
-  统一修正，真机侧下轮复核。
+- **默认腕符号左右相同，逐轴仍在 live A/B**（2026-10-21）：`DEFAULT_WRIST_SIGNS`
+  两侧必须一致。旧版左侧是右侧的全局取反（镜像假设），实测左腕 yaw/pitch 与手
+  相反；第二轮两侧 `(+1,-1,+1)` 后左手正常、右手 pitch 反，第三轮当前取
+  `(+1,+1,+1)` 实测。X2 两侧腕工具系平行而非镜像（零位 roll 轴均为世界 +x）。
+  `CHAIN_V3_CHECKS[19]` 钉住“左右相同”；单轴不对时用
+  `--wrist-{yaw,pitch,roll}-sign-l/-r` 只改那一轴。
+- **X/A 长按回位**：左手柄 X 或右手柄 A 按住 ≥3 s，对应手臂按
+  `home_speed_rad_s`（默认 0.5 rad/s，每关节）回到 `ARM_NEUTRAL` 初始姿态；
+  回位期间该臂离合释放，完成后仍握 grip 会在新姿态重新 anchor，不跳变。
+  3point 专属（full 模式里长按 X 是整段录制开始）。
 
 仿真命令（终端 A 先起 harness，终端 B 起 sender；wrapper 会拉起 PC Service）：
 

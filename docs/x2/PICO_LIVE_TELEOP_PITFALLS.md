@@ -399,16 +399,17 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
 节点 `--self-test`）在非零腕/控制器 anchor 下覆盖三轴、两种轴序和默认
 符号，要求工具姿态误差 < 1e-6 rad；另钉住「tool roll 只动 roll 关节」。
 
-**默认符号左右相同（2026-10-21 更新）**：`DEFAULT_WRIST_SIGNS` 两侧均为
-`(yaw,pitch,roll) = (+1,-1,+1)`。旧值左侧 `(-1,+1,-1)` 是右侧的**全局取反**
-（当时假定左右工具系镜像）；v4 3-point sim 中表现为**左手 yaw 与 pitch 与
-真人转向相反**、右手正常。X2 的腕工具系并不镜像：零位时两侧 `wrist_roll`
-铰轴都是世界 +x、yaw/pitch 轴为世界 +z/+y（`x2_ultra.xml`），同一 controller
-body 对应关系适用两侧。`CHAIN_V3_CHECKS[19]`
-`wrist_default_signs_side_parallel` 钉住这一点；若单侧确需不同符号，用
+**默认符号左右相同（2026-10-21，逐轴符号仍在 live A/B）**：`DEFAULT_WRIST_SIGNS`
+两侧始终用同一组符号。旧值左侧 `(-1,+1,-1)` 是右侧的**全局取反**（当时假定左右
+工具系镜像），v4 3-point sim 第一轮表现为**左手 yaw 与 pitch 与真人转向相反**；
+改为两侧 `(+1,-1,+1)` 后第二轮左手正常、但**右手 pitch 反**，因此当前把两侧都
+置为 `(+1,+1,+1)` 做第三轮实测（控制器 +y→+pitch）。X2 的腕工具系并不镜像：
+零位时两侧 `wrist_roll` 铰轴都是世界 +x、yaw/pitch 轴为世界 +z/+y
+（`x2_ultra.xml`），所以同一 controller body 对应关系必须适用两侧；但某个轴的
+符号仍可能因握法/SDK 约定需要逐侧不同。`CHAIN_V3_CHECKS[19]`
+`wrist_default_signs_side_parallel` 钉住“左右相同”这一契约；逐轴用
 `WRIST3_*_SIGN*` / `--wrist-{yaw,pitch,roll}-sign-l/-r` 覆盖并记录原因，
-**不要恢复“左右镜像”**。旧版下 roll 同样是取反的，随这次统一一并修正，
-真机侧建议下轮复核。
+**不要恢复整套“左右镜像”**。
 
 ### 10.4 真机标定/排查
 
@@ -487,8 +488,13 @@ body 对应关系适用两侧。`CHAIN_V3_CHECKS[19]`
 8. **`get_time_stamp_ns()` 仍然不可靠**（见 §5.3）：3point 的 50 Hz 节奏完全用本地
    `time.monotonic()`，stamp 只出现在状态行里。单侧时效由 `_ctrl_t` + `max_age_s`
    承担，与 stamp 无关。
-9. **默认腕符号两侧相同**（2026-10-21 sim 验证）：`DEFAULT_WRIST_SIGNS` 两侧
-   `(+1,-1,+1)`。旧版左侧是右侧的全局取反，3point sim 里左腕 yaw/pitch 与手
-   相反、右侧正常；X2 两侧腕工具系平行（零位 roll 轴均为世界 +x），不镜像。
-   若单侧仍偏，用 `--wrist-{yaw,pitch,roll}-sign-l/-r` 显式覆盖，**不要**恢复
-   左右镜像。详见 §10.3。
+9. **默认腕符号左右相同，逐轴符号仍在 live A/B**（2026-10-21）：`DEFAULT_WRIST_SIGNS`
+   两侧必须相同。第一轮左侧是右侧的全局取反，左腕 yaw/pitch 与手相反；第二轮两侧
+   `(+1,-1,+1)` 后左手正常、右手 pitch 反；第三轮当前取 `(+1,+1,+1)` 实测。
+   X2 两侧腕工具系平行（零位 roll 轴均为世界 +x），不镜像，不要恢复整套左右镜像；
+   单轴不对时用 `--wrist-{yaw,pitch,roll}-sign-l/-r` 只改那一轴。详见 §10.3。
+10. **X/A 长按 3 s 手臂回位（3point 专属）**：左手柄 X → 左臂、右手柄 A → 右臂，
+   以 `home_speed_rad_s`（默认 0.5 rad/s ≈ 29°/s）的**每关节**速度回到
+   `ARM_NEUTRAL`（与 harness/真机启动时的初始姿态一致）。回位期间该臂离合释放，
+   完成后若仍握着 grip 会在回位姿态重新 anchor，不跳变；按住不放不会重复触发。
+   full 模式没有此功能：长按 X 仍是整段录制开始，A 属于 A+B+X+Y / A+X 和弦。

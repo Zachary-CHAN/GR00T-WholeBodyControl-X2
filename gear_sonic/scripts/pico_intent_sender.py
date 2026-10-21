@@ -511,6 +511,46 @@ def _read_trigger_pair(src) -> tuple[float, float]:
     return float(xrt.get_left_trigger()), float(xrt.get_right_trigger())
 
 
+def _read_home_buttons(xrt):
+    """(left X held, right A held) for the arm-home gesture; a failed or
+    absent SDK read is 'released' (never latches)."""
+    if xrt is None:
+        return False, False
+    try:
+        return bool(xrt.get_X_button()), bool(xrt.get_A_button())
+    except Exception:
+        return False, False
+
+
+class _LongPressLatch:
+    """Face-button long-press -> one short request pulse per press.
+
+    The wire receiver edge-detects the pulse, so it must survive a dropped
+    frame: firing keeps the level high for ``pulse_s`` even if the button
+    is released inside that window. A press cannot fire twice until the
+    button is released and held again for ``hold_s``.
+    """
+
+    def __init__(self, hold_s: float = 3.0, pulse_s: float = 0.5) -> None:
+        self.hold_s = float(hold_s)
+        self.pulse_s = float(pulse_s)
+        self._since = None
+        self._armed = True
+        self._pulse_until = 0.0
+
+    def update(self, pressed: bool, now: float) -> bool:
+        if pressed:
+            if self._since is None:
+                self._since = now
+            if self._armed and now - self._since >= self.hold_s:
+                self._armed = False
+                self._pulse_until = now + self.pulse_s
+        else:
+            self._since = None
+            self._armed = True
+        return now < self._pulse_until
+
+
 def _poll_controllers(xrt):
     """One tick of stick/button/trigger state from the XRoboToolkit SDK.
     Returns (lx, ly, rx, ry, a, b, x, y, lt, rt) or None when the SDK
@@ -1082,6 +1122,11 @@ def main() -> int:
               + (" (once: controls go neutral at the end, planner idle/release)" if args.tape_once else " (LOOPING)"),
               flush=True)
     frame_idx, n_sent, t_rep = 0, 0, time.monotonic()
+    # v4 3-point arm home: left X and right A held >=3 s each return that
+    # arm to ARM_NEUTRAL. 3point-only: in the full-mode locomotion grammar a
+    # long X is the full-session recorder start, and A is part of the
+    # A+B+X+Y / A+X chords -- those paths must stay bit-identical.
+    home_latches = {"left": _LongPressLatch(), "right": _LongPressLatch()}
     recording = not args.no_record and not args.tape_replay
     rec = {"t": [], "smpl_joints": [], "human_quat": [],
            "engaged": [], "wrist_pr": [],
@@ -1687,6 +1732,19 @@ def main() -> int:
                 ctrl_fields = _ctrl_wire_fields_3pt(src, lt, rt)
             else:
                 ctrl_fields = _ctrl_wire_fields(getattr(src, "xrt", None), lt, rt)
+            # Arm-home request levels (3point only; see home_latches above).
+            # The receiver edge-detects the pulse; a tape replay carries no
+            # request (homing is an operator command, not recorded state).
+            if tracking_3pt:
+                lx_btn, ra_btn = _read_home_buttons(getattr(src, "xrt", None))
+                ctrl_fields = dict(ctrl_fields)
+                ctrl_fields["home"] = np.array(
+                    [
+                        float(home_latches["left"].update(lx_btn, now)),
+                        float(home_latches["right"].update(ra_btn, now)),
+                    ],
+                    np.float32,
+                )
             # 3point sends PLACEHOLDER smpl_joints/human_quat: force engaged 0
             # so a SMPL tokenizer on the same topic never treats them as live
             # body. The v3 chain does not read `engaged`; grip is its clutch.
