@@ -37,8 +37,10 @@ guard, pose LPF. Deliberate changes:
    The older W_a^-1 delta W_a conjugation was worse (18-26 deg).
 
    ``full_pose_ik=True`` is an explicit opt-in alternative: the FULL
-   7-DoF pose IK (position AND orientation tasks, both gains 1.0 -- equal
-   weighting) solves the wrist too. ``WristClutch.step`` still runs every
+   7-DoF pose IK (position AND orientation tasks; mink uses
+   position_cost 1.5 and wrist-frame orientation costs (1.0, 0.7, 1.0),
+   i.e. pitch yields to position while roll/yaw keep full authority; DLS
+   treats both equally) solves the wrist too. ``WristClutch.step`` still runs every
    tick on both paths; on the full-pose path its command is telemetry only
    (record columns 49:61).
 3. HAND INVERTED: ``r = hand`` -- the hand is OPEN at rest and CLOSES when
@@ -343,6 +345,32 @@ class ClutchArmV3(ClutchArm):
         self.ctrl_lever = (
             np.zeros(3, np.float64) if lever is None else np.asarray(lever, np.float64).reshape(3)
         )
+        # OPERATOR X/Y SIGN (2026-10-30, live-corrected). The 3-point sender
+        # builds [fwd, lat, up] with ``fwd = cross(lat, up)`` from the SDK
+        # world. That world is RIGHT-handed (X right, Y up, Z in; the PC
+        # service README pins it and notes that the actual data flips
+        # Unity's +Z), NOT the left-handed Unity figure the 2026-10-27 round
+        # assumed. With the left controller at -X the cross product is
+        # therefore -Z = operator FORWARD: wire = (operator forward,
+        # operator left, up). The X2 base frame is (forward, left, up) as
+        # well (ARM_NEUTRAL puts the wrists at +x) and the operator faces
+        # the SAME direction (2026-10-30 live, NOT face-to-face), so the
+        # avatar map is the IDENTITY: +1 / +1. -1 mirrors an axis and is
+        # only correct for a face-to-face rig; the 2026-10-27 x=-1 round
+        # trusted the Unity left-handed figure and made the real robot
+        # reach BACKWARD (and, with the trunk keep-out, sideways). The
+        # wrist needs neither sign: a constant frame cancels in
+        # R_anchor^-1 R_now, which is why rotation looked fine all along.
+        # Both flips MUST happen after the lever correction: ``r_c`` and the
+        # wire quaternion share the old frame, so mirroring their input
+        # coordinates would inject a 2*(R_c r_c)_i error during wrist
+        # rotation. Defaults +1 preserve the full-body wire behaviour.
+        self.operator_x_sign = float(kwargs.pop("operator_x_sign", 1.0))
+        self.operator_y_sign = float(kwargs.pop("operator_y_sign", 1.0))
+        if self.operator_x_sign not in (-1.0, 1.0):
+            raise ValueError("operator_x_sign must be +1 or -1")
+        if self.operator_y_sign not in (-1.0, 1.0):
+            raise ValueError("operator_y_sign must be +1 or -1")
         self.full_pose_ik = bool(kwargs.pop("full_pose_ik", False))
         # Soft radial deadband on the compensated translation, metres. The
         # operator's hand tremor and the clutch re-anchor both live at the
@@ -405,16 +433,73 @@ class ClutchArmV3(ClutchArm):
         return self.q[4:7] if self.full_pose_ik else self.wrist.cmd
 
     def _operator_wrist_pos(self, c: np.ndarray) -> np.ndarray:
-        """Controller origin -> operator wrist centre, ``C - R_c @ r_c``."""
+        """Controller origin -> operator wrist centre, ``C - R_c @ r_c``.
+
+        Either operator sign may mirror the result's x/y, both AFTER the
+        lever correction.  The real v4 node uses (x, y) = (+1, +1): the
+        3-point wire is already operator (forward, left, up) -- the SDK
+        world is right-handed X-right/Y-up/Z-in, so ``fwd = cross(lat,
+        up)`` is operator-FORWARD (the 2026-10-27 round mistook it for
+        BACKWARD by reading the Unity figure instead of the delivered
+        data) -- and the operator faces the SAME direction as the robot
+        (2026-10-30 live correction), whose base is also (forward, left,
+        up).  The map is the identity; -1 mirrors an axis and is only
+        right for a face-to-face rig.
+        Doing the flips here (rather than on the wire position or the
+        controller quaternion) keeps ``C`` and ``R_c @ r_c`` in the same
+        frame: a pure wrist rotation still cancels exactly, while an
+        operator translation reaches the robot in the robot's own
+        forward/left sense.
+        """
         if np.linalg.norm(c[3:]) < 1e-6:
             # zero placeholder (no-xrt / SDK failure): no orientation, no
             # lever correction. engage() refuses this pose before we get here.
-            return np.asarray(c[:3], np.float64).copy()
-        return c[:3] - _rot_from_quat_wxyz(c[3:]).apply(self.ctrl_lever)
+            w = np.asarray(c[:3], np.float64).copy()
+        else:
+            w = c[:3] - _rot_from_quat_wxyz(c[3:]).apply(self.ctrl_lever)
+        if self.operator_x_sign < 0.0:
+            w[0] = -w[0]
+        if self.operator_y_sign < 0.0:
+            w[1] = -w[1]
+        return w
 
     def _compensated_target(self, c: np.ndarray, a_op, a_rob) -> np.ndarray:
         """Robot position target from the lever-corrected operator wrist."""
         return a_rob + self.position_scale * (self._operator_wrist_pos(c) - a_op)
+
+    def _clamp_reach_from_anchor(self, tgt_pos: np.ndarray, a_rob: np.ndarray) -> np.ndarray:
+        """Clamp to the reach sphere ALONG THE COMMANDED RAY FROM THE ANCHOR.
+
+        The legacy clamp below preserved the direction from the SHOULDER, so
+        once a long command saturated, the wrist slid along the sphere toward
+        the shoulder's own lateral/height line.  With the left wrist anchored
+        13.5 cm lateral of the shoulder (ARM_NEUTRAL: y 0.278 vs 0.143), a
+        40 cm operator forward extension slid the wrist ~4.8 cm toward the
+        robot's right and ~6.7 cm up while the operator's hand went straight
+        forward -- the 2026-10-30 live report "屈肘前伸左手时机器人手往右侧
+        偏移".  Intersecting the sphere with the anchor -> raw-target ray keeps
+        the operator's commanded direction exact; the wrist just stops at the
+        boundary instead of sliding (self-test: reach_clamp_anchor_direction).
+
+        The radial clamp stays as a backstop for an anchor that is itself
+        outside the sphere (a fully-extended pose at engage: max_reach is
+        0.93 of the sampled max, so that is possible, not a bug).
+        """
+        v = np.asarray(a_rob, np.float64) - self.shoulder
+        d = np.asarray(tgt_pos, np.float64) - a_rob
+        dd = float(d @ d)
+        if dd > 1e-12:
+            b = float(v @ d)
+            disc = b * b - dd * (float(v @ v) - self.max_reach**2)
+            if disc >= 0.0:
+                lam = (-b + np.sqrt(disc)) / dd
+                if lam < 1.0:
+                    tgt_pos = a_rob + max(lam, 0.0) * d
+        rad = tgt_pos - self.shoulder
+        r = float(np.linalg.norm(rad))
+        if r > self.max_reach:
+            tgt_pos = self.shoulder + rad * (self.max_reach / r)
+        return tgt_pos
 
     def _deadband(self, tgt_pos: np.ndarray, a_rob: np.ndarray) -> np.ndarray:
         """Soft radial deadband around the engage anchor.
@@ -476,10 +561,7 @@ class ClutchArmV3(ClutchArm):
         # with the waist itself)
         if self.torso_keepout is not None:
             tgt_pos = self._project_out_of_trunk(tgt_pos)
-        rad = tgt_pos - self.shoulder
-        r = float(np.linalg.norm(rad))
-        if r > self.max_reach:
-            tgt_pos = self.shoulder + rad * (self.max_reach / r)
+        tgt_pos = self._clamp_reach_from_anchor(tgt_pos, a_rob)
         if self.torso_keepout is not None:
             tgt_pos = self._project_out_of_trunk(tgt_pos)
         if self._tgt_slewed is None:
@@ -552,6 +634,10 @@ class IncrementalTeleopTickerV3:
         full_pose_ik: bool = False,
         backend: str | None = None,
         ctrl_lever: tuple | dict | None = None,
+        operator_x_sign: float = 1.0,
+        operator_y_sign: float = 1.0,
+        position_cost: float | None = None,
+        orientation_axis_weights: tuple | None = None,
         position_deadband_m: float = 0.003,
         posture_gain: float = 0.01,
         home_speed_rad_s: float = 0.5,
@@ -584,6 +670,12 @@ class IncrementalTeleopTickerV3:
         # per-side mapping above is authoritative. Kept for callers written
         # before per-hand calibration existed.
         self.ctrl_lever = self.ctrl_levers["left"]
+        self.operator_x_sign = float(operator_x_sign)
+        self.operator_y_sign = float(operator_y_sign)
+        if self.operator_x_sign not in (-1.0, 1.0):
+            raise ValueError("operator_x_sign must be +1 or -1")
+        if self.operator_y_sign not in (-1.0, 1.0):
+            raise ValueError("operator_y_sign must be +1 or -1")
         self.full_pose_ik = bool(full_pose_ik)
         # The deadband and posture term ship on the 4-DoF default path; the
         # opt-in full-pose path keeps its pre-A/B/C behavior (see
@@ -617,6 +709,12 @@ class IncrementalTeleopTickerV3:
                 full_pose_ik=full_pose_ik,
                 backend=backend,
                 ctrl_lever=self.ctrl_levers[side],
+                operator_x_sign=self.operator_x_sign,
+                operator_y_sign=self.operator_y_sign,
+                # None = the mink solver's shipped task costs (position 1.5,
+                # orientation (1, 0.7, 1)); dropped on the dls backend.
+                position_cost=position_cost,
+                orientation_axis_weights=orientation_axis_weights,
                 position_deadband_m=self.position_deadband_m,
                 posture_gain=self.posture_gain,
             )
@@ -1258,7 +1356,7 @@ def check_grip_stale_open() -> None:
     assert st2["hand"]["l"] > 0.0, "--stale-grip-close must hold the last hand"
 
 
-def _full_pose_drive(side: str, axis: str, deg: float, ticks: int = 200):
+def _full_pose_drive(side: str, axis: str, deg: float, ticks: int = 500):
     """Anchor at neutral, then command one controller rotation for `ticks`.
 
     Returns (arm, pose, R_target, p_target, q_trace). Pure -- the opt-in
@@ -1289,20 +1387,25 @@ def check_full_pose_ik_tracks_orientation() -> None:
 
     (1) A 90 deg yaw of the controller, held at a fixed position: the
         end-effector rotation must land within 3 deg of the commanded one
-        and 2 mm of the target. Measured 0.2 deg / 0.15 mm -- the 3 deg
-        gate is slack on purpose, this is a regression guard on the whole
-        chain (anchor -> target synthesis -> clip), not a solver figure.
+        and 2 mm of the target. Measured 0.0 deg / 0.35 mm at the
+        2026-10-27 bent-elbow neutral -- the 3 deg gate is slack on
+        purpose, this is a regression guard on the whole chain
+        (anchor -> target synthesis -> clip), not a solver figure.
     (2) A 60 deg pitch, which PINS ``wrist_pitch`` at its +0.558 rad
         bound: the unsaturated rotation residual must be left standing
-        (bounded, ~11.8 deg) instead of being bought with position. Both
-        task gains are 1.0 on this path (equal weighting by design), so the
-        saturated residual is split between the two tasks instead of the
-        rotation giving way to position: measured ~12.2 mm (mink) / 12.5 mm
-        (dls) of position error against ~11.8 deg of rotation residual. The
-        20 mm gate is a regression guard on that split, well above the
-        measurement and far below the 50.9 mm ``ConfigurationLimit`` failure
-        mode (see the x2_arm_mink module docstring). The last 20 ticks must
-        also be settled, not grinding against the bound.
+        (bounded, ~3.6 deg at the bent-elbow neutral) instead of being
+        bought with position. Both task gains are 1.0 on this path (equal
+        weighting by design), so the saturated residual is split between
+        the two tasks instead of the rotation giving way to position:
+        measured ~2.3 mm of position error against ~3.6 deg of rotation
+        residual. The 20 mm gate is a regression guard on that split, well
+        above both measurements and far below the 50.9 mm
+        ``ConfigurationLimit`` failure mode (see the x2_arm_mink module
+        docstring). The 500-tick drive (10 s at 50 Hz) is chosen so the
+        bounded per-tick step has converged: at the bent-elbow neutral the
+        first 200 ticks still have ~0.04 rad of travel left in the last-20
+        window, while at 500 the step is at machine precision. The last 20
+        ticks must also be settled, not grinding against the bound.
 
     and in both halves every tick must keep q inside
     ``X2_ARM_JOINT_LIMITS_RAD`` -- the end-to-end statement of "the limits
@@ -1400,8 +1503,14 @@ def check_default_4dof_and_equal_full_pose_weights() -> None:
     * the shipped default is the v1-style 4-DoF position solve + WristClutch
       direct fill, so both arms report ``full_pose_ik=False`` and the solver
       carries no orientation weight (WristClutch owns orientation);
-    * the opt-in full-pose path weights position and rotation equally (1.0 /
-      1.0), instead of the historical 1.0 / 0.5.
+    * the opt-in full-pose path keeps the position/rotation GAINS equal
+      (1.0 / 1.0), but the mink backend ships the 2026-10-30 priority
+      tuning: ``position_cost=1.5`` (mink caps ``gain`` at 1.0, so the cost
+      is the only way to raise position) and orientation per-axis costs
+      ``(1, 0.7, 1)`` -- wrist PITCH yields to position, roll/yaw stay
+      first-class. The DLS backend (the PC2 node) has no such knobs and
+      keeps the equal-gain behaviour, so the mink-only pins are skipped
+      there.
     """
     tick = IncrementalTeleopTickerV3()
     for side, arm in tick.arms.items():
@@ -1409,10 +1518,20 @@ def check_default_4dof_and_equal_full_pose_weights() -> None:
         assert (
             arm.solver.rotation_weight == 0.0
         ), f"{side}: 4-DoF path must not carry an orientation task weight"
+        if getattr(arm.solver, "backend", "dls") == "mink":
+            assert arm.solver.position_cost == 1.5, (
+                f"{side}: mink position_cost must be raised to 1.5, "
+                f"got {arm.solver.position_cost}"
+            )
     full = ClutchArmV3("left", full_pose_ik=True)
     assert full.full_pose_ik
     assert full.solver.position_weight == 1.0
-    assert full.solver.rotation_weight == 1.0, "full-pose path must weight position == rotation"
+    assert full.solver.rotation_weight == 1.0, "full-pose path must keep the gains equal"
+    if getattr(full.solver, "backend", "dls") == "mink":
+        assert full.solver.position_cost == 1.5
+        w = np.asarray(full.solver.orientation_axis_weights)
+        assert np.allclose(w, (1.0, 0.7, 1.0)), f"orientation axis weights: {w}"
+        assert w[1] < min(w[0], w[2]), "wrist pitch must yield to roll/yaw"
 
 
 def check_ctrl_lever_pure_wrist_rotation() -> None:
@@ -1493,6 +1612,141 @@ def check_ctrl_lever_pure_wrist_rotation() -> None:
     assert np.allclose(
         common.arms["right"].ctrl_lever, r_true
     ), "a single ctrl_lever must apply to both arms"
+
+
+def check_operator_signs() -> None:
+    """3-point wire x is operator-FORWARD and +y is operator-LEFT.
+
+    ``fixed_operator_frame_from_controllers`` builds ``fwd = cross(lat, up)``
+    from the SDK world, which the PC service delivers RIGHT-handed (X right,
+    Y up, Z in; its README also notes the real data flips Unity's +Z).
+    The left controller sits at -X, so that cross product is -Z = operator
+    FORWARD.  The wire's +y (operator left) and +z (up) are right in the
+    operator's own frame: wire = (forward, left, up).
+
+    The operator and the robot face the SAME direction (2026-10-30 live
+    correction -- NOT face-to-face) and the X2 base is also (forward, left,
+    up), so the avatar map is the IDENTITY:
+
+        wire x INCREASE (operator forward) -> robot +x  => operator_x_sign=+1
+        wire y INCREASE (operator left)    -> robot +y  => operator_y_sign=+1
+
+    (the 2026-10-27 x=-1 round read the Unity figure instead of the
+    delivered data and made the real robot reach BACKWARD).  Pin:
+
+    (A) a wire x INCREASE (operator forward) must reach the robot as +x with
+        +1, and as -x with -1 (the live "hand forward, robot backward" bug);
+        the x flip must leave y/z alone, and the y flip must leave x/z alone;
+    (B) a fronto-parallel circle: under the same-facing avatar map the
+        robot's (y, z) traversal must have the SAME sense as the wire's own
+        (y_sign=+1); -1 mirrors it, which is only right for a face-to-face
+        rig (the 2026-10-30 y=-1 round made the real robot's lateral motion
+        and circle direction come out mirrored);
+    (C) the flips happen AFTER the lever correction: a pure wrist rotation
+        with a calibrated lever still leaves the target invariant, because
+        ``C`` and ``R_c @ r_c`` stay in the same frame.
+    """
+    pose0 = np.zeros(7, np.float64)
+    pose0[3] = 1.0  # unit quat (wxyz): engage() refuses zero placeholders
+
+    def make_arm(x_sign: float = 1.0, y_sign: float = 1.0, lever=None) -> ClutchArmV3:
+        return ClutchArmV3(
+            "left",
+            position_scale=1.0,
+            torso_keepout=None,
+            target_slew_m_s=0.0,
+            position_deadband_m=0.0,
+            posture_gain=0.0,
+            ctrl_lever=lever,
+            operator_x_sign=x_sign,
+            operator_y_sign=y_sign,
+        )
+
+    p0, _ = make_arm().solver.fk(ARM_NEUTRAL["left"])
+    pose0[:3] = p0
+    # operator forward = wire x INCREASE; +y = operator left; +z = up
+    d_wire = np.array([0.06, 0.05, 0.04])
+
+    def target_delta(arm, d: np.ndarray) -> np.ndarray:
+        assert arm.engage(pose0), "engage refused a valid synthetic pose"
+        a_op, _, a_rob, _ = arm.anchor
+        moved = pose0.copy()
+        moved[:3] = pose0[:3] + d
+        return arm._compensated_target(moved, a_op, a_rob) - a_rob
+
+    for x_sign, want_x in ((1.0, +1.0), (-1.0, -1.0)):
+        delta = target_delta(make_arm(x_sign=x_sign), d_wire)
+        assert delta[0] * want_x > 0.5 * abs(d_wire[0]), (
+            f"operator_x_sign={x_sign:+.0f}: wire forward (dx={d_wire[0]:+.3f}) "
+            f"reached the robot as x={delta[0]:+.3f}; expected {want_x:+.0f}"
+        )
+        assert (
+            abs(delta[1] - d_wire[1]) < 1e-12 and abs(delta[2] - d_wire[2]) < 1e-12
+        ), f"operator_x_sign={x_sign:+.0f} leaked into lateral/vertical: {delta}"
+    for y_sign, want_y in ((1.0, +1.0), (-1.0, -1.0)):
+        delta = target_delta(make_arm(y_sign=y_sign), d_wire)
+        assert delta[1] * want_y > 0.5 * abs(d_wire[1]), (
+            f"operator_y_sign={y_sign:+.0f}: wire lateral (dy={d_wire[1]:+.3f}) "
+            f"reached the robot as y={delta[1]:+.3f}; expected {want_y:+.0f}"
+        )
+        assert (
+            abs(delta[0] - d_wire[0]) < 1e-12 and abs(delta[2] - d_wire[2]) < 1e-12
+        ), f"operator_y_sign={y_sign:+.0f} leaked into forward/vertical: {delta}"
+
+    # (B) circle direction is the SIGNED AREA in the (y, z) plane.  The
+    # operator faces the SAME direction as the robot, so the robot must
+    # reproduce the wire's own traversal (y_sign=+1); -1 mirrors it, which
+    # is only correct for a face-to-face rig.
+    phis = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+    circle = np.stack([np.zeros_like(phis), 0.06 * np.cos(phis), 0.06 * np.sin(phis)], axis=1)
+    area_wire = 0.5 * float(
+        np.sum(circle[:-1, 1] * circle[1:, 2] - circle[:-1, 2] * circle[1:, 1])
+    )
+    areas = {}
+    for y_sign in (1.0, -1.0):
+        arm = make_arm(y_sign=y_sign)
+        assert arm.engage(pose0)
+        a_op, _, a_rob, _ = arm.anchor
+        d = np.array(
+            [
+                arm._compensated_target(np.concatenate([pose0[:3] + w, pose0[3:]]), a_op, a_rob)
+                - a_rob
+                for w in circle
+            ]
+        )
+        areas[y_sign] = 0.5 * float(np.sum(d[:-1, 1] * d[1:, 2] - d[:-1, 2] * d[1:, 1]))
+    assert areas[1.0] * area_wire > 0.0, (
+        f"same-facing avatar map must keep the wire's circle sense: wire "
+        f"area {area_wire:+.2e}, y_sign=+1 -> {areas[1.0]:+.2e}"
+    )
+    assert areas[-1.0] * area_wire < 0.0, (
+        f"y_sign=-1 must mirror the circle (face-to-face rig): wire area "
+        f"{area_wire:+.2e}, y_sign=-1 -> {areas[-1.0]:+.2e}"
+    )
+
+    # (C) ordering: the wire position and quaternion share the OLD frame, so
+    # the mirror must be applied to their combined output, after the lever.
+    r_true = np.array([0.0, 0.02, 0.09])
+    R0 = sRot.from_euler("ZYX", [0.4, -0.3, 0.2])
+    for x_sign, y_sign in ((1.0, 1.0), (-1.0, -1.0)):
+        arm = make_arm(x_sign, y_sign, lever=r_true)
+        pp, _ = arm.solver.fk(arm.q)
+        c0 = np.concatenate([pp + R0.apply(r_true), _rot_to_quat_wxyz(R0)])
+        assert arm.engage(c0)
+        a_op, _, a_rob, _ = arm.anchor
+        for dR in (
+            sRot.from_euler("x", 0.25),
+            sRot.from_euler("y", -0.2),
+            sRot.from_euler("z", 0.3),
+        ):
+            R = dR * R0
+            c = np.concatenate([pp + R.apply(r_true), _rot_to_quat_wxyz(R)])
+            tgt = arm._compensated_target(c, a_op, a_rob)
+            assert np.linalg.norm(tgt - a_rob) < 1e-9, (
+                f"operator signs ({x_sign:+.0f},{y_sign:+.0f}): mirroring before "
+                f"the lever correction moved the target "
+                f"{np.linalg.norm(tgt - a_rob) * 1e3:.3f} mm"
+            )
 
 
 def check_position_deadband() -> None:
@@ -1703,7 +1957,7 @@ def check_wrist_default_signs_side_parallel() -> None:
         wc = WristClutch(side)
         assert wc.engage(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]))
         for name, axis in axes.items():
-            dq = sRot.from_rotvec(theta * np.asarray(axis)).as_quat(scalar_first=True)
+            dq = _rot_to_quat_wxyz(sRot.from_rotvec(theta * np.asarray(axis)))
             cmd = wc.step(dq)
             col, sign = specs[name]
             assert cmd[col] * sign > 0.5 * theta, (
@@ -1801,6 +2055,56 @@ def check_arm_home_long_press() -> None:
     assert np.allclose(st["q"]["right"], right0, rtol=0.0, atol=0.0)
 
 
+def check_reach_clamp_anchor_direction() -> None:
+    """A long forward command saturates the reach sphere WITHOUT sliding the
+    wrist sideways or up.
+
+    Regression for the 2026-10-30 live report ("屈肘前伸左手时, 机器人手往
+    右侧偏移"): the legacy shoulder-centred radial clamp traded the anchor's
+    13.5 cm lateral offset for forward reach, so a straight forward command
+    slid the wrist toward y_shoulder (robot's own right) and upward. The
+    clamp must keep the anchor->target direction: pure +x stays pure +x.
+    """
+    for side in ("left", "right"):
+        # v4 real-node signs (+1, +1): wire +x is operator FORWARD, so
+        # pose[0] += dx below is an operator forward extension in the
+        # robot's +x.
+        arm = _engaged_arm(
+            side,
+            target_slew_m_s=0.0,
+            position_deadband_m=0.0,
+            operator_x_sign=1.0,
+            operator_y_sign=1.0,
+        )
+        _a_op, _a_op_inv, a_rob, _a_rob_R = arm.anchor
+        pose = np.zeros(7)
+        pose[3] = 1.0
+        pose[:3] = arm.solver.fk(arm.q)[0]
+        q = arm.q.copy()
+        for _ in range(60):  # 60 x 1 cm of operator forward travel
+            pose[0] += 0.01
+            q, _ik = arm.step(True, pose)
+        tgt = arm._tgt_slewed
+        r = float(np.linalg.norm(tgt - arm.shoulder))
+        assert r <= arm.max_reach + 1e-9, (
+            f"{side}: saturated target escaped the reach sphere ({r:.4f} > {arm.max_reach:.4f})"
+        )
+        fwd = float(tgt[0] - a_rob[0])
+        assert fwd > 0.10, f"{side}: saturated target barely advanced ({fwd:.3f} m)"
+        dy = float(tgt[1] - a_rob[1])
+        dz = float(tgt[2] - a_rob[2])
+        assert abs(dy) < 2e-3, (
+            f"{side}: forward command slid the target laterally by {dy * 100:+.1f} cm"
+        )
+        assert abs(dz) < 2e-3, (
+            f"{side}: forward command slid the target vertically by {dz * 100:+.1f} cm"
+        )
+        fk = arm.solver.fk(q)[0]
+        assert abs(float(fk[1] - a_rob[1])) < 5e-3, (
+            f"{side}: FK wrist drifted {float(fk[1] - a_rob[1]) * 100:+.1f} cm in y"
+        )
+
+
 CHECKS = [
     ("wrist_zero_delta_noop", check_wrist_zero_delta_noop),
     ("wrist_single_axis_direction", check_wrist_single_axis_direction),
@@ -1825,6 +2129,8 @@ CHECKS = [
     ("3pt_controller_frame", check_3pt_controller_frame),
     ("wrist_default_signs_side_parallel", check_wrist_default_signs_side_parallel),
     ("arm_home_long_press", check_arm_home_long_press),
+    ("operator_signs", check_operator_signs),
+    ("reach_clamp_anchor_direction", check_reach_clamp_anchor_direction),
 ]
 
 

@@ -105,11 +105,20 @@ def test_arm_home_long_press():
     a3.CHAIN_V3_CHECKS[20][1]()
 
 
+def test_operator_signs():
+    """3-point wire is operator (forward, left, up); same-facing avatar map
+    is the identity (+1, +1) after the lever correction, -1 mirrors (see
+    check_operator_signs for the full contract)."""
+    dict(a3.CHAIN_V3_CHECKS)["operator_signs"]()
+
+
 def test_fixed_operator_frame_position_only():
     """The operator frame reads positions only: arbitrary (even zero)
     quaternions on the same pair of positions must give the same M/origin."""
-    left = np.array([0.30, 0.05, 1.20, 12.0, -4.0, 9.0, 0.0])
-    right = np.array([-0.30, -0.02, 1.15, 0.0, 0.0, 0.0, 0.0])
+    # Real XRoboToolkit/Unity coordinates: +X is RIGHT, so the LEFT
+    # controller sits at -X. See test_fixed_operator_frame_lateral_sign.
+    left = np.array([-0.30, 0.05, 1.20, 12.0, -4.0, 9.0, 0.0])
+    right = np.array([0.30, -0.02, 1.15, 0.0, 0.0, 0.0, 0.0])
     M1, o1 = fixed_operator_frame_from_controllers(left, right)
     left2, right2 = left.copy(), right.copy()
     left2[3:] = [0.0, 0.0, 0.0, 1.0]
@@ -120,20 +129,35 @@ def test_fixed_operator_frame_position_only():
 
 
 def test_fixed_operator_frame_lateral_sign():
-    """p_left - p_right along raw +X -> the frame's lateral row is +X, i.e.
-    the left-axis component of the same delta is POSITIVE (left is +y)."""
-    left = np.array([0.30, 0.0, 1.20])
-    right = np.array([-0.30, 0.0, 1.20])
+    """SDK left controller at raw -X -> lateral row is operator-left (+y)
+    and ``fwd = cross(lat, up)`` lands on -Z, i.e. operator-FORWARD.
+
+    The XRoboToolkit PC service delivers a RIGHT-handed world (X right,
+    Y up, Z in; its README notes the real data flips Unity's +Z), so -Z is
+    in FRONT of the operator -- the 2026-10-27 round read the left-handed
+    Unity figure and called the same -Z "backward", which is how the wire
+    x ended up flipped.  This is the frame the v4 3-point sender freezes;
+    the wire axes are the operator's own (forward, left, up), and the
+    operator and the robot face the SAME direction (2026-10-30 live
+    correction), so the real node runs the identity map
+    (``operator_x_sign=+1``, ``operator_y_sign=+1``; only the frame signs
+    are pinned here, the chain check owns the mapping contract).
+    """
+    left = np.array([-0.30, 0.0, 1.20])
+    right = np.array([0.30, 0.0, 1.20])
     M, origin = fixed_operator_frame_from_controllers(left, right)
     d = left - right
-    assert (M @ d)[1] > 0.5
+    assert (M @ d)[1] > 0.5  # +y = operator left
+    assert np.allclose(M[0], [0.0, 0.0, -1.0]), M[0]  # -Z = operator forward
     assert np.allclose(origin, 0.5 * (left + right))
 
 
 def test_controller_wire_wrist_delta_frame_free():
     """A constant frame left-multiply cancels in the wrist delta
     R_anchor^-1 R_now, so the existing --ctrl-lever stays valid."""
-    M, o = fixed_operator_frame_from_controllers([0.30, 0.0, 1.20], [-0.30, 0.0, 1.20])
+    M, o = fixed_operator_frame_from_controllers(
+        [-0.30, 0.0, 1.20], [0.30, 0.0, 1.20]
+    )
     rng = np.random.default_rng(0)
     R0, R1 = sRot.random(random_state=rng), sRot.random(random_state=rng)
     p0 = np.array([0.10, 0.20, 1.00])
@@ -147,7 +171,9 @@ def test_controller_wire_wrist_delta_frame_free():
 
 def test_controller_wire_position_delta_origin_free():
     """The frame origin cancels in position deltas."""
-    M, o = fixed_operator_frame_from_controllers([0.30, 0.0, 1.20], [-0.30, 0.0, 1.20])
+    M, o = fixed_operator_frame_from_controllers(
+        [-0.30, 0.0, 1.20], [0.30, 0.0, 1.20]
+    )
     p0 = np.array([0.10, 0.20, 1.00, 0.0, 0.0, 0.0, 1.0])
     p1 = np.array([0.25, 0.10, 0.90, 0.0, 0.0, 0.0, 1.0])
     w0 = controller_pose_to_operator_frame(p0, M, o)
@@ -187,3 +213,10 @@ def test_model_and_head_hold():
 
 def test_self_test_bundle():
     assert a3.run_self_test()
+
+
+def test_reach_clamp_anchor_direction():
+    """Forward extension saturates the reach sphere without sliding the
+    wrist sideways/up (2026-10-30 live: left hand forward from a bent
+    elbow, the robot's hand drifted toward its own right)."""
+    dict(a3.CHAIN_V3_CHECKS)["reach_clamp_anchor_direction"]()

@@ -212,7 +212,10 @@ def test_position_only_branch() -> None:
     """
     from gear_sonic.utils.teleop.solver.arm.x2_arm_ik import ArmIKSolver
 
-    solver = MinkArmIK("right")
+    # Legacy-equivalent weighting: the shipped default raises position_cost
+    # to 1.5 (2026-10-30 operator tuning), and DLS has no such knob, so the
+    # port-equivalence claim is pinned at equal weights on purpose.
+    solver = MinkArmIK("right", position_cost=1.0, orientation_axis_weights=(1.0, 1.0, 1.0))
     legacy = ArmIKSolver("right")
     q_seed = np.zeros(7)
     q_seed[3] = -0.8
@@ -236,6 +239,30 @@ def test_position_only_branch() -> None:
     # (0.6 mrad here -- a joint with no position authority).
     assert np.abs(q - q_legacy).max() < 1e-3
     assert np.abs((q - q_legacy)[[0, 1, 2, 3, 4, 6]]).max() < 1e-5
+
+
+def test_shipped_weight_priority() -> None:
+    """2026-10-30 tuning: position cost 1.5, wrist pitch yields (0.7).
+
+    mink caps ``gain`` at 1.0, so the raised position priority can only ride
+    on ``position_cost``; the orientation task's per-axis vector is expressed
+    in the wrist frame (x=roll, y=pitch, z=yaw), matching the chain's ZYX
+    wrist mapping.
+    """
+    solver = MinkArmIK("left")
+    assert solver.position_cost == 1.5
+    assert np.allclose(solver.orientation_axis_weights, (1.0, 0.7, 1.0))
+    assert np.allclose(solver._position_task.cost[:3], 1.5)
+    assert np.allclose(solver._position_task.cost[3:], 0.0)
+    assert np.allclose(solver._orientation_task.cost[:3], 0.0)
+    assert np.allclose(solver._orientation_task.cost[3:], (1.0, 0.7, 1.0))
+    # a scalar means "all axes equal"
+    equal = MinkArmIK("left", position_cost=1.0, orientation_axis_weights=1.0)
+    assert np.allclose(equal.orientation_axis_weights, 1.0)
+    with pytest.raises(ValueError):
+        MinkArmIK("left", position_cost=0.0)
+    with pytest.raises(ValueError):
+        MinkArmIK("left", orientation_axis_weights=(1.0, -0.1, 1.0))
 
 
 def test_max_iters_composition() -> None:

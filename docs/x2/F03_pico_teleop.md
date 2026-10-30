@@ -128,19 +128,21 @@ same, R = reset. Stop: Ctrl-C.
 
 | 取值 | 求解器 | 说明 |
 |---|---|---|
-| `mink`（默认） | `MinkArmIK` | mink 1.3 的一个 QP；v3 默认走 4-DoF：`solve_position_free4` 只解肩 3 + 肘，腕由 `WristClutch` 直填；`full_pose_ik=True` 时改为位置 + 姿态两个 `RelativeFrameTask`（权重都 1.0），完整 7-DoF |
-| `dls` | `ArmIKSolver` | 手写纯 numpy 阻尼最小二乘（v1/v2 的原始实现，留作回退）；同样支持 4-DoF `solve_position_free4` 与 7-DoF `solve` |
+| `mink`（默认） | `MinkArmIK` | mink 1.3 的一个 QP；v3 默认走 4-DoF：`solve_position_free4` 只解肩 3 + 肘，腕由 `WristClutch` 直填；`full_pose_ik=True` 时改为位置 + 姿态两个 `RelativeFrameTask`，完整 7-DoF。权重：位置 `position_cost=1.5`，姿态按腕系 `(roll, pitch, yaw)` 轴取 `(1.0, 0.7, 1.0)`（pitch 稍降） |
+| `dls` | `ArmIKSolver` | 手写纯 numpy 阻尼最小二乘（v1/v2 的原始实现，留作回退）；同样支持 4-DoF `solve_position_free4` 与 7-DoF `solve`（无权重概念） |
 
 选择顺序：构造参数 → 环境变量 `X2_IK_BACKEND` → 默认 `mink`。**缺 mink 时构造期
 直接报错**（提示装 mink 或 `X2_IK_BACKEND=dls`），不做静默回退。两个 harness 启动
 横幅都会打印解析到的求解器与自由度（v3 默认形如 `arm IK mink` + `4-DoF`；
 v3 harness 加 `--full-pose-ik` 时为 `7-DoF`），`arm.backend` /
-`arm.full_pose_ik` 是权威字段。
+`arm.full_pose_ik` 是权威字段。**PC2 真机节点 2026-10-30 起也默认 `mink`**
+（离线安装，见 `x2_pc2/v3_upper_teleop/README.md` §3.3；`--backend dls` 回退）。
 
 这条链的角色（2026-10 互换）：**握把键 grip 是每臂 clutch**（经 LPF 后过阈值；
 `TRIGGER_THRESH` / `--trigger-thresh` 是历史名），**扳机 trigger 驱动 OmniHand
-手指**（v2 `ratio = 1 - hand`，v3 `ratio = hand`）。真机 PC2 的平铺副本**尚未同步**，
-仍是旧的 trigger clutch / grip 手指；读数前先确认跑的是哪一侧。
+手指**（v2 `ratio = 1 - hand`，v3 `ratio = hand`）。PC2 上的
+`incremental_chain.py` 属于 v2，仍是旧语义；**v3 节点走独立的
+`incremental_chain_v3base.py`**，两者互不影响。
 
 ```bash
 X2_IK_BACKEND=dls .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py --wire   # 回退到 DLS
@@ -169,11 +171,15 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 控制器原点随姿态画弧」，断言补偿后目标 < 1e-6 m 且 q[:4] 漂移 < 0.01 rad；同时
 断言单侧向量按臂路由）、`position_deadband`、`posture_gain_null_space`（mink/DLS 都跑）。
 
-> **真机（PC2）仍跑 DLS**：mink / mujoco 没有、也不该被推到 Jetson
-> （`gear_sonic[teleop]` 里没有 mink，`gear_sonic[sim]` 里才有）。所以
-> **sim 里的手臂行为与真机不同是预期内的**，直到另一次单独的迁移把这条链搬上去。
+> **真机（PC2）后端（2026-10-30 更新）**：PC2 原先没有 mink，只能 DLS；现已
+> 离线安装 mink 1.3.0 / mujoco 3.13.0 / qpsolvers 4.13.0 / daqp 0.10.3 到
+> user site（`x2_pc2/v3_upper_teleop/README.md` §3.3），**v3 节点默认
+> `--backend mink`，与 sim 同权重**。`gear_sonic[teleop]` 里仍不放 mink
+> （那是 Jetson 侧能看到的 extra），PC2 的包不通过 pip 依赖解析，而是随
+> bundle 部署 `x2_arm_mink.py` + `x2_arm_kinematic.py`。`--backend dls` 仍可
+> 逐次回退，不需要卸载任何东西。
 
-### v4：无 body tracker 的 3-point 上肢遥操（`--tracking 3point`，仅 sim，2026-10）
+### v4：无 body tracker 的 3-point 上肢遥操（`--tracking 3point`，sim + 真机，2026-10）
 
 **不用任何 Pico body tracker**：只戴头显、双手柄。v3 链的 frame 契约只消费
 `t / lctrl_pose / rctrl_pose / trigger / grip`（`smpl_joints` 完全被忽略），所以 v4
@@ -185,6 +191,21 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
   与 `fwd = cross(lat, up)`，origin = 双手柄中点；标定后**冻结**，绝不逐 tick 更新。
   头显不参与帧朝向、不参与任何门控（只做状态打印）。wire 数学与 live full 模式
   （`_torso_M` / `_ctrl_wire_fields`）同构，`--ctrl-lever-*` 继续有效。
+- **wire 的 +x 是操作员前方（2026-10-30 真机更正）**：XRoboToolkit PC service
+  交付的是**右手系**（X 右、Y 上、Z 朝里；其 README 还注明实际数据把 Unity
+  图里的 +Z 反了过来），左手柄在 **-X**，所以
+  `cross(lat, up) = cross(-X, +Y) = -Z = 前方`。2026-10-27 那轮按 Unity
+  左手系图误判成"后方"，用 `--operator-x-sign -1` 把 lever 补偿后的 x 取反，
+  真机上反而前伸变后退（后退目标还会撞躯干 keep-out，被椭圆投影成"往侧偏"）。
+  **现在真机默认 `+1`（恒等）**；腕旋转不受影响：常量帧在 `R_anchor⁻¹ R_now`
+  里抵消。详见 `PICO_LIVE_TELEOP_PITFALLS.md` §11 第 15 条。
+- **wire 的 +y 是操作员左，不翻（2026-10-30 真机更正）**：操作员与机器人
+  **同向**站位（不是面对面），机器人 +y（自己的左）就是操作员的左，所以
+  `--operator-y-sign` 保持 **+1**（真机节点默认）。x/y 合起来是 avatar 映射
+  `diag(+1,+1,+1)`（恒等）：操作员往左前方伸手 → 机器人手往它自己的左前方走，
+  正面画圆方向一致。2026-10-30 中间那轮按"机器人面向操作员"推的 `-1` 在真机上
+  把左右/画圆方向做成了镜像，已回退。sim harness 默认也是 `+1/+1`；
+  `run_pico_teleop_v4_sim.sh` 已内置。
 - **标定姿势**：双手各握手柄，自然举在胸前、**左右分开 ≥ 20 cm、保持约 1 秒**。
   sender 打印 `[3pt] operator frame calibrated ...` 后进入 `stream live.`。失败时每
   3 s 打印 `hold both controllers apart at chest height (>= 15 cm)` 并自动重试。
@@ -199,17 +220,31 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
   `(+1,+1,+1)` 实测。X2 两侧腕工具系平行而非镜像（零位 roll 轴均为世界 +x）。
   `CHAIN_V3_CHECKS[19]` 钉住“左右相同”；单轴不对时用
   `--wrist-{yaw,pitch,roll}-sign-l/-r` 只改那一轴。
+  **2026-10-27 真机结论**：串轴（轴序）修正后两侧 pitch 仍反，真机节点已把
+  每侧默认符号改为 `(yaw, pitch, roll) = (+1, -1, +1)`；共享链/sim 默认不动。
 - **X/A 长按回位**：左手柄 X 或右手柄 A 按住 ≥3 s，对应手臂按
   `home_speed_rad_s`（默认 0.5 rad/s，每关节）回到 `ARM_NEUTRAL` 初始姿态；
   回位期间该臂离合释放，完成后仍握 grip 会在新姿态重新 anchor，不跳变。
   3point 专属（full 模式里长按 X 是整段录制开始）。
 
-仿真命令（终端 A 先起 harness，终端 B 起 sender；wrapper 会拉起 PC Service）：
+仿真命令（2026-10-30 起优先用 launcher；它后台起 harness、前台起 sender，
+帧符号和腕映射已对齐真机）：
 
 ```bash
-# A
+./gear_sonic/scripts/run_pico_teleop_v4_sim.sh
+# 无窗口 / 限时 / 录制：
+./gear_sonic/scripts/run_pico_teleop_v4_sim.sh --no-viewer --duration 30 --record /tmp/v4_3pt.npz
+```
+
+手工两终端等价命令（终端 A harness，终端 B sender；wrapper 会拉起 PC Service）：
+
+```bash
+# A —— 注意：--operator-x-sign +1 --operator-y-sign +1 与腕 0,2,1 + pitch -1 缺一不可
 .venv/bin/python gear_sonic/scripts/arm_teleop_v3_mujoco.py \
   --wire --intent-port 15573 \
+  --operator-x-sign +1 --operator-y-sign +1 \
+  --wrist-axis-order-l 0,2,1 --wrist-axis-order-r 0,2,1 \
+  --wrist-pitch-sign-l -1 --wrist-pitch-sign-r -1 \
   --ctrl-lever-left  0.0410 0.0090 -0.0912 \
   --ctrl-lever-right -0.0393 0.0115 -0.0791 \
   --record /tmp/v4_3pt.npz
@@ -221,11 +256,75 @@ Pico 的 controller pose 是**控制器原点**，不是人的腕心。手腕原
 
 验收要点（完整清单见 `PICO_LIVE_TELEOP_PITFALLS.md` §11）：
 
-1. 平移符号：双手同时朝操作员前方平移，record 列 7:14 的 x 应增大；
+1. 平移符号：双手同时朝操作员前方平移，**机器人腕 FK x 应增大**。注意 3point
+   wire 的 +x 本身是操作员后方（见上），所以 record 列 7:14 的 x 会**减小**；
+   不要再用列 7:14 判前伸。看列 35:49 的 q 做 FK，或直接看 viewer；
 2. **头部隔离**：手柄不动、只转头 5 s，列 7:35 应平坦（< 2 mm / < 0.5°），
    手臂指令不随头动；
 3. 单侧丢跟踪：失效侧列 4/5 → 0、65/66 → 0，该侧手臂冻结、无跳变；
 4. 扣 trigger：列 2/3 上升，viewer 里 OmniHand 闭合（v3 极性）。
+
+#### 真机（2026-10-27 起）
+
+v4 真机**不是**下面 `Robot` 那节的 SMPL 全身链路，而是 **laptop sender →
+PC2 v3 节点直连 HAL**：与 v3 真机同一条 wire，PC2 不需要新节点，只是数据源
+换成 3point。PC2 侧的节点、lever、CLAW 手桥命令见
+[`x2_pc2/v3_upper_teleop/README.md`](../../x2_pc2/v3_upper_teleop/README.md)
+§4.1 / §4.2.1；**bundle 必须用当前仓库重建**（新 neutral / keepout / home 都在
+vendored 链里；2026-10-30 起 bundle 还带 `x2_arm_mink.py` +
+`x2_arm_kinematic.py`，节点默认 `--backend mink`，权重与 sim 相同）。
+
+```bash
+# laptop：预设 = --tracking 3point --hand-source trigger --hand-close-on-grip
+./gear_sonic/scripts/run_pico_teleop_v4_real.sh --pc2-host <PC2_IP>
+
+# 只动臂、不动手
+./gear_sonic/scripts/run_pico_teleop_v4_real.sh --pc2-host <PC2_IP> --no-hands
+
+# 仿真孪生（同一套帧符号 / 腕映射 / lever，不需要 PC2 和机器人）
+./gear_sonic/scripts/run_pico_teleop_v4_sim.sh
+```
+
+- **起 PC2 节点就会发 neutral**：无 wire / stale 时链路输出就是
+  `ARM_NEUTRAL`（现在是屈肘朝前），节点从第一拍按 50 Hz 发 arm command；
+  先吊架/净空，不要假设手臂还停在 `Develop_MC` 的瘫软位置。
+- 3point 仍强制 `--no-locomotion`（关的是 planner/控制器层），但 sender 在
+  3point 下**保留** `hand_finger_cmd`（`:5572`），所以扳机→CLAW 在真机可用；
+  **grip 始终是手臂离合**。`--hand-source off` 或 `--no-hands` 才是真的手臂-only。
+- 启动横幅应出现 `hand_finger_cmd PUB -> tcp://<PC2>:5572`；PC2 上
+  `ss -ltnp | grep 5572` 必须看到 CLAW 手桥在 BIND，否则臂动、手不动。
+- launcher 只接受 **sender 侧**参数（`--record-dir`、`--no-record`、
+  `--wrist-source`、`--cam`、`--headset-ip`…）。**PC2 节点侧**的 lever、
+  腕符号 / 轴序、`--operator-x-sign`、`--backend`、`--record`、`--duration`、
+  `--self-test` 必须写在 PC2 的 `ros2 run ... incremental_upper_teleop_v3`
+  命令上；launcher 会明确拒绝，避免误以为已经生效。
+- 3point 的 wire `engaged` 恒 0 是预期；手臂离合状态看 record 列 65/66。
+- **真机节点腕映射（仅节点默认，不改共享链）**：
+  - 轴序两侧 `0,2,1`（2026-10-27 真机确认：屈肘朝前 neutral 下 pitch/roll
+    串轴，控制器 `x→pitch、y→roll`）；要旧映射传 `--wrist-axis-order-l/-r 0,1,2`。
+  - 符号两侧 `(yaw, pitch, roll) = (+1, -1, +1)`（同日真机反馈：串轴修好后
+    两侧 pitch 方向都反；yaw / roll 保持 `+1`）。
+  - 共享链/MuJoCo harness 默认仍是 `0,1,2` + `(+1,+1,+1)`；
+    `run_pico_teleop_v4_sim.sh` 已内置 `--wrist-axis-order-l/-r 0,2,1
+    --wrist-pitch-sign-l -1 --wrist-pitch-sign-r -1`；手工起 harness 时要显式传。
+  - 单轴仍不对再用 `--wrist-{yaw,pitch,roll}-sign-l/-r` 或
+    `WRIST3_{YAW,PITCH,ROLL}_SIGN_{L,R}` 覆盖。
+- **位置前后（2026-10-30 真机，最终结论）**：真机节点默认 `--operator-x-sign +1`
+  （env `OPERATOR_X_SIGN`）。3point wire 的 +x 就是操作员**前方**（PC service
+  交付右手系 X 右/Y 上/Z 朝里，实际数据把 Unity 的 +Z 反了过来，左手柄在 −X
+  使 `cross(lat, up) = −Z = 前方`）；操作员前伸时 wire x 增大，链先做 lever
+  补偿，机器人腕 x 同向增大。启动横幅打印 `[frame] operator_x_sign=+1`。
+  2026-10-27 那轮按 Unity 左手系图误判成"后方"并默认 −1，真机前伸变后退，
+  后退目标撞躯干 keep-out 还会被投影成侧向偏移；2026-10-30 已改回 +1。
+  只有面对面站位才传 `−1`。
+- **位置左右 / 画圆方向（2026-10-30 真机，最终结论）**：真机节点默认
+  `--operator-y-sign +1`（env `OPERATOR_Y_SIGN`）。操作员与机器人**同向**
+  站位（不是面对面），wire 的 +y（操作员左）就是机器人 +y（自己的左），
+  横向不做翻转；x/y 合起来是 avatar 映射 `diag(+1,+1,+1)`（恒等）——
+  操作员左前方 → 机器人自己的左前方，正面画圆方向一致。中间那轮按
+  "机器人面向操作员"推的 `-1` 会把左右/画圆做成镜像，已回退。
+  `run_pico_teleop_v4_sim.sh` 已内置（x +1、y +1），手工起 harness 时同样用
+  `+1/+1`。full-body `_torso_M` wire 也是 `+1/+1`。
 
 > **已知限制**：没有躯干/腿跟踪。固定帧只标定一次，engage 期间转体会给前伸方向带来
 > 同样角度的偏航偏差——保持髋/脚不动；转身后松开 grip、恢复朝向、重启 sender 重新

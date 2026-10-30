@@ -15,13 +15,25 @@ command stream.
     .venv/bin/python tools/gen_v4_intent_tape.py /tmp/v4_tape.npz --profile arm
     .venv/bin/python tools/ab_arm_ik_backends.py --tape /tmp/v4_tape.npz --full-pose-ik
 
-Both sides run the SHIPPED path: ``IncrementalTeleopTickerV3`` with
-``full_pose_ik=False`` (the default: 4-DoF position solve over shoulder-3 +
-elbow, WristClutch directly fills the three wrist joints), differing only in
-``backend``.  The ticker is otherwise built from its defaults, so the numbers
-are the harness's numbers, not a hand-tuned scenario.  ``--full-pose-ik``
-runs the opt-in 7-DoF path instead (useful to reproduce the migration
-budget that was set on that path).
+Both sides run ``IncrementalTeleopTickerV3`` with ``full_pose_ik=False``
+(the default: 4-DoF position solve over shoulder-3 + elbow, WristClutch
+directly fills the three wrist joints), differing only in ``backend``.
+The ticker is otherwise built from its defaults, so the numbers are the
+harness's numbers, not a hand-tuned scenario.  ``--full-pose-ik`` runs the
+opt-in 7-DoF path instead (useful to reproduce the migration budget that
+was set on that path).
+
+WEIGHTING.  Since 2026-10-30 the shipped mink solver deliberately does NOT
+match the DLS weighting: ``MinkArmIK`` defaults to ``position_cost=1.5``
+(raised, because mink caps ``gain`` at 1.0) and orientation per-axis costs
+``(1.0, 0.7, 1.0)`` (wrist pitch yields).  The migration claim -- "swap the
+solver, not the behaviour" -- is therefore measured at EQUAL weighting, the
+default here: the mink run is built with ``position_cost=1.0,
+orientation_axis_weights=(1, 1, 1)`` (the chain forwards the kwargs and the
+dls branch drops them).  ``--mink-weights shipped`` runs the actual shipped
+tuning and reports the deltas WITHOUT applying the backend gates: that
+number is the operator-visible price of the position priority, not a
+migration regression.
 
 Tape choice matters for the 4-DoF path.  The synthetic ``--profile arm``
 tape drives both arms into the elbow-near-straight crawl with ~120 mm of
@@ -128,9 +140,16 @@ def _frames(tape: dict, dt: float):
         }
 
 
-def run_backend(tape: dict, backend: str, full_pose_ik: bool = False) -> dict:
+def run_backend(
+    tape: dict,
+    backend: str,
+    full_pose_ik: bool = False,
+    solver_kwargs: dict | None = None,
+) -> dict:
     """One full pass over the tape. Pure: no plant, no clock, no wire."""
-    ticker = IncrementalTeleopTickerV3(backend=backend, full_pose_ik=full_pose_ik)
+    ticker = IncrementalTeleopTickerV3(
+        backend=backend, full_pose_ik=full_pose_ik, **(solver_kwargs or {})
+    )
     n = len(tape["t"])
     out = {
         "backend": backend,
@@ -172,7 +191,7 @@ def run_backend(tape: dict, backend: str, full_pose_ik: bool = False) -> dict:
     return out
 
 
-def _report_agreement(a: dict, b: dict) -> bool:
+def _report_agreement(a: dict, b: dict, gate: bool = True) -> bool:
     print(f"\n== joint command stream: {a['resolved']} vs {b['resolved']} ==")
     ok = True
     for side in SIDES:
@@ -190,16 +209,18 @@ def _report_agreement(a: dict, b: dict) -> bool:
             bad = (
                 mx[i] > BUDGET["dq_max"] or rms[i] > BUDGET["dq_rms"] or fin[i] > BUDGET["dq_final"]
             )
-            ok &= not bad
+            if gate:
+                ok &= not bad
+            mark = ("FAIL" if bad else "ok") if gate else ("delta" if bad else "ok")
             print(
                 f"    {name:15s} max {mx[i]:9.5f}  RMS {rms[i]:9.5f}  final {fin[i]:9.5f}"
-                f"   {'FAIL' if bad else 'ok'}   (budget {BUDGET['dq_max']}/{BUDGET['dq_rms']}/"
+                f"   {mark}   (budget {BUDGET['dq_max']}/{BUDGET['dq_rms']}/"
                 f"{BUDGET['dq_final']})"
             )
     return ok
 
 
-def _report_flags(a: dict, b: dict) -> bool:
+def _report_flags(a: dict, b: dict, gate: bool = True) -> bool:
     print("\n== safety flags (must be identical every tick) ==")
     ok = True
     for run in (a, b):
@@ -210,7 +231,8 @@ def _report_flags(a: dict, b: dict) -> bool:
     for side in SIDES:
         for flag in ("holding", "engaged"):
             diff = np.flatnonzero(a[flag][side] != b[flag][side])
-            ok &= diff.size == 0
+            if gate:
+                ok &= diff.size == 0
             where = ""
             if diff.size:
                 k = int(diff[0])
@@ -233,10 +255,11 @@ def _runs(mask: np.ndarray) -> str:
     return "[" + ", ".join(out) + "]" if out else "none"
 
 
-def _report_tracking(a: dict, b: dict, budget_m: float) -> bool:
+def _report_tracking(a: dict, b: dict, budget_m: float, gate: bool = True) -> bool:
     print("\n== tracking ==")
     print(
-        f"  GATE: the COMMANDED hand pose may not differ by more than "
+        f"  {'GATE' if gate else 'DELTA (not gated)'}: the COMMANDED hand pose "
+        f"{'may not differ' if gate else 'differs'} by more than "
         f"{budget_m * 1e3:.0f} mm -- the operator must not be able to tell "
         f"which solver is running"
     )
@@ -248,10 +271,12 @@ def _report_tracking(a: dict, b: dict, budget_m: float) -> bool:
         diff = np.linalg.norm(a["ee"][side] - b["ee"][side], axis=1)[live]
         worst = int(np.flatnonzero(live)[int(np.argmax(diff))])
         bad = float(diff.max()) > budget_m
-        ok &= not bad
+        if gate:
+            ok &= not bad
+        mark = ("FAIL" if bad else "ok") if gate else ("delta" if bad else "ok")
         print(
             f"  {side:5s} hand difference max {diff.max() * 1e3:6.3f} mm (tick {worst}), "
-            f"mean {diff.mean() * 1e3:6.4f} mm   {'FAIL' if bad else 'ok'}"
+            f"mean {diff.mean() * 1e3:6.4f} mm   {mark}"
         )
     print("\n  solver-reported pos_err (reported, NOT gated -- see the module docstring):")
     for side in SIDES:
@@ -388,6 +413,16 @@ def main() -> int:
         action="store_true",
         help="A/B the opt-in 7-DoF pose IK instead of the shipped 4-DoF split",
     )
+    ap.add_argument(
+        "--mink-weights",
+        choices=("equal", "shipped"),
+        default="equal",
+        help="'equal' (default) builds the mink side at position_cost=1.0 / "
+        "orientation (1,1,1), the migration-equivalence pair, and applies the "
+        "backend gates; 'shipped' uses the 2026-10-30 tuning (1.5 / (1,0.7,1)) "
+        "and only REPORTS the delta -- it is an operator-visible trade, not a "
+        "migration regression",
+    )
     ap.add_argument("--json", default=None, help="write both command streams here (.npz)")
     args = ap.parse_args()
 
@@ -401,8 +436,13 @@ def main() -> int:
     raw = np.load(path)
     tape = {k: raw[k] for k in raw.files}
 
+    gate = args.mink_weights == "equal"
+    mink_kwargs = (
+        {"position_cost": 1.0, "orientation_axis_weights": (1.0, 1.0, 1.0)} if gate else {}
+    )
     runs = [
-        run_backend(tape, backend, full_pose_ik=args.full_pose_ik) for backend in ("dls", "mink")
+        run_backend(tape, "dls", full_pose_ik=args.full_pose_ik),
+        run_backend(tape, "mink", full_pose_ik=args.full_pose_ik, solver_kwargs=mink_kwargs),
     ]
     for run, backend in zip(runs, ("dls", "mink")):
         # a private solver per side, only for the joint-box reachability search
@@ -413,13 +453,16 @@ def main() -> int:
     path_name = "7-DoF pose" if args.full_pose_ik else "4-DoF position + wrist fill"
     print(
         f"tape {path}: {n} frames ({n * IncrementalTeleopTickerV3().dt:.1f} s) -> "
-        f"{a['resolved']} vs {b['resolved']}  [{path_name}]"
+        f"{a['resolved']} vs {b['resolved']}  [{path_name}; mink weights "
+        f"{args.mink_weights}]"
     )
 
     ok = True
-    ok &= _report_agreement(a, b)
-    ok &= _report_flags(a, b)
-    ok &= _report_tracking(a, b, EE_DIFF_FULL_POSE_M if args.full_pose_ik else BUDGET["ee_diff_m"])
+    ok &= _report_agreement(a, b, gate=gate)
+    ok &= _report_flags(a, b, gate=gate)
+    ok &= _report_tracking(
+        a, b, EE_DIFF_FULL_POSE_M if args.full_pose_ik else BUDGET["ee_diff_m"], gate=gate
+    )
     ok &= _report_ranges(runs)
     _report_round5_risk(a, b)
 
@@ -435,7 +478,13 @@ def main() -> int:
         )
         print(f"\nwrote {args.json}")
 
-    print(f"\nA/B: {'PASS' if ok else 'FAIL'}")
+    if gate:
+        print(f"\nA/B: {'PASS' if ok else 'FAIL'}")
+    else:
+        print(
+            "\nA/B (shipped mink weights): deltas reported, backend gates NOT applied"
+            + (" -- JOINT RANGE VIOLATION" if not ok else "")
+        )
     return 0 if ok else 1
 
 

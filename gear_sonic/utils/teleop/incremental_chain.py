@@ -76,14 +76,19 @@ except ImportError:  # pragma: no cover - flat vendored copy (PC2 czq_examples)
         IKResult,
     )
 
-# The mink backend pulls in mujoco + mink + a QP backend, which the robot's
-# JetPack image does not carry (PC2 still runs the DLS solver). Imported
-# defensively so this module -- the one file both trees share -- stays
-# importable there; selecting the backend is what fails, and loudly.
+# The mink backend pulls in mujoco + mink + a QP backend. Until 2026-10-30
+# the robot's JetPack image did not carry them; they are now installed on
+# PC2 and the node defaults to mink (2026-10-30 operator request), with the
+# same shipped task weights as the laptop. The import stays defensive so
+# this module -- the one file both trees share -- remains importable on an
+# image without them; selecting the backend is what fails, and loudly.
 try:  # pragma: no cover - depends on the environment
     from gear_sonic.utils.teleop.solver.arm.x2_arm_mink import MinkArmIK
 except ImportError:  # pragma: no cover
-    MinkArmIK = None
+    try:  # flat vendored copy (PC2 czq_examples/ -- mink installed 2026-10-30)
+        from x2_arm_mink import MinkArmIK  # type: ignore[no-redef]
+    except ImportError:
+        MinkArmIK = None
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +118,14 @@ _LEGACY_ONLY_SOLVER_KWARGS = {
     # exact-projector null-space gain. The legacy spellings stay dropped.
     "null_space_gain": "use posture_gain; the mink backend has no such kwarg",
 }
+
+# Task-cost knobs only the mink backend has. The A/B harness hands the same
+# ticker kwargs to both backends, so the dls branch drops them instead of
+# raising TypeError -- the DLS weights ride on the gains, and there is no
+# per-axis orientation priority there. Default None on the chain means "use
+# the solver's own shipped defaults" (MinkArmIK: position_cost 1.5,
+# orientation (1, 0.7, 1) since 2026-10-30).
+_MINK_ONLY_SOLVER_KWARGS = {"position_cost", "orientation_axis_weights"}
 
 
 def resolve_arm_backend(backend: str | None = None) -> str:
@@ -154,6 +167,7 @@ def make_arm_solver(side: str, backend: str | None = None, **kwargs):
             )
         kwargs = {k: v for k, v in kwargs.items() if k not in _LEGACY_ONLY_SOLVER_KWARGS}
         return MinkArmIK(side, **kwargs), resolved
+    kwargs = {k: v for k, v in kwargs.items() if k not in _MINK_ONLY_SOLVER_KWARGS}
     return ArmIKSolver(side, **kwargs), resolved
 
 
@@ -197,9 +211,15 @@ GRIP_TAU = 0.15
 # DEFAULT_{LEFT,RIGHT}_ARM_NEUTRAL_RAD (the sim harness asserts equality);
 # carried here so the robot node needs no repo-tree import. The wrist of
 # this pose is the engage seed and the IK warm start.
+#
+# 2026-10-27 operator request: elbows bent ~90 deg with the forearms
+# pointing FORWARD (the old pose had the arms hanging with a slight bend).
+# FK on x2_arm_fk at this pose: forearm direction [1.00, +-0.02, -0.06] in
+# the torso frame, wrist at x=0.221 m, y=+-0.278 m, z=+0.053 m relative to
+# torso_link -- forearms level, upper arms hanging at the sides.
 ARM_NEUTRAL = {
-    "left": np.array([0.2, 0.2, 0.0, -0.6, 0.0, 0.0, 0.0]),
-    "right": np.array([0.2, -0.2, 0.0, -0.6, 0.0, 0.0, 0.0]),
+    "left": np.array([0.0, 0.2, 0.0, -1.57, 0.0, 0.0, 0.0]),
+    "right": np.array([0.0, -0.2, 0.0, -1.57, 0.0, 0.0, 0.0]),
 }
 
 # ---------------------------------------------------------------------------
@@ -214,28 +234,30 @@ ARM_NEUTRAL = {
 # model every run and asserts equality (check_keepout_matches_model), so
 # the plant can never silently drift from the robot node's constant.
 # The alignment subtracts the wrist offset between the MJCF body and the
-# solver chain, so these move whenever the chain's geometry does: the right
-# entry was re-derived after x2_arm_fk's right wrist offsets were corrected
-# to the URDF (1.15 mm; left unchanged).
+# solver chain AT THE NEUTRAL POSE, so these move whenever the chain's
+# geometry OR the neutral pose does: the right entry was re-derived after
+# x2_arm_fk's right wrist offsets were corrected to the URDF (1.15 mm), and
+# BOTH entries were re-derived for the 2026-10-27 bent-elbow neutral
+# (cx/cy moved ~8-9 mm, z_lo/z_hi ~10-13 mm).
 # ---------------------------------------------------------------------------
 TORSO_KEEPOUT = {
     "left": (
-        0.003332438027695837,
-        0.0031369985678674946,
+        0.011819798758394255,
+        -0.001348868136789066,
         0.2542544365041611,
         0.18810346448531395,
         0.2553776834499313,
-        -0.5738766516591312,
-        0.42569439347186194,
+        -0.5841687380140363,
+        0.41540230711695675,
     ),
     "right": (
-        0.00425748769003286,
-        0.00288685198510193,
+        0.012512297579944319,
+        -0.001521006732450297,
         0.2542544365041611,
         0.18810346448531395,
         0.2553776834499313,
-        -0.5925363011747504,
-        0.4070347439562427,
+        -0.5992172197306809,
+        0.4003538254003122,
     ),
 }
 
@@ -372,6 +394,8 @@ class ClutchArm:
         rot_err_clip_rad: float = 0.08,
         backend: str | None = None,
         posture_gain: float = 0.0,
+        position_cost: float | None = None,
+        orientation_axis_weights: tuple | np.ndarray | None = None,
     ) -> None:
         self.side = side
         self.position_scale = float(position_scale)
@@ -446,9 +470,12 @@ class ClutchArm:
         # `uniform_step_clip` is dropped on the mink path (see
         # _LEGACY_ONLY_SOLVER_KWARGS); `self.backend` is what the harness
         # banner prints, so a run always says which solver produced it.
-        self.solver, self.backend = make_arm_solver(
-            side,
-            backend=backend,
+        # position_cost / orientation_axis_weights are mink-only and None
+        # means "the solver's shipped defaults" (1.5 and (1, 0.7, 1) since
+        # 2026-10-30); the dls branch drops them (see
+        # _MINK_ONLY_SOLVER_KWARGS), so a harness can hand the same kwargs
+        # to both backends and still A/B them at equal weighting.
+        solver_kwargs = dict(
             damping=0.08,
             rotation_weight=rotation_weight,
             uniform_step_clip=True,
@@ -456,6 +483,11 @@ class ClutchArm:
             posture_gain=posture_gain,
             q_preferred=ARM_NEUTRAL[side],
         )
+        if position_cost is not None:
+            solver_kwargs["position_cost"] = position_cost
+        if orientation_axis_weights is not None:
+            solver_kwargs["orientation_axis_weights"] = orientation_axis_weights
+        self.solver, self.backend = make_arm_solver(side, backend=backend, **solver_kwargs)
         self.q = ARM_NEUTRAL[side].copy()
         self.anchor = None  # (op_pos, op_rot_inv, rob_pos, rob_rot)
         self.last_ik = IKResult(0.0, 0.0, 0, 0)

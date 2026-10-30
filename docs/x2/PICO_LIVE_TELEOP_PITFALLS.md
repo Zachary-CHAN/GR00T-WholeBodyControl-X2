@@ -212,21 +212,27 @@ while time.monotonic() - t0 < 60:
   （`/home/nvidia/Documents/czq/logs/service.log`，只有 13 字节，内容就两个字 `release mode`）；
   sender 的 stdout 直接进 pty，读不了。
 - **「改了 IK 之后 sim 和真机不一样」→ 先看后端，再看行为**。增量上半身链的手臂求解器
-  由 `X2_IK_BACKEND`（或 `arm.backend`）决定：sim 默认 `mink`，真机（PC2）仍是 `dls`，
-  两侧本来就不同（[`F03_pico_teleop.md`](F03_pico_teleop.md) 的「手臂 IK 后端」）。
+  由 `X2_IK_BACKEND`（或 `arm.backend`）决定。**2026-10-30 起 sim 与 PC2 真机节点
+  都默认 `mink`**，权重也相同（position 1.5、腕姿态轴权重 1.0/0.7/1.0）；PC2 是
+  离线安装的（`x2_pc2/v3_upper_teleop/README.md` §3.3），`--backend dls` 仍可回退
+  （[`F03_pico_teleop.md`](F03_pico_teleop.md) 的「手臂 IK 后端」）。
   harness 横幅会打印求解器与自由度（默认形如 `arm IK mink` + `4-DoF`；加
-  `--full-pose-ik` 才是 `7-DoF`）；拿它对齐口径，别拿 sim 的数字推断真机行为。
+  `--full-pose-ik` 才是 `7-DoF`）；拿它对齐口径，别只看 record。
 - **「改了 trigger/grip 之后 sim 和真机反了」→ 先看运行侧**。2026-10 起 sim 的增量链
-  把 **grip 当 clutch、trigger 当手指**；PC2 平铺副本未同步，仍是旧的 trigger clutch /
-  grip 手指。读 record 列 2/3（原始 trigger）与 4/5（滤波 grip），或看节点横幅（仍写
-  `trigger>... clutches`）时，先确认是 sim 还是真机。
+  把 **grip 当 clutch、trigger 当手指**；PC2 上 v2 的 `incremental_chain.py` 仍是旧
+  语义，而 **v3 节点走独立的 `incremental_chain_v3base.py`（已同步）**。读 record
+  列 2/3（原始 trigger）与 4/5（滤波 grip），或看节点横幅（仍写
+  `trigger>... clutches`）时，先确认是 v2 还是 v3。
 - **live `--no-locomotion` 下 trigger 恒 0（2026-10-20 已修）**：sender 以前只在
   `dual_mode` 块里调用 `_poll_controllers`，非 dual 路径把 `lt=rt=0` 直接写进 wire；
   sim record 列 2/3 全 0，手永远不闭合。现在非 dual 的 **live** 源会在主循环里直接读
   `get_left_trigger()/get_right_trigger()`（`_read_trigger_pair`），tape 源仍用
-  `replay_ctrl`。注意这不等于真机手能动：`--no-locomotion` 下 sender 仍不创建
-  `hand_sock`，真机手指必须走 §4.2 的 `--hand-source trigger --hand-close-on-grip`
-  （不加 `--no-locomotion`）。
+  `replay_ctrl`。**v3 full 模式**下这不等于真机手能动：`--no-locomotion` 会关掉
+  控制器层，`hand_sock` 不创建；真机手指必须走
+  `x2_pc2/v3_upper_teleop/README.md` §4.2 的
+  `--hand-source trigger --hand-close-on-grip`（不加 `--no-locomotion`）。
+  **v4 3point 是例外（2026-10-27）**：3point 强制 `--no-locomotion`，但 sender
+  会在 3point 下保留 `hand_sock`，用 wire-gated trigger/grip 发 `:5572`，见 §11.11。
 
 ---
 
@@ -411,14 +417,26 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
 `WRIST3_*_SIGN*` / `--wrist-{yaw,pitch,roll}-sign-l/-r` 覆盖并记录原因，
 **不要恢复整套“左右镜像”**。
 
+**2026-10-27 真机结论（与上面的 sim A/B 分开看）**：串轴（轴序 `0,2,1`）
+修好后，真机上**两侧 pitch 方向都反**，于是真机节点把每侧默认符号定为
+`(yaw, pitch, roll) = (+1, -1, +1)`；共享链 `DEFAULT_WRIST_SIGNS` 与 sim
+harness 仍是 `(+1,+1,+1)`。也就是说：sim 看到的是链默认，真机看到的是
+节点默认，二者不一致是**有意的**——sim 要对齐真机必须显式传
+`--wrist-axis-order-l/-r 0,2,1 --wrist-pitch-sign-l -1 --wrist-pitch-sign-r -1`。
+
 ### 10.4 真机标定/排查
 
 1. 先分别做 tool yaw / pitch / roll 各 20–30°（不要同时转），**看手的
    朝向**。列 55:61 是控制器原始差分 `(yaw,pitch,roll)`，列 49:55 是腕
    cmd，可用于离线对照。
 2. **tool roll 却动了 pitch/yaw，或工具朝向整体偏到别的轴**：先查
-   `--wrist-axis-order-l/-r`（默认 `0,1,2`，交换 x/z 用 `2,1,0`，另两对
-   用 `0,2,1` / `1,0,2`），再查 `--wrist-{yaw,pitch,roll}-sign-l/-r`。
+   `--wrist-axis-order-l/-r`（真机节点 2026-10-27 起默认 `0,2,1`：controller
+   `x→pitch、y→roll`，因为屈肘朝前 neutral 下 pitch/roll 串轴；`0,1,2` 是旧
+   映射，交换 x/z 用 `2,1,0`，另一对用 `1,0,2`），再查
+   `--wrist-{yaw,pitch,roll}-sign-l/-r`。**真机节点符号默认两侧
+   `(+1,-1,+1)`**（2026-10-27：轴序修好后两侧 pitch 仍反），yaw/roll 为 `+1`。
+   共享链/MuJoCo harness 默认仍是 `0,1,2` + `(+1,+1,+1)`，sim 对齐真机要显式
+   传 `--wrist-axis-order-l/-r 0,2,1 --wrist-pitch-sign-l -1 --wrist-pitch-sign-r -1`。
    换握法/换人后要复查。
 3. **tool pitch/yaw 动了 2–3 个关节是正常的**：只要工具朝向跟手一致就
    不要“修”。若工具朝向斜向另一个轴，才回到第 2 步。
@@ -493,8 +511,160 @@ x→roll）。自检 `wrist_nonzero_anchor_tracks_tool_rotation`（v3 链 + 真�
    `(+1,-1,+1)` 后左手正常、右手 pitch 反；第三轮当前取 `(+1,+1,+1)` 实测。
    X2 两侧腕工具系平行（零位 roll 轴均为世界 +x），不镜像，不要恢复整套左右镜像；
    单轴不对时用 `--wrist-{yaw,pitch,roll}-sign-l/-r` 只改那一轴。详见 §10.3。
+   **2026-10-27 真机补充（两轮，别混）**：
+   - 第一轮：屈肘朝前 neutral 下是 **pitch/roll 串轴**（不是符号反），两侧一致；
+     真机节点默认轴序改为 `0,2,1`（controller `x→pitch、y→roll`）。
+   - 第二轮：轴序修好后**两侧 pitch 方向仍反**，真机节点符号默认改为
+     `(yaw, pitch, roll) = (+1, -1, +1)`，yaw/roll 保持 `+1`。
+   - 共享链/sim 默认仍 `0,1,2` + `(+1,+1,+1)`；
+     `run_pico_teleop_v4_sim.sh` 已内置下面这组对齐参数，手工起 harness 时
+     仍需显式传 `--wrist-axis-order-l/-r 0,2,1 --wrist-pitch-sign-l -1
+     --wrist-pitch-sign-r -1`。
+   - 位置前后另见第 14 条：3point sim 用 `--operator-x-sign +1`（恒等）。
 10. **X/A 长按 3 s 手臂回位（3point 专属）**：左手柄 X → 左臂、右手柄 A → 右臂，
    以 `home_speed_rad_s`（默认 0.5 rad/s ≈ 29°/s）的**每关节**速度回到
    `ARM_NEUTRAL`（与 harness/真机启动时的初始姿态一致）。回位期间该臂离合释放，
    完成后若仍握着 grip 会在回位姿态重新 anchor，不跳变；按住不放不会重复触发。
    full 模式没有此功能：长按 X 仍是整段录制开始，A 属于 A+B+X+Y / A+X 和弦。
+11. **真机手指（2026-10-27）**：3point 仍强制 `--no-locomotion`，但 sender 现在
+   在 3point 下**保留** `hand_sock`，并用 **wire-gated** 的 `trigger` / `grip`
+   （失效侧已是 0）发 `hand_finger_cmd` → PC2 `:5572`。所以真机角色是
+   **grip = 手臂离合、trigger = CLAW**；`--hand-source off` / `--no-hands` 才是
+   手臂-only。laptop 用 `run_pico_teleop_v4_real.sh`（自动带
+   `--tracking 3point --hand-source trigger --hand-close-on-grip`）；PC2 仍需
+   msgpack CLAW 手桥 BIND `:5572`，否则臂动、手不动。注意 3point 的 wire
+   `engaged` 恒 0，不要拿它判手；看启动横幅的 `hand_finger_cmd PUB ->`、
+   `[hand] grasp ...` 和 PC2 的 `ss -ltnp | grep 5572`。
+12. **`ros2 run` 读的是 install 副本，不是 `src`**（2026-10-27 实测）：PC2 的
+   install/czq_examples/lib/python3.10/site-packages/czq_examples 目录是
+   `colcon build` 拷过去的普通副本（非软链）。只 scp 到 `src` 不会生效，必须
+   `colcon build --packages-select czq_examples`（或同时拷 install 副本并删其
+   `__pycache__`）。核对 install 里八个 `.py` 的 sha256 与 `dist/SHA256SUMS`
+   一致，别只看 src。
+13. **PC2 是 scipy 1.8.0，没有 `scalar_first=` 关键字**：链里不要写
+   `sRot.from_quat(q, scalar_first=True)` / `as_quat(scalar_first=True)`（PC2 上
+   直接 `TypeError`；laptop 的 scipy 1.15 不会报，所以本地测试发现不了）。一律用
+   `_rot_from_quat_wxyz` / `_rot_to_quat_wxyz`，它们内部做同样的循环移位。
+   2026-10-27 的 `wrist_default_signs_side_parallel` 自检就是这样在 PC2 首次
+   暴露的。
+14. **人手向前、机器人手向后（2026-10-27 真机；★2026-10-30 结论反转：
+    真正的根因是"右手系"，2026-10-27 那轮的 -1 才是错的）**：
+   **不是 neutral 改动**（`_compensated_target` 只是把操作员位移直接加到机器人
+   锚点，neutral 只改机器人初始姿态）。根因在固定 operator frame 与 SDK 世界
+   坐标系：`fixed_operator_frame_from_controllers` 用
+   `fwd = cross(lat, up)`。**2026-10-27 把 SDK 世界当成 Unity 左手系
+   （X 右、Y 上、Z 进=前方），推出 wire +x = 操作员后方——这一步错了。**
+   XRoboToolkit PC service README 实际写的是：数据格式是
+   **right-handed coordinate system (X right, Y up, Z in)**，并明确注明
+   Unity 图（x 右/y 上/z 前）里的 z 轴在**实际数据里是反的**（"实际数据 z 轴
+   为上图的反方向"）。也就是说交付的是右手系：**Z 朝后**。操作员左手在
+   **-X**，于是 `lat=-X`、`cross(-X, +Y) = -Z` = **操作员前方**。wire 本来就是
+   `(前方, 左, 上)`，和机器人基座（neutral 屈肘朝前时腕在 +x）同向——同向站位
+   下**恒等映射**才是对的。横向 +y、竖向 +z 一直是对的；腕旋转不受影响
+   （常量帧在 `R_anchor⁻¹ R_now` 抵消）——这正是"转姿没问题、只有位置反"的
+   原因。2026-10-27 的 A/B 把操作员那一段**回拉**误标成了"前伸"（wire Δx =
+   **-0.119 m** 本身就是手在往回走），所以得出了错误的 -1。
+
+   **现在的修复（2026-10-30 已部署）**：`operator_x_sign` 默认回到 **+1**
+   （`--operator-x-sign`，env `OPERATOR_X_SIGN`），共享链 / MuJoCo harness /
+   `run_pico_teleop_v4_sim.sh` 全部 `+1/+1`；只有**面对面**站位才翻某一轴。
+   取反（如果哪天真需要）必须放在 **lever 补偿之后**（`S=diag(∓1,1,1)` 作用于
+   `C - R_c r_c`）：`C` 与 `R_c r_c` 同处旧帧，只翻 `C` 会在腕转动时引入最多
+   `2|r|`（约 20 cm）的伪平移。
+
+   **真机证据（2026-10-30 17:09 记录逐拍复放）**：
+   (a) 用记录里的线框四元数算 `R_c @ r_c`（controller→wrist 方向在 wire 系的
+   投影），均值 left `(+0.059, -0.071, -0.025)` / right `(+0.083, -0.011,
+   -0.014)` m——双手的"手腕→手柄"方向主要落在 **+wire x**，也就是手朝前，
+   证明 wire +x = 操作员前方（若 +x 是后方，等于人把手柄朝自己胸口握）；
+   (b) 同场 x=-1 时，前伸被翻译成**后退**目标，撞上躯干椭圆 keep-out
+   **618 拍**、最大投影 **0.1306 m**（全在右臂）——这正是用户报的"前伸时手
+   往侧偏"的来源；`_clamp_reach_from_anchor` 命中 0 次，不是 reach 球。
+   (c) 17:09 与最新两轮反馈（x=-1 时前后反、y=+1 时左右对）与上述完全一致。
+
+   **验收改法**：操作员前伸时 record 列 7:14 的 wire x **增大**，机器人腕 FK x
+   也应**增大**（列 35:49 的 q 做 FK 或直接看 viewer）。自检 `operator_signs`
+   已把 (A) 改成"wire x 增大 = 前伸、+1 保持方向"，并继续钉住 x/y/z 不串轴
+   （B/C）和"翻转在 lever 之后"的纯腕转不变性。
+
+15. **画圆方向反了 / 左右反（2026-10-30 真机）——最终结论：同向 avatar，
+    恒等映射 (+1,+1)**：单轴旋转正常，但操作员在胸前画圆时机器人画反方向。
+    当时按"机器人面向操作员"推出 `operator_y_sign=-1`；17:09 真机复测后用户
+    确认现场是**同向站位**——操作员与机器人朝同一方向，机器人 `+y`（自己的
+    左）就是操作员的左，横向**不该翻转**。`-1` 那一轮把左右和画圆方向做成了
+    镜像。
+
+    **修复（2026-10-30 两轮回退）**：`operator_y_sign` 回到 **+1**；x 也在
+    同日回退到 **+1**（第 14 条：wire +x 本来就是前方，-1 那一轮才是前后反
+    的根源）。两者合起来是恒等 avatar 映射 `diag(+1,+1,+1)`：操作员往左前方
+    伸手 → 机器人手往它自己的左前方走，正面画圆同向。真机节点默认即
+    `(+1,+1)`（`--operator-y-sign`，env `OPERATOR_Y_SIGN`）；共享链/MuJoCo
+    harness 与 3point sim launcher 全部 `+1/+1`。只有**面对面**站位才需要
+    翻某一个轴。腕旋转不受影响（常量帧在差分中抵消）。
+
+    **验收**：`check_operator_signs` 钉住 (A) x 符号→机器人 x；(B) y 符号→
+    机器人 y 且不串轴；(C) frontal 圆在 (y,z) 平面的**有向面积**符号
+    （同向站位下 y=+1 必须保持 wire 自身的绕向）；(D) 翻转在 lever 之后的
+    纯腕转不变性。
+
+16. **PC2 装 mink（2026-10-30，离线）**：真机节点现在默认 `--backend mink`，
+   与 sim 同权重（`position_cost=1.5`、腕姿态 `(roll,pitch,yaw)` 轴权重
+   `(1.0,0.7,1.0)`）。安装时踩到的点：
+   - **PC2 无外网**，且 `pip` 默认装到 `~/.local`（user site）。做法是在笔记本
+     `pip download --platform manylinux_2_28_aarch64 --python-version 310
+     --only-binary=:all:` 拉 `mink==1.3.0`、`mujoco==3.13.0`、
+     `qpsolvers[daqp]==4.13.0`、`daqp==0.10.3`、`typing_extensions`、
+     `absl-py`、`etils[epath]`、`glfw`、`PyOpenGL`，scp 后
+     `pip install --no-index --find-links <dir>`。**不要升级 numpy/scipy**
+     （PC2 是 numpy 1.26.1 / scipy 1.8.0，链里依赖 scipy 1.8 的行为）。
+   - `mink` 没有 `__version__`，别写 `mink.__version__`（`AttributeError`）；
+     用 `importlib.metadata.version("mink")`。
+   - **模型不能拷完整 MJCF**：`x2_ultra.xml` 引用 66 MB 网格，PC2 没有
+     `gear_sonic/data` 树；`czq_examples` 是 setuptools 包，`colcon build`
+     只拷 `.py`，data 文件到不了 install 副本。因此 bundle 用
+     `gen_arm_kinematic_model.py` 生成 **kinematics-only**
+     `x2_arm_kinematic.py`（body/joint 保留，mesh/geom/site/actuator 全删，
+     每个 body 给占位 mass/inertia 以过 `compile()`），XML 以字符串内嵌，
+     运行时 `MjSpec.from_string()`。
+   - 模块带 `SOURCE_SHA256`；`build_bundle.sh` 在没有 mujoco 的机器上用
+     `--verify` 比对 MJCF 哈希，**MJCF 改了必须重新生成**，手改模块会被拒。
+   - 扁平导入：`x2_arm_mink.py` 先试 `gear_sonic.*`，失败回退同目录
+     `x2_arm_fk` / `x2_arm_ik`；`incremental_chain_v3base.py` 同样回退
+     `x2_arm_mink`。bundle 自检用 `sys.modules["gear_sonic"] = None`
+     强制走 PC2 的扁平路径，laptop 上跑 `SELF_TEST=1` 即覆盖。
+   - 模型自检应打印 `model ref: <x2_arm_kinematic>`、`nq 7`、
+     `position_cost 1.5`、`orientation (1.0, 0.7, 1.0)`；`--self-test
+     --backend mink` 和 `--backend dls` 都要 8/8。
+
+
+17. **屈肘前伸时手往机器人右侧偏（2026-10-30 真机，reach 球沿"肩→目标"
+    方向截断）**：单轴旋转、前后都正常；操作员屈肘（手收在胸前）再向前伸
+    左手的 **大幅度** 动作里，机器人左手会一边前伸一边往机器人自己的右侧
+    （基座 −y）偏，并轻微上飘——看起来像肩 3 轴里某个自由度方向反了。
+    不是肩轴，也不是 IK：真机节点跑的就是同一条链，MuJoCo 里同样能复现。
+
+    **根因**：`ClutchArmV3.step` 的 reach 球以 **肩** 为球心，截断时保留的是
+    "肩→目标"的方向。屈肘 neutral（`ARM_NEUTRAL`）的腕在肩外侧：左臂
+    腕 y=+0.278、肩 y=+0.143，`r_anchor=0.318`，而 `max_reach=0.425`——
+    **从屈肘位沿半径只剩 10.7 cm 余量**。操作员前伸 40 cm 时目标很早就
+    饱和，之后手腕只能沿球面滑向"肩的正前方"，也就是把起锚时的 13.5 cm
+    横向偏移交出去：实测 40 cm 指令 → 只前进 18.0 cm、y **−4.8 cm**（机器人
+    自己的右侧）、z **+6.7 cm**。锚点若在肩内侧（例如手先越过中线再起锚），
+    同一个机理就会往 +y 滑——方向取决于锚点，所以特别像"某个轴反了"。
+
+    **修复**：`_clamp_reach_from_anchor` 改为沿 **锚点 → 原始目标** 的射线
+    与 reach 球求交（一元二次方程），只缩短、不换方向；原先的径向截断保留
+    作 backstop（起锚时手臂已完全伸直、锚点本身在球外——`max_reach` 是
+    采样最大值的 0.93 倍，这种情形合法）。纯前伸现在 `tgt dy=dz=0`，
+    FK 残差 y −0.2 cm / z +0.5 cm（IK 沿手臂轴的奇异方向残差，径向）。
+    代价是前伸止于 13.8 cm（旧行为那 4 cm 本来就是横向滑出来的）。
+
+    **验收**：链自检 `reach_clamp_anchor_direction`（两侧各 60 cm 纯前伸，
+    断言 `|tgt−S|≤max_reach`、y/z 不漂 <2 mm）进 `CHAIN_V3_CHECKS`
+    尾部（只追加，`test_arm_teleop_v3.py` 按下标索引）；链自检 23/23、
+    pytest 91 passed。真机看"前伸走直线、到极限停住"，不再横向滑。
+
+    **工作空间提醒**：操作员从屈肘位到全伸约 40–50 cm，X2 臂从同一起点只剩
+    ~14 cm——1:1 映射必然饱和。要完整行程用 `--position-scale 0.35` 左右
+    （三轴一起缩），或者中途松 grip、在伸出位重新起锚；不要期待手臂走完
+    操作员的全部位移。

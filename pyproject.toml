@@ -56,6 +56,8 @@ select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# Generated kinematics-only MJCF: the embedded XML keeps the source formatting.
+"x2_pc2/v3_upper_teleop/x2_arm_kinematic.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 case-sensitive = false

@@ -18,18 +18,44 @@ Consumes the SAME wire as the v2 node (:5573 "pico_intent", packed binary,
       three) off neutral; tool roll stays a pure roll-joint motion.
       ``--wrist-axis-order-l/-r`` and the per-axis signs define C (controller
       -> wrist axis correspondence).  This is the v3 fix for "rotate only
-      the wrist, the robot drags its elbow/shoulder".
+      the wrist, the robot drags its elbow/shoulder".  Real node defaults
+      (2026-10-27, elbow-forward neutral): axis order ``0,2,1`` and signs
+      ``(yaw, pitch, roll) = (1, -1, 1)`` on BOTH sides; the shared chain and
+      the MuJoCo harness keep ``0,1,2`` + ``(1, 1, 1)``.
     * SMPL is CLOSED: the waist holds a fixed ``--waist-stand``.
     * 2026-10 role swap: the GRIP is the per-arm clutch; the TRIGGER drives
       the (internal) hand channel.  This node does not publish a hand -- the
       trigger therefore has no robot-side effect here.  A stale wire HOLDS
       the arms (clutch semantics), like v2.
+    * OPERATOR FRAME (2026-10-30 live-corrected; the 2026-10-27 finding
+      had the wire x backwards).  The v4 3-point sender's fixed frame is
+      built as ``fwd = cross(lat, up)`` from the SDK world, which the
+      XRoboToolkit PC service delivers RIGHT-handed (X right, Y up, Z in;
+      its README also notes the real data flips Unity's +Z).  The left
+      controller sits at -X, so that cross product is -Z = operator
+      FORWARD: the wire is (operator forward, operator left, up).  The
+      wrist mapping is frame-free (a constant left-multiply cancels in
+      ``R_anchor^-1 R_now``).  The operator and the robot face the SAME
+      direction (2026-10-30 live correction -- NOT face-to-face) and the
+      X2 base frame is also (forward, left, up) -- ARM_NEUTRAL puts the
+      wrists at +x -- so the avatar map is the IDENTITY: the real node
+      defaults to ``--operator-x-sign +1`` and ``--operator-y-sign +1``
+      and the operator's front-left reaches the robot's own front-left.
+      The 2026-10-27 x=-1 round trusted the Unity left-handed figure
+      instead of the delivered data and made the real robot reach
+      BACKWARD (the backward target then hit the trunk keep-out, which is
+      what slid the hand sideways -- the "offset" symptom); the
+      2026-10-30 y=-1 round mirrored a face-to-face rig that we do not
+      have.  The shared chain / MuJoCo harness use the same +1 defaults.
 
-Robot-side differences from the sim harness: DLS backend (PC2 has no
-mink/mujoco), ROS 2 Humble hal publishers, and an 85-column record with the
-plant qpos columns (70:85) left NaN.  Everything else -- receiver, ticker,
-guards, record layout, self-test checks -- is the shared code, so a sim run
-and a robot run read the same way offline.
+Robot-side differences from the sim harness: ROS 2 Humble hal publishers
+and an 85-column record with the plant qpos columns (70:85) left NaN.
+Everything else -- receiver, ticker, guards, record layout, self-test
+checks -- is the shared code, so a sim run and a robot run read the same
+way offline.  Arm IK backend: mink by default since 2026-10-30 (mink /
+mujoco / daqp installed on PC2; the model is the bundled kinematics-only
+``x2_arm_kinematic.py``, see x2_pc2/v3_upper_teleop/README.md).  The DLS
+solver stays available as ``--backend dls``.
 
 Deploy layout (flat, next to this file -- see x2_pc2/v3_upper_teleop/README.md):
 
@@ -38,6 +64,8 @@ Deploy layout (flat, next to this file -- see x2_pc2/v3_upper_teleop/README.md):
                                      #  renamed so v2's flat copy stays intact)
     incremental_chain_v3.py          # v3 ticker / wrist clutch
     x2_arm_ik.py  x2_arm_fk.py       # DLS solver + X2 FK
+    x2_arm_mink.py                   # mink solver (imported only for --backend mink)
+    x2_arm_kinematic.py              # kinematics-only MJCF module for the mink model
     upper_body_teleop.py             # v1 hal tables (names/limits/gains)
 
 Run on PC2 (paths per czq_test_v2_incremental.md §3):
@@ -45,17 +73,17 @@ Run on PC2 (paths per czq_test_v2_incremental.md §3):
     source /opt/ros/humble/setup.bash
     source /home/agi/aimdk/install/setup.bash
     source ~/Workspaces/czq/ros2_ws/install/setup.bash
+    ros2 run czq_examples incremental_upper_teleop_v3 --self-test --backend mink
     ros2 run czq_examples incremental_upper_teleop_v3 --self-test --backend dls
     ros2 run czq_examples incremental_upper_teleop_v3 --dry-run --record /tmp/v3_dry.npz --duration 20
-    ros2 run czq_examples incremental_upper_teleop_v3 \
-        --ctrl-lever-left  0.0410 0.0090 -0.0912 \
-        --ctrl-lever-right -0.0393 0.0115 -0.0791 \
-        --record /tmp/v3_live.npz
+    # live: the measured ctrl levers, the avatar signs (-1, +1) and the
+    # wrist map are BAKED DEFAULTs -- no calibration flags on the command line
+    ros2 run czq_examples incremental_upper_teleop_v3 --record /tmp/v3_live.npz
 
 Without a colcon entry point, run the flat file directly:
 
     cd ~/Workspaces/czq/ros2_ws/src/czq_examples/czq_examples
-    python3 incremental_upper_teleop_v3.py --self-test --backend dls
+    python3 incremental_upper_teleop_v3.py --self-test --backend mink
 """
 
 from __future__ import annotations
@@ -161,11 +189,13 @@ def _parse_axis_order(text: str) -> tuple[int, int, int]:
     """Parse '0,1,2' / '0 1 2' into the wrist-axis correspondence.
 
     Wrist joints are [yaw, pitch, roll]; the controller differential's
-    Euler ZYX components are [about z, about y, about x]. The default
-    (0,1,2) means controller z -> yaw, y -> pitch, x -> roll. A
-    permutation such as 2,1,0 swaps the controller x/z assignment. It is
-    applied to the controller differential BEFORE the exact wrist-chain
-    solve, together with the per-axis signs.
+    Euler ZYX components are [about z, about y, about x]. ``0,1,2`` means
+    controller z -> yaw, y -> pitch, x -> roll; the real node now defaults
+    to ``0,2,1`` (x -> pitch, y -> roll) because the elbow-forward neutral
+    crossed pitch and roll (2026-10-27 real-robot finding). A permutation
+    such as 2,1,0 swaps the controller x/z assignment. It is applied to
+    the controller differential BEFORE the exact wrist-chain solve,
+    together with the per-axis signs.
     """
     try:
         return chain_v3.parse_wrist_axis_order(text)
@@ -173,11 +203,48 @@ def _parse_axis_order(text: str) -> tuple[int, int, int]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _axis_order_default(env_name: str) -> tuple[int, int, int]:
+def _sign_default(env_name: str, default: float) -> float:
+    """Parse a +1/-1 frame sign from the environment."""
     try:
-        return _parse_axis_order(os.environ.get(env_name, "0,1,2"))
+        value = float(os.environ.get(env_name, default))
+    except ValueError as exc:
+        raise SystemExit(f"{env_name}: {exc}") from exc
+    if value not in (-1.0, 1.0):
+        raise SystemExit(f"{env_name} must be +1 or -1, got {value}")
+    return value
+
+
+def _axis_order_default(env_name: str) -> tuple[int, int, int]:
+    # 2026-10-27 real-robot finding: with the elbow-forward neutral
+    # ([0, +/-0.2, 0, -1.57, 0,0,0]) the controller's roll/pitch land on
+    # each other's wrist joints. The node (real robot) therefore defaults
+    # to 0,2,1, i.e. controller x -> pitch and y -> roll. The shared chain
+    # and the MuJoCo harness keep their 0,1,2 default; pass
+    # --wrist-axis-order-l/-r 0,2,1 there to match the robot.
+    try:
+        return _parse_axis_order(os.environ.get(env_name, "0,2,1"))
     except argparse.ArgumentTypeError as exc:
         raise SystemExit(f"{env_name}: {exc}") from exc
+
+
+# Real-node wrist default (2026-10-27): after the pitch/roll axis swap above,
+# the remaining pitch direction is inverted on BOTH sides. Yaw and roll stay
+# +1. The shared chain / MuJoCo harness keep (1,1,1); the env vars and
+# --wrist-{yaw,pitch,roll}-sign-l/-r still override per axis.
+REAL_DEFAULT_WRIST_SIGNS = {
+    "left": (1.0, -1.0, 1.0),
+    "right": (1.0, -1.0, 1.0),
+}
+
+# Real-node ctrl-lever default (2026-10 increment fit, docs/x2/
+# PICO_LIVE_TELEOP_PITFALLS.md §9): controller origin -> operator wrist
+# centre in the controller body frame. Baked here so the live command line
+# carries NO calibration flags; --ctrl-lever[-left/-right] still override,
+# and a re-fit should be re-baked here (or passed explicitly for that run).
+REAL_DEFAULT_CTRL_LEVER = {
+    "left": (0.0410, 0.0090, -0.0912),
+    "right": (-0.0393, 0.0115, -0.0791),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +279,11 @@ class TeleopCore:
             side: (
                 getattr(args, f"ctrl_lever_{side}")
                 if getattr(args, f"ctrl_lever_{side}") is not None
-                else args.ctrl_lever
+                else (
+                    args.ctrl_lever
+                    if args.ctrl_lever is not None
+                    else REAL_DEFAULT_CTRL_LEVER[side]
+                )
             )
             for side in ("left", "right")
         }
@@ -232,6 +303,8 @@ class TeleopCore:
             full_pose_ik=args.full_pose_ik,
             backend=args.backend,
             ctrl_lever=ctrl_levers,
+            operator_x_sign=args.operator_x_sign,
+            operator_y_sign=args.operator_y_sign,
             position_deadband_m=args.position_deadband_mm * 1e-3,
             posture_gain=args.posture_gain,
         )
@@ -463,7 +536,7 @@ def _record_layout_ok() -> bool:
     """A real (stale, disengaged) tick -> an 85-column row with the plant
     qpos columns NaN. Pins the layout the sim autopsy tools assume."""
     try:
-        tick = chain_v3.IncrementalTeleopTickerV3(backend=os.environ.get("X2_IK_BACKEND", "dls"))
+        tick = chain_v3.IncrementalTeleopTickerV3(backend=os.environ.get("X2_IK_BACKEND", "mink"))
         frame = {
             "trigger": np.zeros(2),
             "grip": np.zeros(2),
@@ -590,25 +663,21 @@ def run_self_test(args) -> bool:
 def main() -> int:
     signs_env = {
         "left": {
-            "yaw": float(
-                os.environ.get("WRIST3_YAW_SIGN_L", chain_v3.DEFAULT_WRIST_SIGNS["left"][0])
-            ),
+            "yaw": float(os.environ.get("WRIST3_YAW_SIGN_L", REAL_DEFAULT_WRIST_SIGNS["left"][0])),
             "pitch": float(
-                os.environ.get("WRIST3_PITCH_SIGN_L", chain_v3.DEFAULT_WRIST_SIGNS["left"][1])
+                os.environ.get("WRIST3_PITCH_SIGN_L", REAL_DEFAULT_WRIST_SIGNS["left"][1])
             ),
             "roll": float(
-                os.environ.get("WRIST3_ROLL_SIGN_L", chain_v3.DEFAULT_WRIST_SIGNS["left"][2])
+                os.environ.get("WRIST3_ROLL_SIGN_L", REAL_DEFAULT_WRIST_SIGNS["left"][2])
             ),
         },
         "right": {
-            "yaw": float(
-                os.environ.get("WRIST3_YAW_SIGN_R", chain_v3.DEFAULT_WRIST_SIGNS["right"][0])
-            ),
+            "yaw": float(os.environ.get("WRIST3_YAW_SIGN_R", REAL_DEFAULT_WRIST_SIGNS["right"][0])),
             "pitch": float(
-                os.environ.get("WRIST3_PITCH_SIGN_R", chain_v3.DEFAULT_WRIST_SIGNS["right"][1])
+                os.environ.get("WRIST3_PITCH_SIGN_R", REAL_DEFAULT_WRIST_SIGNS["right"][1])
             ),
             "roll": float(
-                os.environ.get("WRIST3_ROLL_SIGN_R", chain_v3.DEFAULT_WRIST_SIGNS["right"][2])
+                os.environ.get("WRIST3_ROLL_SIGN_R", REAL_DEFAULT_WRIST_SIGNS["right"][2])
             ),
         },
     }
@@ -622,17 +691,46 @@ def main() -> int:
     )
     ap.add_argument("--position-scale", type=float, default=1.0)
     ap.add_argument(
+        "--operator-x-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=_sign_default("OPERATOR_X_SIGN", 1.0),
+        help="sign on the LEVER-CORRECTED operator x before it drives the "
+        "robot (env OPERATOR_X_SIGN). The v4 3-point sender builds "
+        "fwd = cross(lat, up) from the SDK's RIGHT-handed world (X right, "
+        "Y up, Z in -- the PC service README notes the real data flips "
+        "Unity's +Z), so wire +x is operator-FORWARD; the same-facing "
+        "avatar map is the identity and the real node defaults to +1. "
+        "Pass -1 only to mirror x (face-to-face rig). The wrist mapping is "
+        "frame-free.",
+    )
+    ap.add_argument(
+        "--operator-y-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=_sign_default("OPERATOR_Y_SIGN", 1.0),
+        help="sign on the LEVER-CORRECTED operator y before it drives the "
+        "robot (env OPERATOR_Y_SIGN). The wire's +y is operator-left and the "
+        "operator faces the SAME direction as the robot (2026-10-30 live "
+        "correction, NOT face-to-face), so robot +y (its own left) is the "
+        "operator's left too: the real node defaults to +1, and the "
+        "operator's front-left reaches the robot's own front-left. Pass -1 "
+        "only for a face-to-face rig, where the robot's own left is the "
+        "operator's visual right.",
+    )
+    ap.add_argument(
         "--ctrl-lever",
         nargs=3,
         type=float,
-        default=(0.0, 0.0, 0.0),
+        default=None,
         metavar=("X", "Y", "Z"),
         help="Pico controller origin -> operator wrist centre, metres in the "
-        "controller body frame (W = C - R @ r). Default 0 keeps the raw "
-        "controller origin. A pure wrist rotation with a stationary hand "
-        "should leave the robot target still; if it sweeps, fit this vector "
-        "(docs/x2/PICO_LIVE_TELEOP_PITFALLS.md). Common default for both "
-        "hands; --ctrl-lever-left/right override it",
+        "controller body frame (W = C - R @ r). Common override for both "
+        "hands; unset = the measured REAL_DEFAULT_CTRL_LEVER is baked in "
+        "(2026-10 fit), so the live command line needs no calibration flags. "
+        "A pure wrist rotation with a stationary hand should leave the robot "
+        "target still; if it sweeps, re-fit (docs/x2/"
+        "PICO_LIVE_TELEOP_PITFALLS.md) and pass it here",
     )
     ap.add_argument(
         "--ctrl-lever-left",
@@ -640,7 +738,8 @@ def main() -> int:
         type=float,
         default=None,
         metavar=("X", "Y", "Z"),
-        help="left-hand override of --ctrl-lever (fit each controller separately)",
+        help="left-hand override (default: the baked REAL_DEFAULT_CTRL_LEVER "
+        "left entry, 0.0410 0.0090 -0.0912)",
     )
     ap.add_argument(
         "--ctrl-lever-right",
@@ -648,7 +747,8 @@ def main() -> int:
         type=float,
         default=None,
         metavar=("X", "Y", "Z"),
-        help="right-hand override of --ctrl-lever (see --ctrl-lever-left)",
+        help="right-hand override (default: the baked REAL_DEFAULT_CTRL_LEVER "
+        "right entry, -0.0393 0.0115 -0.0791)",
     )
     ap.add_argument(
         "--position-deadband-mm",
@@ -683,8 +783,9 @@ def main() -> int:
     ap.add_argument(
         "--full-pose-ik",
         action="store_true",
-        help="opt into the 7-DoF pose IK (wrist solved; position and rotation "
-        "gains both 1.0) instead of the default 4-DoF position solve + "
+        help="opt into the 7-DoF pose IK (wrist solved; mink uses position_cost "
+        "1.5 and wrist-frame orientation costs 1.0/0.7/1.0, dls weights them "
+        "equally) instead of the default 4-DoF position solve + "
         "WristClutch direct wrist fill",
     )
     ap.add_argument(
@@ -695,17 +796,18 @@ def main() -> int:
         "before the exact wrist-chain solve",
     )
     for axis in ("yaw", "pitch", "roll"):
+        sign_default = ", real-node default -1" if axis == "pitch" else ", real-node default +1"
         ap.add_argument(
             f"--wrist-{axis}-sign-l",
             type=float,
             default=signs_env["left"][axis],
-            help=f"left wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_L)",
+            help=(f"left wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_L" f"{sign_default})"),
         )
         ap.add_argument(
             f"--wrist-{axis}-sign-r",
             type=float,
             default=signs_env["right"][axis],
-            help=f"right wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_R)",
+            help=(f"right wrist {axis} sign (env WRIST3_{axis.upper()}_SIGN_R" f"{sign_default})"),
         )
     for side, suffix in (("left", "l"), ("right", "r")):
         ap.add_argument(
@@ -715,10 +817,11 @@ def main() -> int:
             help=(
                 f"{side} controller-axis -> wrist-joint correspondence "
                 f"(env WRIST3_AXIS_ORDER_{suffix.upper()}); wrist joints are "
-                "[yaw,pitch,roll], default 0,1,2 = controller z->yaw, y->pitch, "
-                "x->roll. Use e.g. 2,1,0 if a single anatomical DOF lands on the "
-                "wrong wrist joint. Applied to the differential before the exact "
-                "wrist solve; not a per-joint scale"
+                "[yaw,pitch,roll]. Real-node default 0,2,1 = controller z->yaw, "
+                "x->pitch, y->roll (pitch/roll swapped for the elbow-forward "
+                "neutral); pass 0,1,2 for the old mapping. Use 2,1,0 if a single "
+                "anatomical DOF lands on the wrong wrist joint. Applied to the "
+                "differential before the exact wrist solve; not a per-joint scale"
             ),
         )
     ap.add_argument(
@@ -749,8 +852,10 @@ def main() -> int:
     ap.add_argument(
         "--backend",
         choices=("dls", "mink"),
-        default="dls",
-        help="arm IK backend; PC2 has no mink/mujoco, so the robot default is dls",
+        default="mink",
+        help="arm IK backend; mink is the default since 2026-10-30 (mink + "
+        "mujoco + daqp are installed on PC2 and the bundle carries the "
+        "kinematics-only model), dls is the legacy fallback",
     )
     ap.add_argument(
         "--no-legs",
@@ -783,6 +888,23 @@ def main() -> int:
         help="dry-run only: stop after N s (0 = until Ctrl-C)",
     )
     args = ap.parse_args()
+
+    print(
+        f"[frame] operator_x_sign={args.operator_x_sign:+.0f} "
+        f"operator_y_sign={args.operator_y_sign:+.0f} "
+        "(-1/+1 = same-facing avatar map: operator forward -> robot +x, "
+        "operator left -> robot +y; the 3point wire is operator "
+        "(forward, left, up), so +1/+1 is the identity map; any -1 would "
+        "mirror an axis, i.e. a face-to-face rig)"
+    )
+    for side, suffix in (("left", "l"), ("right", "r")):
+        print(
+            f"[wrist] {side:5s} axis_order={tuple(getattr(args, f'wrist_axis_order_{suffix}'))} "
+            f"signs(yaw,pitch,roll)="
+            f"({getattr(args, f'wrist_yaw_sign_{suffix}'):+.0f},"
+            f"{getattr(args, f'wrist_pitch_sign_{suffix}'):+.0f},"
+            f"{getattr(args, f'wrist_roll_sign_{suffix}'):+.0f})"
+        )
 
     if args.self_test:
         return 0 if run_self_test(args) else 1

@@ -19,7 +19,8 @@ rotation spreading over the whole arm). v3 changes three things
   limits). The wrist is yaw-proximal with pitch/roll cross-coupled, so a
   tool pitch/yaw rotation coordinates pitch+roll off neutral; tool roll is
   always the roll joint alone. ``--full-pose-ik`` opts into the 7-DoF pose
-  solve instead (position and orientation task gains both 1.0);
+  solve instead (mink: position_cost 1.5 and wrist-frame orientation costs
+  1.0/0.7/1.0 for roll/pitch/yaw; dls treats both tasks equally);
 * HAND INVERTED: the hand is OPEN at rest and CLOSES when the TRIGGER is
   pressed (the LPF'd trigger is the hand channel); the GRIP is the per-arm
   clutch (2026-10 role swap; the constant / flag names are historical).
@@ -171,6 +172,31 @@ def main() -> int:
     ap.add_argument("--stale-s", type=float, default=0.5)
     ap.add_argument("--position-scale", type=float, default=1.0)
     ap.add_argument(
+        "--operator-x-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=_env_sign("OPERATOR_X_SIGN", 1.0),
+        help="sign on the LEVER-CORRECTED operator x (env OPERATOR_X_SIGN). "
+        "Keep +1 for the full-body wire AND when this harness is driven by "
+        "the v4 3-point sender: the PC service world is RIGHT-handed (X "
+        "right, Y up, Z in; the real data flips Unity's +Z), so "
+        "cross(lat, up) is operator-FORWARD and the same-facing avatar map "
+        "is the identity. -1 is only for a face-to-face rig. Matches the "
+        "PC2 node's --operator-x-sign default (+1).",
+    )
+    ap.add_argument(
+        "--operator-y-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=_env_sign("OPERATOR_Y_SIGN", 1.0),
+        help="sign on the LEVER-CORRECTED operator y (env OPERATOR_Y_SIGN). "
+        "Keep +1 for the full-body wire AND when driven by the v4 3-point "
+        "sender: the operator faces the SAME direction as the robot "
+        "(2026-10-30 live correction), so the wire's +y (operator left) is "
+        "already the robot's own +y (its left). -1 is only for a "
+        "face-to-face rig. Matches the PC2 node's default (+1).",
+    )
+    ap.add_argument(
         "--ctrl-lever",
         nargs=3,
         type=float,
@@ -232,8 +258,9 @@ def main() -> int:
     ap.add_argument(
         "--full-pose-ik",
         action="store_true",
-        help="opt into the 7-DoF pose IK (wrist solved; position and rotation "
-        "gains both 1.0) instead of the default 4-DoF position solve + "
+        help="opt into the 7-DoF pose IK (wrist solved; mink uses position_cost "
+        "1.5 and wrist-frame orientation costs 1.0/0.7/1.0, dls weights them "
+        "equally) instead of the default 4-DoF position solve + "
         "WristClutch direct wrist fill",
     )
     ap.add_argument(
@@ -365,6 +392,8 @@ def main() -> int:
         waist_stand=args.waist_stand,
         full_pose_ik=args.full_pose_ik,
         ctrl_lever=ctrl_levers,
+        operator_x_sign=args.operator_x_sign,
+        operator_y_sign=args.operator_y_sign,
         position_deadband_m=args.position_deadband_mm * 1e-3,
         posture_gain=args.posture_gain,
     )
@@ -378,7 +407,9 @@ def main() -> int:
     print(
         f"[sim] v3 wire mode: SUB :{args.intent_port}; grip (LPF'd)>"
         f"{args.trigger_thresh} engages, trigger drives the hands, "
-        f"scale {args.position_scale}, lpf tau {args.input_tau}s, "
+        f"scale {args.position_scale}, operator_x_sign {args.operator_x_sign:+.0f}, "
+        f"operator_y_sign {args.operator_y_sign:+.0f}, "
+        f"lpf tau {args.input_tau}s, "
         f"wrist scale {args.wrist_scale} signs L{wrist_signs['left']} R{wrist_signs['right']} "
         f"axes L{tuple(args.wrist_axis_order_l)} R{tuple(args.wrist_axis_order_r)}, "
         f"ctrl lever L{tuple(np.round(ticker.ctrl_levers['left'], 4))} "

@@ -32,12 +32,33 @@ for f in \
     "$REPO/gear_sonic/utils/teleop/incremental_chain_v3.py" \
     "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_ik.py" \
     "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_fk.py" \
+    "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_mink.py" \
+    "$HERE/gen_arm_kinematic_model.py" \
+    "$REPO/gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml" \
     "$HAL_TABLE"; do
     [[ -f "$f" ]] || { echo "missing source: $f" >&2; exit 2; }
 done
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
+
+# ---- mink model: kinematics-only MJCF, as a sibling .py module -----------
+# PC2 has no gear_sonic data tree and the full MJCF references 66 MB of
+# meshes; setuptools only copies *.py, so the model ships as a module.
+# Regenerated from the source MJCF when mujoco is importable; otherwise the
+# checked-in module is used after its SOURCE_SHA256 is checked against the
+# MJCF (a stale model must not reach the robot).
+MJCF="$REPO/gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml"
+if "$PYTHON" -c "import mujoco" >/dev/null 2>&1; then
+    "$PYTHON" "$HERE/gen_arm_kinematic_model.py" --mjcf "$MJCF" \
+        --out "$OUT/x2_arm_kinematic.py"
+else
+    echo "[bundle] mujoco not importable in $PYTHON -- using the checked-in" \
+         "kinematics-only model after a hash check"
+    "$PYTHON" "$HERE/gen_arm_kinematic_model.py" --mjcf "$MJCF" \
+        --verify "$HERE/x2_arm_kinematic.py"
+    install -m 0644 "$HERE/x2_arm_kinematic.py" "$OUT/x2_arm_kinematic.py"
+fi
 
 install -m 0755 "$HERE/incremental_upper_teleop_v3.py" "$OUT/"
 # v3's base chain gets a v3-only name on purpose: PC2's `incremental_chain.py`
@@ -47,6 +68,7 @@ install -m 0644 "$REPO/gear_sonic/utils/teleop/incremental_chain.py" \
 install -m 0644 "$REPO/gear_sonic/utils/teleop/incremental_chain_v3.py" "$OUT/"
 install -m 0644 "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_ik.py" "$OUT/"
 install -m 0644 "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_fk.py" "$OUT/"
+install -m 0644 "$REPO/gear_sonic/utils/teleop/solver/arm/x2_arm_mink.py" "$OUT/"
 install -m 0644 "$HAL_TABLE" "$OUT/upper_body_teleop.py"
 install -m 0644 "$HERE/README.md" "$OUT/README.md"
 
@@ -86,13 +108,38 @@ PY
 
 echo "[bundle] wrote $OUT"
 echo "[bundle] source commit: $(awk -F= '/^source_commit=/{print $2}' "$OUT/bundle_info.txt")"
-echo "[bundle] scp the six .py files FLAT into the PC2 package directory:"
+echo "[bundle] scp the eight .py files FLAT into the PC2 package directory:"
 echo "  scp $OUT/incremental_upper_teleop_v3.py \\"
 echo "      $OUT/incremental_chain_v3base.py $OUT/incremental_chain_v3.py \\"
-echo "      $OUT/x2_arm_ik.py $OUT/x2_arm_fk.py $OUT/upper_body_teleop.py \\"
+echo "      $OUT/x2_arm_ik.py $OUT/x2_arm_fk.py $OUT/x2_arm_mink.py \\"
+echo "      $OUT/x2_arm_kinematic.py $OUT/upper_body_teleop.py \\"
 echo "      Agibot-X2-PC2-Orin-NX:~/Workspaces/czq/ros2_ws/src/czq_examples/czq_examples/"
 
 if [[ "${SELF_TEST:-0}" == "1" ]]; then
-    echo "[bundle] running the robot self-test on the flat bundle (backend dls) ..."
-    "$PYTHON" "$OUT/incremental_upper_teleop_v3.py" --self-test --backend dls
+    # Block the gear_sonic package so the test exercises the FLAT vendored
+    # imports (and the bundled kinematics-only model) exactly as PC2 does;
+    # without this the laptop's editable install wins and the bundle's
+    # mink path would never be touched.
+    for backend in dls mink; do
+        if [[ "$backend" == "mink" ]] \
+           && ! "$PYTHON" -c "import mink, mujoco, daqp" >/dev/null 2>&1; then
+            echo "[bundle] SKIP the mink self-test: mink/mujoco/daqp are not importable in $PYTHON"
+            continue
+        fi
+        echo "[bundle] running the robot self-test on the flat bundle (backend $backend, forced flat imports) ..."
+        "$PYTHON" - "$OUT" "$backend" <<'PY'
+import runpy
+import sys
+
+out, backend = sys.argv[1], sys.argv[2]
+sys.modules["gear_sonic"] = None  # "import of gear_sonic halted" -> flat fallbacks
+sys.argv = [
+    f"{out}/incremental_upper_teleop_v3.py",
+    "--self-test",
+    "--backend",
+    backend,
+]
+runpy.run_path(sys.argv[0], run_name="__main__")
+PY
+    done
 fi

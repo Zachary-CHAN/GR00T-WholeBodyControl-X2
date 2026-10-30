@@ -761,10 +761,12 @@ def main() -> int:
     ap.add_argument("--tape-replay", default=None)
     ap.add_argument("--tracking", choices=("full", "3point"), default="full",
                     help="'full' (default): Pico body stream (headset + waist/ankle "
-                         "trackers) exactly as today. '3point': trackerless arm-only "
-                         "mode; the two controllers supply lctrl_pose/rctrl_pose/"
-                         "trigger/grip and the headset is diagnostic only. Forces "
-                         "--no-locomotion; live only (not with --tape-replay).")
+                         "trackers) exactly as today. '3point': trackerless mode; the "
+                         "two controllers supply lctrl_pose/rctrl_pose/trigger/grip "
+                         "and the headset is diagnostic only. Forces --no-locomotion "
+                         "(no planner/controller layer), but hand_finger_cmd still "
+                         "works -- use --hand-source trigger for a real CLAW. Live "
+                         "only (not with --tape-replay).")
     ap.add_argument("--auto-engage", action="store_true")
     ap.add_argument("--wb-toggle-gate", choices=["right-trigger", "none"], default="right-trigger",
                     help="deadman for the B mode switch (LOCOMOTION <-> WHOLE_BODY): 'right-trigger' "
@@ -867,11 +869,15 @@ def main() -> int:
     if tracking_3pt and args.tape_once:
         ap.error("--tracking 3point cannot be combined with --tape-once")
     if tracking_3pt:
-        args.no_locomotion = True   # arm-only: no planner/clip/hand sockets
-        print("[3pt] trackerless arm-only mode: --no-locomotion forced; "
+        args.no_locomotion = True   # no planner/clip sockets; the hand socket stays
+        print("[3pt] trackerless mode: --no-locomotion forced; "
               "wire engaged is forced 0 (SMPL consumer stays out).", flush=True)
-        print("[3pt] hand_finger_cmd disabled in arm-only mode "
-              "(sim harness drives OmniHand from trigger).", flush=True)
+        if args.hand_source == "off":
+            print("[3pt] hands off (--hand-source off): arms only.", flush=True)
+        else:
+            print(f"[3pt] hands live on :{args.hand_port} (source: controller "
+                  f"{args.hand_source}); the grip is the ARM CLUTCH, so use "
+                  "--hand-source trigger for a real CLAW/OmniHand.", flush=True)
         if args.auto_engage:
             print("[3pt] --auto-engage has no effect on the wire: engaged is "
                   "forced 0; grip is the clutch.", flush=True)
@@ -940,7 +946,11 @@ def main() -> int:
               f"{micro_list} -> motion_clip_cmd tcp://{args.pc2_host}:{args.clip_port}", flush=True)
     micro_prev_dir, micro_cooldown_until = None, 0.0
     hand_sock = None
-    if (dual_mode or raw_tape_once) and args.hand_source != "off":
+    # 3point forces --no-locomotion (dual_mode False) but still owns the
+    # fingers on the real robot: the grip is the arm clutch, the trigger is
+    # the hand. Keep the hand wire alive there and publish the wire-GATED
+    # trigger/grip (lost side already zeroed) rather than the raw pair.
+    if (dual_mode or raw_tape_once or tracking_3pt) and args.hand_source != "off":
         hand_sock = _bounded(ctx.socket(zmq.PUB))
         hand_sock.connect(f"tcp://{args.pc2_host}:{args.hand_port}")
         print(f"hand_finger_cmd PUB -> tcp://{args.pc2_host}:{args.hand_port} "
@@ -1176,7 +1186,7 @@ def main() -> int:
         print(f"[clip] RECORDING raw body clips per engage -> "
               f"{args.session_dir}", flush=True)
     if tracking_3pt:
-        print("3pt: engaged forced 0 (arm-only); grip is the clutch.", flush=True)
+        print("3pt: engaged forced 0 (no body stream); grip is the clutch.", flush=True)
     elif engaged:
         print("ENGAGED (auto).", flush=True)
     elif dual_mode:
@@ -1187,27 +1197,34 @@ def main() -> int:
     else:
         print("DISENGAGED — controller layer off (--no-locomotion/tape); "
               "--auto-engage or tape flags control engage.", flush=True)
-    def _publish_hands(now: float, lt: float, rt: float) -> None:
+    def _publish_hands(
+        now: float, lt: float, rt: float, grips: "tuple[float, float] | None" = None
+    ) -> None:
         """OmniHand fingers: grips -> grasp ratio -> 10-DOF motor targets on
         the hand_finger_cmd wire, at --hand-hz, whether or not whole-body is
         engaged (hands are usable in kplanner mode too; the kplanner latches
         the last targets on a link drop). Called from the dual-mode
         controller layer AND from the stick-less tape replay (2026-09-05:
         window-tape replays published no hands -- "fingers not opening in
-        sim" -- because this lived inside the dual-mode block)."""
+        sim" -- because this lived inside the dual-mode block). 3point
+        passes ``grips`` from the wire-gated fields so a lost controller
+        zeroes that side's fingers too (2026-10-27, real-robot v4)."""
         nonlocal hand_next_t, hand_tick, hand_last
         if hand_sock is None or now < hand_next_t:
             return
         hand_next_t = now + 1.0 / max(args.hand_hz, 1.0)
-        try:
-            if isinstance(src, _IntentTapeSource):
-                # v4 tapes carry the recorded grip (replay = session);
-                # legacy tapes -> (0, 0) exactly as before
-                lg, rg = src.replay_grips(now)
-            else:
-                lg = float(src.xrt.get_left_grip()); rg = float(src.xrt.get_right_grip())
-        except Exception:
-            lg = rg = 0.0
+        if grips is not None:
+            lg, rg = float(grips[0]), float(grips[1])
+        else:
+            try:
+                if isinstance(src, _IntentTapeSource):
+                    # v4 tapes carry the recorded grip (replay = session);
+                    # legacy tapes -> (0, 0) exactly as before
+                    lg, rg = src.replay_grips(now)
+                else:
+                    lg = float(src.xrt.get_left_grip()); rg = float(src.xrt.get_right_grip())
+            except Exception:
+                lg = rg = 0.0
         l_ratio, r_ratio = controller_grasp_ratio(
             left_trigger=lt, right_trigger=rt, left_grip=lg, right_grip=rg,
             mode=args.hand_source)
@@ -1254,8 +1271,11 @@ def main() -> int:
                     except Exception:
                         lt = rt = 0.0
                 # stick-less tape replay (single engage-window clip): the
-                # tape's own frames carry the hands (triggers/grips as stored)
-                _publish_hands(now, 0.0, 0.0)
+                # tape's own frames carry the hands (triggers/grips as stored).
+                # 3point publishes after ctrl_fields below, using the
+                # wire-gated trigger/grip (lost side already zeroed).
+                if not tracking_3pt:
+                    _publish_hands(now, 0.0, 0.0)
 
             # ---- dual-mode controller layer (live sessions only) ----
             # Quest control grammar: A+B+X+Y = OFF<->LOCOMOTION, B =
@@ -1744,6 +1764,17 @@ def main() -> int:
                         float(home_latches["right"].update(ra_btn, now)),
                     ],
                     np.float32,
+                )
+                # Real-robot v4 hands: trigger = CLAW/OmniHand, grip = arm
+                # clutch. Use the gated fields (a stale controller's
+                # trigger/grip are 0 there) instead of the raw pair, so a
+                # dropped side releases its fingers instead of freezing them
+                # at the last squeeze.
+                _publish_hands(
+                    now,
+                    float(ctrl_fields["trigger"][0]),
+                    float(ctrl_fields["trigger"][1]),
+                    grips=(float(ctrl_fields["grip"][0]), float(ctrl_fields["grip"][1])),
                 )
             # 3point sends PLACEHOLDER smpl_joints/human_quat: force engaged 0
             # so a SMPL tokenizer on the same topic never treats them as live

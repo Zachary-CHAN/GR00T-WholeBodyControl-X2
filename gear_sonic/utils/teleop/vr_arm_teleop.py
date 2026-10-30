@@ -57,17 +57,20 @@ from scipy.spatial.transform import Rotation as sRot
 from gear_sonic.utils.teleop.solver.arm import ArmIKSolver, IKResult
 
 
-# ── X2 stand-pose neutral arm angles (rad) ────────────────────────────────
+# ── X2 neutral arm angles (rad) ────────────────────────────────────────────
 #
-# Same numbers used by the live VLA bridge / mock publisher. Layout is
-# left[7] then right[7] in the canonical X2 arm joint order:
+# Same numbers used by the live VLA bridge / mock publisher and by the v3/v4
+# teleop chain (incremental_chain.ARM_NEUTRAL; the sim harness asserts the
+# two are identical). Elbows bent ~90 deg, forearms pointing forward:
+# FK on x2_arm_fk gives forearm [1.00, +-0.02, -0.06] in the torso frame.
+# Layout is left[7] then right[7] in the canonical X2 arm joint order:
 #   shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
 #   wrist_yaw, wrist_pitch, wrist_roll
 DEFAULT_LEFT_ARM_NEUTRAL_RAD: tuple[float, ...] = (
-    0.2, 0.2, 0.0, -0.6, 0.0, 0.0, 0.0,
+    0.0, 0.2, 0.0, -1.57, 0.0, 0.0, 0.0,
 )
 DEFAULT_RIGHT_ARM_NEUTRAL_RAD: tuple[float, ...] = (
-    0.2, -0.2, 0.0, -0.6, 0.0, 0.0, 0.0,
+    0.0, -0.2, 0.0, -1.57, 0.0, 0.0, 0.0,
 )
 
 

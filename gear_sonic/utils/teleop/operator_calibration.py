@@ -142,8 +142,9 @@ SCHEMA_VERSION = 2
 # This change is INDEPENDENT of the deploy stand pose: SONIC's standing
 # behavior is loaded from ``stand_pose_loader.hpp`` on the C++ side. The
 # Python ``DEFAULT_*_NEUTRAL_RAD`` (used as the IK snap target when
-# disengaged) still matches the SONIC stand pose so the robot doesn't
-# move when the operator releases A.
+# disengaged) followed the SONIC stand pose until 2026-10-27; it now
+# follows the v4 teleop neutral (elbows bent ~90 deg, forearms forward)
+# so the legacy VR path releases A to the same pose as the v3/v4 chain.
 ARMS_DOWN_LEFT = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 ARMS_DOWN_RIGHT = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
