@@ -2387,32 +2387,44 @@ mc_em_post() {
     # $1 = action ("stop_app" or "start_app")
     #
     # Tries the legacy HTTP endpoint first (older PC1 firmware exposes
-    # it on $MC_EM_URL/json/start_app | stop_app). Newer firmware (post
-    # ~2026-05 on this fleet) dropped the HTTP wrapper entirely: the EM
-    # service moved to ROS 2 services (/aimdk.protocol.EmAppService/
-    # StartApp + StopApp), and the supported CLI on PC2 is `aima em
-    # start-app mc` / `aima em stop-app mc`, which wraps those services.
-    # When the HTTP POST fails AND we're on a host that has `aima` on
-    # PATH (i.e. we're running on PC2 in onbot mode), fall back to the
-    # CLI so the operator does not have to know which firmware they're
-    # on. Useful for both onbot mode (PC2-native) and any future
-    # firmware update on the local-mode laptop.
+    # it on $MC_EM_URL/json/start_app | stop_app). On this fleet the PC1
+    # EM HTTP endpoint is what `aima` itself uses underneath (the CLI
+    # POSTs to {base_url}/stop_app, and its own timeout for that call is
+    # 20 s because EM waits for MC's process to be reaped). PC2's local
+    # `aima` talks to PC2's OWN EM on 127.0.0.1:50080 -- a different app
+    # namespace whose list has no `mc` app at all (2026-10-30). So the
+    # HTTP POST to PC1 is the real path; the CLI fallback below is only
+    # a bounded best-effort for hosts whose local EM does host `mc`.
     local action="$1"
     local url="$MC_EM_URL/json/$action"
+    # stop_app blocks on the EM side until MC's process is reaped: the
+    # `mc` app carries term_timeout_ms=10000 on this fleet, and the aima
+    # CLI itself uses timeout=20 for this call. The old 5 s cap timed out
+    # on every real stop (2026-10-30: pane froze at "stopping MC ...";
+    # curl gave up at 5.0 s, the EM never finished reaping MC). start_app
+    # returns as soon as the app is spawned, so keep the short cap there.
+    local max_time=5
+    [[ "$action" == "stop_app" ]] && max_time=30
     local http_rc=0
+    local http_body=""
     if [[ -z "$MC_EM_URL" ]]; then
         echo -e "$(ts) ${YELLOW}[mc-em]${NC} no EM HTTP URL (set PC1_HOST=<PC1_IP>, X2_MC_EM_URL or --mc-em-url); skipping HTTP, trying 'aima em' CLI ..." >&2
         http_rc=1
     elif command -v curl &>/dev/null; then
-        if curl -fsS -X POST -H 'Content-Type: application/json' \
-            --connect-timeout 3 --max-time 5 \
+        if http_body=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            --connect-timeout 3 --max-time "$max_time" \
             -d '{"app_name":"mc"}' \
-            "$url" >/dev/null 2>&1; then
+            "$url" 2>&1); then
             return 0
+        else
+            # MUST capture $? inside the else branch: after a failed `if`
+            # with no else, $? reads 0 (the if statement itself succeeds),
+            # which is how the real curl rc (22 = HTTP error, 28 = timeout)
+            # was being swallowed in every downstream diagnostic.
+            http_rc=$?
         fi
-        http_rc=$?
     elif command -v python3 &>/dev/null; then
-        if python3 - "$url" <<'PY' 2>/dev/null
+        if python3 - "$url" "$max_time" <<'PY' 2>/dev/null
 import json, sys, urllib.request
 url = sys.argv[1]
 req = urllib.request.Request(
@@ -2422,17 +2434,21 @@ req = urllib.request.Request(
     method="POST",
 )
 try:
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=float(sys.argv[2])) as r:
         r.read()
 except Exception:
     sys.exit(1)
 PY
         then
             return 0
+        else
+            http_rc=$?
         fi
-        http_rc=$?
     fi
     # HTTP failed. Try the `aima em` CLI fallback (PC2 only).
+    if [[ -n "$http_body" ]]; then
+        echo -e "$(ts) ${YELLOW}[mc-em]${NC} HTTP response: $(printf '%s' "$http_body" | tail -c 300)" >&2
+    fi
     local aima_subcmd=""
     case "$action" in
         stop_app)  aima_subcmd="stop-app" ;;
@@ -2440,7 +2456,13 @@ PY
     esac
     if [[ -n "$aima_subcmd" ]] && command -v aima &>/dev/null; then
         echo -e "$(ts) ${YELLOW}[mc-em]${NC} HTTP $url failed (rc=$http_rc); trying 'aima em $aima_subcmd mc' ..." >&2
-        if aima em "$aima_subcmd" mc >/dev/null 2>&1; then
+        # PC2's local EM is a DIFFERENT app namespace from PC1's: its
+        # app list has no `mc` (pnc/perception/... only), so the CLI's
+        # name check fails and it then blocks on a TTY read forever
+        # (2026-10-30: pid stuck in n_tty_read, deploy pane frozen for
+        # minutes). Bound it and cut stdin so this stays a best-effort
+        # last resort instead of an indefinite hang.
+        if timeout 25 aima em "$aima_subcmd" mc </dev/null >/dev/null 2>&1; then
             echo -e "$(ts) ${GREEN}[mc-em]${NC} aima em $aima_subcmd mc OK." >&2
             return 0
         fi
