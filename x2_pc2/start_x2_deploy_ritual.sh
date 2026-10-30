@@ -157,7 +157,12 @@ case "${MODEL}" in
         WB=1
         # onnxruntime (present in the PC2 venv), NOT the onnx package (absent
         # there -- the first version of this check died silently, 2026-09-05).
-        PAIR_CHECK=$("${PREFIX}/venv/bin/python" - "$MODEL" "$DUAL_MODEL" 2>&1 <<'PYEOF'
+        # tail -n 1: onnxruntime prints an ANSI-coloured device-discovery
+        # warning to stderr BEFORE our verdict line; with bare 2>&1 the
+        # captured string starts with that warning, matches none of the
+        # case arms below, and the ritual self-destructs here (2026-10-30:
+        # pane died before LOG_DIR, x2_deploy vanished without a log).
+        PAIR_CHECK=$("${PREFIX}/venv/bin/python" - "$MODEL" "$DUAL_MODEL" 2>&1 <<'PYEOF' | tail -n 1
 import sys
 try:
     import onnxruntime as ort
@@ -214,7 +219,9 @@ elif [ "${WB}" = "1" ]; then
     # PC2 venv), NOT the onnx package (absent there) -- same as the
     # dual-head pairing check above. A check that cannot run is FATAL.
     if [ "${X2_ALLOW_CODEC_MISMATCH:-0}" != "1" ]; then
-        FPR_CHECK=$("${PREFIX}/venv/bin/python" - "$MODEL" "$WB_TOKENIZER" 2>&1 <<'PYEOF'
+        # Same stderr-noise trap as the dual pair check above: keep only the
+        # verdict line so the ANSI device-discovery warning cannot shadow it.
+        FPR_CHECK=$("${PREFIX}/venv/bin/python" - "$MODEL" "$WB_TOKENIZER" 2>&1 <<'PYEOF' | tail -n 1
 import sys
 try:
     import onnxruntime as ort
